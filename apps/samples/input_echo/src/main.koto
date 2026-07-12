@@ -1,0 +1,22 @@
+// Text input sample: show the latest typed ASCII byte.
+
+fn main() {
+    buf last[1];
+    last[0] = 45;
+
+    loop {
+        let cp = text_input();
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            exit(0);
+        }
+        if cp != 0 {
+            last[0] = cp;
+        }
+
+        draw_rect(0, 0, 320, 320, 0);
+        draw_text(16, 24, "type a key:", 11);
+        draw_text(104, 24, last, 1);
+        yield_frame();
+    }
+}

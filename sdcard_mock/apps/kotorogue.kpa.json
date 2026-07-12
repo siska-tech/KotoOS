@@ -1,0 +1,95 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.games.kotorogue",
+  "name": "KotoRogue",
+  "entry": "bytecode/kotorogue.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/kotorogue.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#1A1424",
+    "primary": "#E8D27A",
+    "secondary": "#5C5470",
+    "accent": "#E34A4A",
+    "highlight": "#F6E27A",
+    "shadow": "#0C0A14"
+  },
+  "description": "部屋とモンスターが毎回変わる、ターン制のローグライク。階段を降りて最深部を目指そう。",
+  "category": "ゲーム",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/kotorogue.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/kotorogue.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "sprites/kotorogue_tiles.kim",
+      "type": "image",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_bgm.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_step.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_hit.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_kill.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_gold.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_potion.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_stairs.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_hurt.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_over.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorogue_win.kmml",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

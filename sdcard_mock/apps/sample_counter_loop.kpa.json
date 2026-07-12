@@ -1,0 +1,31 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.samples.counter-loop",
+  "name": "SDK Counter Loop",
+  "entry": "bytecode/sample_counter_loop.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample.kicon",
+  "description": "Counts in a cooperative loop.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_counter_loop.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

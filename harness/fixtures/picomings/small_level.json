@@ -1,0 +1,122 @@
+{
+  "format": "picomings-level",
+  "version": 0,
+  "viewport": {
+    "width": 320,
+    "height": 200
+  },
+  "tile_size": {
+    "width": 16,
+    "height": 16
+  },
+  "map_size": {
+    "columns": 40,
+    "rows": 13
+  },
+  "palette": [
+    "#000000",
+    "#203850",
+    "#406080",
+    "#80a0b8",
+    "#1c5c38",
+    "#389058",
+    "#70c878",
+    "#d8f0b0",
+    "#604020",
+    "#906030",
+    "#c09048",
+    "#f0d080",
+    "#802020",
+    "#c04040",
+    "#e0e0e0",
+    "#ffffff"
+  ],
+  "tiles": [
+    {
+      "id": 0,
+      "name": "empty",
+      "flags": []
+    },
+    {
+      "id": 1,
+      "name": "ground",
+      "flags": [
+        "solid"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "slope_up",
+      "flags": [
+        "solid",
+        "slope"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "hazard",
+      "flags": [
+        "hazard"
+      ]
+    }
+  ],
+  "map_rows": [
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000",
+    "1111111111111111111122222222111111111111",
+    "1111111111111111111111111111111111111111"
+  ],
+  "sprites": [
+    {
+      "id": "actor_walk",
+      "size": {
+        "width": 16,
+        "height": 16
+      },
+      "transparent_index": 0,
+      "frames": [
+        "sprites/actor_walk_0.i4",
+        "sprites/actor_walk_1.i4"
+      ]
+    },
+    {
+      "id": "cursor",
+      "size": {
+        "width": 16,
+        "height": 16
+      },
+      "transparent_index": 0,
+      "frames": [
+        "sprites/cursor.i4"
+      ]
+    }
+  ],
+  "actors": [
+    {
+      "sprite": "actor_walk",
+      "x": 32,
+      "y": 160,
+      "state": "walking"
+    },
+    {
+      "sprite": "actor_walk",
+      "x": 56,
+      "y": 160,
+      "state": "walking"
+    }
+  ],
+  "controls": {
+    "directions": "move cursor or scroll viewport",
+    "enter": "confirm selection",
+    "space": "pause or cancel targeting"
+  }
+}

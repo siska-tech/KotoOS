@@ -1,0 +1,5 @@
+# KotoSnake pluck - hollow odd-harmonic chime, tightened for crisp 16th acid arps.
+KWT1
+WAVE 0 99 100 63 62 69 57 55 59 45 38 45 37 39 82 89 0 -89 -82 -39 -37 -45 -38 -45 -59 -55 -57 -69 -62 -63 -100 -99
+ENV 1 40 18 34
+GAIN 125

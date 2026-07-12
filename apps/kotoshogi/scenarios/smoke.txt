@@ -1,0 +1,14 @@
+# Start, move a pawn, undo, exercise hand/cancel, restart, and exit.
+frame
+newline
+frame
+newline
+up
+newline
+frame
+'u'
+'h'
+'x'
+ime-toggle
+frame
+exit

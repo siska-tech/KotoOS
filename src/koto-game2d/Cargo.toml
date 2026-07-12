@@ -1,0 +1,15 @@
+[package]
+name = "koto-game2d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# KotoGame2D is the app-facing Game2D semantic layer over the koto-gfx retained
+# model (GFX-0006A). Like koto-gfx it is pure, `no_std`, heap-free, and must stay
+# buildable for the Pico firmware target (thumbv6m-none-eabi). Its only dependency
+# is koto-gfx, whose retained POD types it operates on.
+[dependencies]
+koto-gfx = { path = "../koto-gfx" }

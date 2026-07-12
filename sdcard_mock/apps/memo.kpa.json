@@ -1,0 +1,40 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.memo",
+  "name": "Koto Memo",
+  "entry": "bytecode/memo.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/memo.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#F8F5E8",
+    "primary": "#273752",
+    "secondary": "#FFFFFF",
+    "accent": "#D64A4A",
+    "highlight": "#F6D86B",
+    "shadow": "#5A8FCB"
+  },
+  "description": "テキストメモを作成・編集できます。",
+  "category": "アプリ",
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/memo.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/memo.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

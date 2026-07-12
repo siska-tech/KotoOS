@@ -1,0 +1,12 @@
+# Start a run from the title, then wander the first room a little.
+newline
+frame
+right
+right
+down
+down
+left
+up
+right
+down
+frame

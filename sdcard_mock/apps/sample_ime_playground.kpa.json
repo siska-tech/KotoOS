@@ -1,0 +1,31 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.samples.ime-playground",
+  "name": "SDK IME Playground",
+  "entry": "bytecode/sample_ime_playground.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample.kicon",
+  "description": "Experiments with the Japanese IME.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_ime_playground.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "koto-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded logical audio runtime skeleton for KotoOS"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[features]
+debug-hostcalls = []
+experimental-sldpcm4 = []
+picocalc-backend = []
+# Store the built-in drum tables as SLDPCM4 nibble payloads (~4x smaller than
+# the PCM16 tables) and decode them in the drum voice path. Lossy; PCM16
+# remains the default and required representation.
+sldpcm4-drums = []
+# Tag the per-sample render hot path (mixer block loop + the sequence/tone
+# decoders that inline into it under LTO) into `.data.koto_audio_mix` so a
+# cortex-m-rt device startup copies it to SRAM and the CPU1 audio worker stops
+# paying flash-XIP fetch misses when CPU0's render load thrashes the shared XIP
+# cache (KotoRun SMASH underruns, phase=173). Device-only: hosts must not
+# enable this (functions placed in a `.data` section are not executable in
+# host binaries). Same pattern as koto-vm's `ram_interpreter` (KOTO-0169
+# Stage 2); costs ~3.8 KiB of device RAM. Enabled by koto-pico's
+# `ram_audio_mixer` (default-on there since the 2026-07-12 underruns=0
+# device confirmation).
+ram-hot-mix = []

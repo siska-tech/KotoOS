@@ -1,0 +1,70 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.games.kotomines",
+  "name": "KotoMines",
+  "entry": "bytecode/kotomines.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/kotomines.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#F7F1DE",
+    "primary": "#344452",
+    "secondary": "#9CB4A6",
+    "accent": "#E34A4A",
+    "highlight": "#F6C236",
+    "shadow": "#17222B"
+  },
+  "description": "9×9と16×16で遊べる、旗とタイマー付きマインスイーパー。",
+  "category": "ゲーム",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "assets": [
+    {
+      "path": "bytecode/kotomines.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/kotomines.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotomines_bgm.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotomines_move.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotomines_rotate.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotomines_lock.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotomines_clear.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotomines_over.kmml",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

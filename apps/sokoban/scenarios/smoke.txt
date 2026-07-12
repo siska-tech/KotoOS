@@ -1,0 +1,10 @@
+# Load, move the porter, restart, exercise undo, then leave.
+frame
+frame
+frame
+left
+up
+'u'
+ime
+frame
+exit

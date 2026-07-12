@@ -1,0 +1,7 @@
+# KotoSnake title screen after a few animation frames.
+frame
+frame
+frame
+frame
+frame
+frame

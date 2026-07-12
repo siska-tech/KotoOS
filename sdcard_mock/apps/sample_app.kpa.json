@@ -1,0 +1,31 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.sample",
+  "name": "Sample App",
+  "entry": "bytecode/main.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample.kicon",
+  "description": "A baseline sample package.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 65536
+  },
+  "assets": [
+    {
+      "path": "bytecode/main.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

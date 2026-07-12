@@ -1,0 +1,16 @@
+# Edit, open the save prompt (F2), type a new name, confirm (Save As), then quit.
+frame      # load memo.txt
+'x'        # type an edit
+save       # F2: open the save / save-as prompt
+'n'
+'o'
+'t'
+'e'
+'2'
+'.'
+'t'
+'x'
+'t'
+commit     # confirm -> saves as note2.txt and makes it active
+frame      # back in the editor
+exit

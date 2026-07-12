@@ -1,0 +1,243 @@
+fn draw_msg(stats: int) {
+    let m = gs(stats, ST_MSG);
+    if m == 1 { draw_text_color(8, 300, "敵を攻撃した", 18, C_TEXT); return; }
+    if m == 2 { draw_text_color(8, 300, "敵をたおした！", 21, C_TEXT); return; }
+    if m == 3 { draw_text_color(8, 300, "ゴールド発見", 18, C_GOLD); return; }
+    if m == 4 { draw_text_color(8, 300, "薬を拾った", 15, C_POTION); return; }
+    if m == 5 { draw_text_color(8, 300, "薬を飲んだ", 15, C_HP); return; }
+    if m == 6 { draw_text_color(8, 300, "ダメージ！", 15, C_HPLOW); return; }
+    if m == 7 { draw_text_color(8, 300, "階段を降りた", 18, C_STAIRS); return; }
+    draw_text_color(8, 300, "矢印:移動 Q:薬 F1:再開 F10:終了", 40, C_DIM);
+}
+
+// HUD chrome only: the panel and fixed labels. The live values are retained
+// Game2D text items (hud_texts) and the HP bar fill is immediate, so combat
+// and pickups no longer touch the static layer — a static rebuild forces a
+// ~full-screen repaint on the device, which is exactly the per-step hitch
+// this split removes.
+fn render_hud(stats: int, num: int) {
+    draw_rect(0, 242, 320, 78, C_PANEL);
+    draw_rect(0, 242, 320, 2, C_PANELHI);
+    draw_text_color(10, 252, "地下", 6, C_DIM);
+    draw_text_color(70, 252, "階", 3, C_DIM);
+    draw_text_color(120, 252, "HP", 2, C_DIM);
+    draw_rect(146, 252, 100, 12, C_BARBG);
+    draw_text_color(10, 278, "G", 1, C_GOLD);
+    draw_text_color(110, 278, "薬", 3, C_POTION);
+    draw_text_color(180, 278, "撃破", 6, C_DIM);
+}
+
+// Push the live HUD values as retained text items. A value that does not
+// change costs nothing; a change repaints only its own row band.
+fn hud_texts(stats: int, num: int) {
+    let v = gs(stats, ST_DEPTH);
+    heap_set_u8(num + 0, 48 + (v / 10) % 10);
+    heap_set_u8(num + 1, 48 + v % 10);
+    game2d_text_set(0, 52, 252, num, 2, C_TEXT);
+
+    v = gs(stats, ST_HP);
+    heap_set_u8(num + 0, 48 + (v / 100) % 10);
+    heap_set_u8(num + 1, 48 + (v / 10) % 10);
+    heap_set_u8(num + 2, 48 + v % 10);
+    game2d_text_set(1, 252, 252, num, 3, C_TEXT);
+
+    v = heap_get_u16(stats + ST_GOLD);
+    heap_set_u8(num + 0, 48 + (v / 1000) % 10);
+    heap_set_u8(num + 1, 48 + (v / 100) % 10);
+    heap_set_u8(num + 2, 48 + (v / 10) % 10);
+    heap_set_u8(num + 3, 48 + v % 10);
+    game2d_text_set(2, 26, 278, num, 4, C_TEXT);
+
+    v = gs(stats, ST_POTIONS);
+    heap_set_u8(num + 0, 48 + v % 10);
+    game2d_text_set(3, 134, 278, num, 1, C_TEXT);
+
+    v = gs(stats, ST_KILLS);
+    heap_set_u8(num + 0, 48 + (v / 10) % 10);
+    heap_set_u8(num + 1, 48 + v % 10);
+    game2d_text_set(4, 222, 278, num, 2, C_TEXT);
+}
+
+// Build the retained static layer: the full-screen base, the explored-but-dark
+// fog (merged into one rectangle per row per run of same-type cells — rooms and
+// corridors are rectangular, so whole fog rows cost a few commands, not one per
+// cell), and the entire HUD. Every value here changes only on a completed turn,
+// so the layer is rebuilt per action, never per frame. The status message stays
+// immediate (it is timer-driven), as do the lit tiles and entities.
+fn build_static(map: int, stats: int, num: int) {
+    game2d_static_begin();
+    draw_rect(0, 0, 320, 320, C_BG);
+
+    let y = 0;
+    while y < MAP_H {
+        let run = 0;
+        let rt = 0;        // current run type: 0 none, 1 dark wall, 2 dark floor
+        let x = 0;
+        while x <= MAP_W {
+            let t = 0;
+            if x < MAP_W {
+                let b = heap_get_u8(map + y * MAP_W + x);
+                if (b & 24) == 8 {
+                    t = 2;
+                    if (b & 7) == T_WALL { t = 1; }
+                }
+            }
+            if t != rt {
+                if rt == 1 { draw_rect(run * TILE, y * TILE, (x - run) * TILE, TILE, C_WALLD); }
+                if rt == 2 { draw_rect(run * TILE, y * TILE, (x - run) * TILE - 1, TILE - 1, C_FLOORD); }
+                run = x;
+                rt = t;
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    render_hud(stats, num);
+    game2d_static_end();
+}
+
+fn render_play(map: int, actors: int, stats: int, num: int, sheet: int) {
+    let sh = 0;
+    if gs(stats, ST_SHAKE) > 0 {
+        if (gs(stats, ST_SHAKE) & 1) != 0 { sh = 3; } else { sh = 0 - 3; }
+    }
+    // Animation phase: the entity frame toggles every 8 frames; the collectible
+    // twinkle uses a slower phase so it sparkles out of step with the creatures.
+    let anim = gs(stats, ST_ANIM);
+    let af = (anim / 8) & 1;
+    let tw = (anim & 16) != 0;
+
+    // Lit cells only: the dark fog and the HUD live in the retained static
+    // layer, so even the largest lit room stays well inside the per-frame
+    // draw-command budget. Shake shifts the lit layer over the steady fog.
+    // The scan covers just the lit bounding box recorded by reveal — about a
+    // room's worth of cells instead of the whole 300-cell map every frame.
+    let xs = gs(stats, ST_LITX0);
+    let xe = gs(stats, ST_LITX1);
+    let ye = gs(stats, ST_LITY1);
+    let y = gs(stats, ST_LITY0);
+    while y <= ye {
+        let x = xs;
+        while x <= xe {
+            let b = heap_get_u8(map + y * MAP_W + x);
+            if (b & 16) != 0 {
+                let typ = b & 7;
+                let dx = x * TILE + sh;
+                let dy = y * TILE;
+                if typ == T_WALL {
+                    blit(sheet, dx, dy, IMG_WALL);
+                } else {
+                    blit(sheet, dx, dy, IMG_FLOOR);
+                    if typ == T_STAIRS { blit(sheet, dx, dy, IMG_STAIRS); }
+                    else if typ == T_GOLD {
+                        blit(sheet, dx, dy, IMG_GOLD);
+                        if tw { draw_rect(dx + 11, dy + 3, 2, 2, C_SPARK); }
+                    }
+                    else if typ == T_POTION {
+                        blit(sheet, dx, dy, IMG_POTION);
+                        if tw { draw_rect(dx + 9, dy + 4, 2, 2, C_SPARK); }
+                    }
+                }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    // (The dark fog outside this window never changes between turns; it is
+    // composited from the static layer beneath these blits.)
+
+    let i = 0;
+    while i < MON_MAX {
+        if actor_timer(actors, i) != 0 {
+            let mx = actor_x(actors, i);
+            let my = actor_y(actors, i);
+            if (heap_get_u8(map + my * MAP_W + mx) & 16) != 0 {
+                // The slide offset (ActorArray vx/vy) eases the sprite in from its
+                // previous tile; it has already decayed toward 0 in tick_slide.
+                blit(sheet, mx * TILE + sh + actor_vx(actors, i), my * TILE + actor_vy(actors, i),
+                    IMG_MON0 + actor_frame(actors, i) * 2 + af);
+            }
+        }
+        i = i + 1;
+    }
+
+    blit(sheet,
+        gs(stats, ST_PX) * TILE + sh + heap_get_i16(stats + ST_POFFX),
+        gs(stats, ST_PY) * TILE + heap_get_i16(stats + ST_POFFY),
+        IMG_PLAYER + af);
+
+    if gs(stats, ST_SPT) > 0 {
+        spr_spark(gs(stats, ST_SPX) * TILE + sh, gs(stats, ST_SPY) * TILE, gs(stats, ST_SPT), gs(stats, ST_SPC));
+    }
+
+    // Red hurt vignette around the play area.
+    if gs(stats, ST_FLASH) > 0 {
+        let th = gs(stats, ST_FLASH) + 1;
+        draw_rect(0, 0, 320, th, C_FLASH);
+        draw_rect(0, 242 - th, 320, th, C_FLASH);
+        draw_rect(0, 0, th, 242, C_FLASH);
+        draw_rect(320 - th, 0, th, 242, C_FLASH);
+    }
+
+    // HP bar fill over the static bar background (1 immediate rect).
+    let hp = gs(stats, ST_HP);
+    let mhp = gs(stats, ST_MAXHP);
+    let w = hp * 100 / mhp;
+    if w > 0 {
+        let bc = C_HP;
+        if hp * 3 <= mhp { bc = C_HPLOW; }
+        draw_rect(146, 252, w, 12, bc);
+    }
+
+    draw_msg(stats);
+}
+
+fn render_title(stats: int, sheet: int) {
+    draw_rect(0, 0, 320, 320, C_BG);
+    let af = (gs(stats, ST_ANIM) / 8) & 1;
+    blit(sheet, 118, 44, IMG_PLAYER + af);          // hero, breathing
+    blit(sheet, 168, 46, IMG_MON0 + 4 * 2 + af);    // orc, lurking
+    draw_rect(0, 92, 320, 64, C_PANEL);
+    draw_rect(0, 92, 320, 3, C_PANELHI);
+    draw_text_color(98, 112, "KotoRogue", 9, C_PLAYER);
+    draw_text_color(70, 172, "ダンジョン探索RPG", 24, C_DIM);
+    draw_text_color(96, 212, "Enter ではじめる", 21, C_TEXT);
+    draw_text_color(44, 252, "矢印:移動 Q:薬 F1:再開 F10:終了", 40, C_DIM);
+}
+
+fn render_over(stats: int, num: int, won: int) {
+    draw_rect(0, 0, 320, 320, C_BG);
+    draw_rect(30, 78, 260, 164, C_PANEL);
+    draw_rect(30, 78, 260, 3, C_PANELHI);
+    if won == 1 {
+        draw_text_color(122, 98, "勝利！", 9, C_GOLD);
+        draw_text_color(56, 128, "アミュレットを手にした", 33, C_TEXT);
+    } else {
+        draw_text_color(130, 98, "敗北", 6, C_HPLOW);
+        draw_text_color(82, 128, "あなたは倒れた", 21, C_TEXT);
+    }
+
+    let d = gs(stats, ST_DEPTH);
+    heap_set_u8(num + 0, 48 + (d / 10) % 10);
+    heap_set_u8(num + 1, 48 + d % 10);
+    draw_text_color(68, 162, "地下", 6, C_DIM);
+    draw_text_color(110, 162, num, 2, C_TEXT);
+    draw_text_color(128, 162, "階", 3, C_DIM);
+
+    let g = heap_get_u16(stats + ST_GOLD);
+    heap_set_u8(num + 0, 48 + (g / 1000) % 10);
+    heap_set_u8(num + 1, 48 + (g / 100) % 10);
+    heap_set_u8(num + 2, 48 + (g / 10) % 10);
+    heap_set_u8(num + 3, 48 + g % 10);
+    draw_text_color(68, 186, "G", 1, C_GOLD);
+    draw_text_color(84, 186, num, 4, C_TEXT);
+
+    let k = gs(stats, ST_KILLS);
+    heap_set_u8(num + 0, 48 + (k / 10) % 10);
+    heap_set_u8(num + 1, 48 + k % 10);
+    draw_text_color(158, 186, "撃破", 6, C_DIM);
+    draw_text_color(200, 186, num, 2, C_TEXT);
+
+    draw_text_color(74, 214, "Enter で再挑戦", 18, C_TEXT);
+}

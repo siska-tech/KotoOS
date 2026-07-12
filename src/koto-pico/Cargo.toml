@@ -1,0 +1,185 @@
+[package]
+name = "koto-pico"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+cortex-m = "0.7.7"
+cortex-m-rt = "0.7.5"
+critical-section = "1.2.0"
+cyw43 = "0.7.0"
+cyw43-firmware = { version = "0.1.0", features = ["wifi"] }
+cyw43-pio = "0.10.0"
+embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
+embassy-embedded-hal = "0.6.0"
+embassy-futures = "0.1.2"
+embassy-rp = { version = "0.10.0", features = [
+    "critical-section-impl",
+    "executor-thread",
+    "rp2040",
+    "time-driver",
+    "unstable-pac",
+] }
+embassy-time = "0.5.1"
+embassy-usb = { version = "0.6.0", default-features = false }
+embedded-hal = "1.0.0"
+embedded-hal-bus = "0.2.0"
+embedded-sdmmc = { version = "0.9.0", default-features = false }
+# Ported bounded audio runtime (sibling project, KOTO-0165). The CPU1 worker
+# drives its DefaultAudioService; the cue tables are compiled from apps' .kmml
+# sources by tools/koto-audio-gen.
+koto-audio = { path = "../koto-audio/crates/koto-audio", features = [
+    "sldpcm4-drums",
+] }
+koto-core = { path = "../koto-core" }
+koto-game2d = { path = "../koto-game2d" }
+koto-gfx = { path = "../koto-gfx" }
+koto-psram = { path = "../../../koto-psram", features = ["rp2040-embassy"] }
+panic-halt = "1.0.0"
+pio = "0.3.0"
+portable-atomic = { version = "1.13.1", features = ["critical-section"] }
+static_cell = "2.1.1"
+
+# Official product firmware.
+[[bin]]
+name = "koto_firmware"
+path = "src/bin/koto_firmware.rs"
+test = false
+bench = false
+
+# Retained single-peripheral hardware probes (flash manually to re-validate one
+# peripheral in isolation). Obsolete bring-up experiments live in
+# `bringup/archive/` and are intentionally excluded from the build.
+[[bin]]
+name = "probe_lcd"
+path = "src/bin/probe_lcd.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "probe_keyboard"
+path = "src/bin/probe_keyboard.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "probe_sd"
+path = "src/bin/probe_sd.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "probe_psram"
+path = "src/bin/probe_psram.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "psram_diag"
+path = "src/bin/psram_diag.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "probe_power"
+path = "src/bin/probe_power.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "probe_audio"
+path = "src/bin/probe_audio.rs"
+test = false
+bench = false
+
+[features]
+# `ram_interpreter` is default-on since KOTO-0170 Stage 1: the phase=176 stack
+# canary measured the real core-0 main-stack peak at 68,588 B on the worst-case
+# hardware session mix (boot -> shell -> all games + IME/memo + audio), leaving
+# free_min=7,620 B above the statics with the feature enabled — over the
+# >= ~6 KiB flip bar. `psram_fast_code_window` joined the defaults with
+# KOTO-0171: the KOTO-0170 session mix ran with it enabled, so the measured
+# margin and soak both already cover this exact combination. Opt out of both
+# (flash-XIP interpreter + safe-profile refills) with `--no-default-features`.
+# NOTE: the legacy/qpi/dma PSRAM experiment profiles are mutually exclusive
+# with the fast refill — build those with `--no-default-features` (see the
+# compile_error in psram_ext.rs). The phase=176 canary line stays as the
+# permanent regression tripwire: any `.bss` growth must keep `free_min`
+# comfortably positive on hardware.
+default = ["ram_interpreter", "psram_fast_code_window", "ram_audio_mixer"]
+# Interpreter-in-SRAM placement (KOTO-0169 Stage 2, H2-b): run the koto-vm hot
+# loop of the PSRAM-window app path from SRAM instead of flash XIP
+# (cortex-m-rt's link.x copies the tagged `.data.*` section to RAM at reset).
+# Costs ~2.4 KiB of RAM (the SliceCode small-app fallback stays in flash);
+# device-confirmed −16.4% interpret+fetch ns/op (KOTO-0169 Stage 2). The first,
+# ~5.4 KiB default-on shape failed to boot on hardware (the stack grows down
+# into `.bss` with no linker guard) — that history plus the measured margin
+# lives in KOTO-0170.
+ram_interpreter = ["koto-core/ram_interpreter"]
+# Audio-mixer-in-SRAM placement (KotoRun SMASH underrun fix): run the
+# koto-audio per-sample render hot path (mixer block loop + inlined
+# sequence/tone decoders) from SRAM instead of flash XIP, so CPU0's heavy
+# frames can no longer thrash the CPU1 audio worker's instruction fetches
+# through the shared XIP cache. Same `.data.*` copy-to-RAM mechanism as
+# `ram_interpreter`; costs ~3.8 KiB of `.data`. Default-on since the
+# 2026-07-12 device session: SMASH-combo runs measured `underruns=0`
+# (phase=173) with `phase=176 free_min=73,268 B`, so the RAM cost is far from
+# the ~4 KiB stop-ship canary bar (KOTO-0170). Device A/B also showed it
+# halving `worker_late` versus the flash-resident mixer under the same load.
+ram_audio_mixer = ["koto-audio/ram-hot-mix"]
+# Restore the pre-koto-psram default PSRAM backend (the in-tree `PicoCalcPsram`
+# SM0 PIO path in `src/psram.rs`). The default build now uses the extracted
+# `koto-psram` crate adapter (`psram_ext::KotoPsram`); enabling this feature
+# reverts the default-config backend to the legacy in-tree implementation as an
+# escape hatch. It does not affect the `psram_qpi_*` / `psram_dma_*` experiment
+# profiles, which select their own backends.
+legacy_psram = []
+# Fast CodeWindow refill (KOTO-0153; default-on since KOTO-0171). The default
+# `koto-psram` backend attempts the hardware-validated `FastFallingClkdiv2`
+# read (read_clkdiv=2.0, falling-edge sampling, extra dummy byte, RX byte-FIFO
+# + RX DMA) for PsramCodeWindow refills, falling back to the safe koto-psram
+# read on any unsupported address/length or read error. Ordinary PSRAM
+# reads/writes stay on the safe profile; only refills switch. Pulls in the
+# matching `koto-psram/psram_fast_read_clkdiv2` driver feature. Requires the
+# default `koto-psram` backend (mutually exclusive with the legacy/qpi/dma
+# profiles — those now need `--no-default-features`).
+psram_fast_code_window = ["koto-psram/psram_fast_read_clkdiv2"]
+# Diagnostic-only PSRAM helpers. `psram_pio_word_diag` is a build feature
+# used to compile diagnostic helpers that exercise PIO RX FIFO word-based
+# diagnostics. It does not enable any production DMA path.
+psram_pio_word_diag = []
+# Hazardous diagnostic-only PSRAM benchmark rows (clkdiv 2 / 2.5, dummy sweeps).
+psram_diag_hazardous_bench = ["psram_pio_word_diag"]
+# Diagnostic-only reusable PSRAM read API based on verified SM1 CPU-TX + RX-DMA path.
+psram_dma_read_api = ["psram_pio_word_diag"]
+# Diagnostic-only PicoCalc PSRAM QPI backend prototype. This does not replace
+# the firmware PSRAM backend; it only enables the `psram_diag` qpi_cpu64 row.
+psram_qpi_backend = []
+psram_qpi_backend_diag = ["psram_qpi_backend"]
+# Optional experiment: route only PsramCodeWindow refill reads through the
+# validated SM1 falling-edge+fudge clkdiv=3 RX-DMA candidate, with prod16 fallback.
+psram_dma_read_code_window = ["psram_dma_read_api"]
+# Verbose diagnostics for the CodeWindow DMA read experiment (header dumps/traces).
+psram_dma_read_code_window_diag = ["psram_dma_read_code_window"]
+# Optional experiment: route CodeWindow reads through safe QPI read (clkdiv=8)
+# and writes through qspi_4wire_write (clkdiv=2).
+psram_qpi_safe_read_code_window = ["psram_qpi_backend"]
+# Mode-owned QPI backend that centralizes PSRAM bus state transitions.
+psram_qpi_backend_v2 = ["psram_qpi_backend"]
+# Production-like QPI V2 CodeWindow profile: QPI V2 backend with low-rate logs
+# and no app-stage/CodeWindow verification reads.
+psram_qpi_code_window_prod_profile = [
+    "psram_qpi_safe_read_code_window",
+    "psram_qpi_backend_v2",
+]
+# Counters-only QPI V2 diagnostic profile. It performs CodeWindow verify/map
+# checks, stores counters, and reports them only on app exit or VM error.
+psram_qpi_code_window_counters = ["psram_qpi_code_window_prod_profile"]
+# Back-compat alias for the counters-only diagnostic profile.
+psram_qpi_code_window_verify = ["psram_qpi_code_window_counters"]
+# Explicit verbose QPI V2 diagnostic profile. This is the only profile that
+# emits phase=164/165 or app-stage verification logs while the app is running.
+psram_qpi_code_window_verbose = ["psram_qpi_code_window_counters"]

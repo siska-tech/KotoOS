@@ -1,0 +1,36 @@
+# KotoSnake BGM - STAGE 3: overdrive rave (T210). Maximum density: relentless 16th
+# kick+hat drums, a 16th root-fifth acid bass, frantic 7th-chord 16th arpeggios, and
+# aggressive offbeat rave stabs. Same signature wavetable timbres, pushed to the limit.
+# Triggered at snake length 18. The loop end snaps back onto the downbeat.
+#INST 6 audio/kotosnake_lead.kwt
+#INST 7 audio/kotosnake_bass.kwt
+#INST 8 audio/kotosnake_pluck.kwt
+#INST 9 audio/kotosnake_drum.kwt
+
+# Pounding 16ths: kick on each beat, three hats between. The final bar breaks into a
+# snare roll then a kick burst before looping.
+#TRACK drum
+@9 T210 V9 O2 L16 [
+O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C
+O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C
+O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C
+O2 C O5 C O5 C O5 C O2 C O5 C O5 C O5 C O4 C O4 C O4 C O4 C O2 C O2 C O2 C O2 C
+]
+
+# Driving 16th root-fifth acid bass (Am - Am - F - G).
+#TRACK bass
+@7 T210 V9 O2 L16 [
+A E A E A E A E A E A E A E A E  A E A E A E A E A E A E A E A E  F C F C F C F C F C F C F C F C  G D G D G D G D G D G D G D G D
+]
+
+# Frantic 7th-chord 16th arpeggios (Am7 - Am7 - Fmaj7 - G7).
+#TRACK pluck
+@8 T210 V8 O5 L16 [
+A C E G A C E G A C E G A C E G  A C E G A C E G A C E G A C E G  F A C E F A C E F A C E F A C E  G B D F G B D F G B D F G B D F
+]
+
+# Aggressive offbeat rave stab riff.
+#TRACK lead
+@6 T210 V8 O5 L8 [
+A R A R E R A R  A R A R G R E R  F R F R C R F R  G R G R D R B R
+]

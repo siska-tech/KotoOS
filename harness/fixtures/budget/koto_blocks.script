@@ -1,0 +1,99 @@
+# KotoBlocks worst-ish budget scenario (KOTO-0101). Title-screen tile baking, then
+# a stress run through move / rotate / soft-drop / hard-drop / hold / pause+resume
+# and a game-over -> retry, so spawn, lock, top-out and the heaviest hard-drop
+# frame (steps=99 inner loop) are all exercised against the budget gate.
+#
+# Controls (see apps/koto_blocks/src/main.koto): left/right move, up rotate,
+# down soft-drop, space hard-drop, 'h' hold, F1 (ime-toggle) start/retry,
+# F2 (save) pause/resume, F10 (exit) quit.
+
+# --- Title: bake all seven 16x16 tiles (4 rows/frame, ~4 frames/tile). ---
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+ime-toggle
+
+# --- Play: move + rotate, then hard-drop to lock; stack the well column by column. ---
+left
+left
+left
+up
+'\s'
+right
+right
+right
+up
+up
+'\s'
+'h'
+left
+'\s'
+right
+'\s'
+down
+down
+'\s'
+up
+left
+left
+'\s'
+right
+right
+right
+'\s'
+
+# --- Pause and resume mid-game. ---
+save
+frame
+frame
+save
+
+# --- Keep hard-dropping into the same area to force a top-out / game over. ---
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+'\s'
+
+# --- Retry from the game-over screen, play a little, then quit. ---
+ime-toggle
+left
+up
+'\s'
+right
+'\s'
+exit

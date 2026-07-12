@@ -1,0 +1,273 @@
+# Bytecode App Development Roadmap
+
+This roadmap defines the development environment needed before KotoOS apps can
+be evaluated as user-facing software. The current runtime pieces are tested, but
+the normal simulator experience still exposes mostly KotoShell. The next goal is
+to make app development feel like a real loop: write source, build a package,
+run it in KotoSim, interact with it, inspect failures, and repeat.
+
+## Problem Statement
+
+KotoOS already has a `KBC1` bytecode verifier, a cooperative VM, package
+manifests, sandboxed file host calls, text rendering hooks, and a simulator
+launch path. Those pieces prove the runtime foundation, but they do not yet make
+KotoOS evaluable at the user level.
+
+The missing layer is an app development environment:
+
+- A readable source language for app authors.
+- A compiler toolchain that emits verified `KBC1` bytecode.
+- A reusable SDK surface for drawing, input, IME, storage, and app lifecycle.
+- A simulator session that keeps bytecode apps alive across frames.
+- A deterministic build/package/validation loop for checked-in app fixtures.
+
+Raw assembly is still useful, but it should not be the primary authoring format
+for real apps. It should serve as a compiler backend target, a debugging format,
+and a narrow fixture language for low-level VM tests.
+
+## Development Model
+
+The intended app authoring flow is:
+
+```text
+apps/memo/src/main.koto
+        |
+        v
+Koto language compiler
+        |
+        v
+optional readable KBC assembly / IR
+        |
+        v
+KBC1 bytecode
+        |
+        v
+KPA package or sdcard_mock app layout
+        |
+        v
+KotoSim interactive bytecode session
+```
+
+The first language does not need to be ambitious. It should be small,
+deterministic, easy to compile, and close to the host ABI. A useful MVP is a
+structured procedural language with:
+
+- `fn main()` and a per-frame loop convention.
+- `let` locals, integer values, booleans, and simple byte/string buffers.
+- `if`, `while`, `break`, and `return`.
+- string literals and fixed-size buffers for host calls.
+- imports from a small KotoSDK prelude.
+- explicit host-call results instead of exceptions.
+
+Garbage collection, dynamic objects, closures, traits, generics, and a large
+standard library are out of scope for the first compiler. The language should be
+pleasant enough to write a memo app, but constrained enough that memory and VM
+costs stay visible.
+
+## Milestone 1: Runtime Surface For Real Apps
+
+Goal: bytecode can receive text-oriented input and drive host services without
+native simulator shortcuts.
+
+Issues:
+
+- [KOTO-0042](../issues/main/KOTO-0042-runtime-input-ime-host-calls.md): add typed input
+  and IME/text-buffer host calls.
+- [KOTO-0043](../issues/main/KOTO-0043-sim-interactive-bytecode-session.md): keep a
+  verified VM alive across frames in KotoSim.
+
+Exit criteria:
+
+- A bytecode fixture can receive frame input, draw visible output, yield, resume,
+  and exit back to the shell.
+- A bytecode fixture can feed host IME/editor services and read back the state it
+  needs to render.
+
+## Milestone 2: Low-Level Build Target
+
+Goal: make `KBC1` generation reproducible and inspectable.
+
+Issues:
+
+- [KOTO-0044](../issues/main/KOTO-0044-bytecode-assembler.md): implement a readable
+  assembly/IR format and assembler for low-level fixtures and compiler output.
+
+Exit criteria:
+
+- Checked-in bytecode fixtures can be regenerated from source.
+- The harness fails when committed `.kbc` files drift from their sources.
+- The assembler is documented as an intermediate/debug layer, not the preferred
+  app authoring language.
+
+## Milestone 3: High-Level Language Direction
+
+Goal: choose and freeze the first high-level app language subset before the memo
+app is rewritten around it.
+
+Issues:
+
+- [KOTO-0045](../issues/main/KOTO-0045-high-level-app-language-spike.md): select the
+  first source language approach and write its minimal design.
+
+Decision: [Koto App Language MVP](../spec/KOTO_APP_LANGUAGE.md) — a small, Koto-specific,
+ahead-of-time compiled procedural language over the integer VM.
+
+Recommended direction:
+
+- Build a small Koto-specific language first, rather than embedding a full
+  existing language runtime.
+- Compile ahead-of-time to `KBC1`.
+- Keep runtime services explicit through KotoSDK calls.
+- Treat the compiler as a host-side tool; no parser or compiler is needed on the
+  RP2040.
+
+Exit criteria:
+
+- The language subset can express a frame loop, shell-style app lifecycle,
+  drawing, text input, IME composition, save/load, and exit.
+- The design includes memory limits, string/buffer rules, and host-call error
+  handling.
+
+## Milestone 4: Compiler MVP
+
+Goal: compile small app sources into verifier-valid `KBC1`.
+
+Issues:
+
+- [KOTO-0046](../issues/main/KOTO-0046-koto-language-compiler-mvp.md): implement the
+  first parser, semantic checks, and bytecode emission.
+
+Exit criteria:
+
+- `main.koto` sources compile to deterministic bytecode.
+- Compiler errors include source locations.
+- Generated bytecode passes `verify_kbc`.
+- Tests cover expressions, control flow, labels/branches, strings, host-call
+  wrappers, and verifier rejection paths.
+
+## Milestone 5: KotoSDK For Bytecode Apps
+
+Goal: app code should call a small stable API rather than hard-code numeric
+host-call IDs everywhere.
+
+Issues:
+
+- [KOTO-0047](../issues/main/KOTO-0047-bytecode-sdk-prelude.md): define SDK bindings and
+  examples for the high-level language.
+
+Reference: [KotoSDK Prelude](../spec/KOTO_SDK.md) — named drawing/input/IME/editor/file/
+lifecycle calls, predefined constants, result conventions, and example snippets.
+
+Exit criteria:
+
+- Source apps can call named functions such as `draw_text`, `input_text`,
+  `ime_feed`, `file_read_text`, `file_write_text`, `yield_frame`, and `exit`.
+- The SDK documentation maps each function to host ABI behavior and error
+  results.
+- The SDK keeps sandboxing and buffer ownership explicit.
+
+## Milestone 6: App Build And Package Loop
+
+Goal: one command builds app source into the mock SD layout and validates it.
+
+Issues:
+
+- [KOTO-0048](../issues/main/KOTO-0048-app-build-package-loop.md): add a reproducible
+  build/package command for source apps.
+
+Exit criteria:
+
+- A command rebuilds `sdcard_mock/bytecode/*.kbc` from app sources.
+- The project harness verifies generated bytecode, manifest references, and KPA
+  source drift.
+- App sources live in a stable tree, for example `apps/memo/src/main.koto`.
+
+## Milestone 7: Interactive Developer Experience
+
+Goal: KotoSim becomes the main way to evaluate KotoOS features before hardware.
+
+Issues:
+
+- [KOTO-0049](../issues/main/KOTO-0049-sim-app-dev-experience.md): improve KotoSim with
+  app-focused run commands, diagnostics, and repeatable interactive scenarios.
+  Reference: [App Development Loop](../guides/APP_DEV_LOOP.md) — `--app`/`--app-script`,
+  input scripts, window mode, and trap diagnostics.
+- [KOTO-0050](../issues/main/KOTO-0050-runtime-inspector.md): expose VM, host-call,
+  input, drawing, and file state for a running app.
+- [KOTO-0051](../issues/main/KOTO-0051-bytecode-debug-data.md): map bytecode PCs back to
+  high-level source locations for diagnostics.
+- [KOTO-0056](../issues/main/KOTO-0056-app-failure-recovery.md): return to a controlled
+  shell state and show a readable summary when an app fails.
+- [KOTO-0058](../issues/main/KOTO-0058-golden-frame-validation.md): validate key shell
+  and app frames with stable golden or structured outputs.
+
+Exit criteria:
+
+- Developers can launch a specific app directly from the command line.
+- Runtime errors report app ID, source/bytecode location when available, VM PC,
+  host-call ID, and a readable reason.
+- Scripted scenarios can drive shell launch, text entry, IME conversion, save,
+  exit, and relaunch.
+
+## Milestone 7b: Developer Assets And Project Scaffolding
+
+Goal: reduce the friction of creating, packaging, resetting, and visually
+checking small apps.
+
+Issues:
+
+- [KOTO-0052](../issues/main/KOTO-0052-sdk-samples.md): add small source-authored sample
+  apps that double as SDK and compiler regression fixtures.
+- [KOTO-0053](../issues/main/KOTO-0053-app-scaffold-tool.md): generate a new app
+  skeleton with manifest, source, icon placeholder, build config, and scenario.
+- [KOTO-0054](../issues/main/KOTO-0054-asset-development-pipeline.md): define the first
+  image/font/media conversion and preview pipeline for package-ready assets.
+- [KOTO-0055](../issues/main/KOTO-0055-save-data-management.md): inspect and reset
+  sandboxed app save data during simulator development.
+- [KOTO-0057](../issues/main/KOTO-0057-shell-app-details.md): show package details,
+  permissions, runtime, memory request, and save-data presence in KotoShell.
+
+Exit criteria:
+
+- A developer can create a new small app, build it, launch it, reset its save
+  data, and validate its basic output without hand-editing package plumbing.
+- KotoShell exposes enough package metadata that users can understand what they
+  are launching.
+
+## Milestone 8: User-Evaluable Memo App
+
+Goal: the simulator demonstrates KotoOS as an actual Japanese PDA environment,
+not only as tested components.
+
+Issues:
+
+- [KOTO-0041](../issues/main/KOTO-0041-bytecode-memo-app.md): implement the memo app as a
+  real bytecode-driven app.
+
+Exit criteria:
+
+- In KotoSim window mode, a user can open Koto Memo from KotoShell, type ASCII
+  and Japanese text, see IME state, save, exit, relaunch, and see saved content.
+- The memo app source is readable high-level source.
+- Native simulator shortcuts are removed from the app path or kept only as test
+  helpers outside the user-facing flow.
+
+## Order Of Execution
+
+The practical order is:
+
+1. Extend the host ABI and interactive session (`KOTO-0042`, `KOTO-0043`).
+2. Add assembly/IR only as the low-level reproducible target (`KOTO-0044`).
+3. Freeze the high-level language subset (`KOTO-0045`).
+4. Build the compiler MVP and SDK prelude (`KOTO-0046`, `KOTO-0047`).
+5. Wire the package/build/harness loop (`KOTO-0048`).
+6. Improve simulator diagnostics and app launch flow (`KOTO-0049`, `KOTO-0050`,
+   `KOTO-0051`, `KOTO-0056`, `KOTO-0058`).
+7. Add samples, scaffolding, assets, save-data helpers, and shell details
+   (`KOTO-0052`, `KOTO-0053`, `KOTO-0054`, `KOTO-0055`, `KOTO-0057`).
+8. Rewrite Koto Memo as a high-level source app compiled to bytecode
+   (`KOTO-0041`).
+
+The important product shift is that KotoOS becomes user-evaluable only when a
+real app can be authored, built, launched, interacted with, and persisted through
+the same runtime path that future apps will use.

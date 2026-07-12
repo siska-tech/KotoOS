@@ -1,0 +1,252 @@
+// Recompute visibility: clear all lit bits, then light the player's room
+// (classic Rogue room-lighting) plus the 8 cells around the player (corridors).
+// Also records the lit-area bounding box into stats (the per-frame render scans
+// only that window) and returns the index of the room containing the player,
+// or -1 in a corridor — the caller uses it to skip static-layer rebuilds for
+// moves that cannot have changed the fog.
+fn reveal(map: int, rooms: int, nrooms: int, px: int, py: int, stats: int, clearw: int) -> int {
+    // Lit bits only ever exist inside the previously recorded window, so the
+    // clear pass walks that window (~a room) instead of all 300 cells. When
+    // the caller already delta-cleared a tiny old halo (corridor steps), it
+    // passes clearw == 0 and the window walk is skipped entirely.
+    if clearw != 0 {
+        let cy = gs(stats, ST_LITY0);
+        let cy1 = gs(stats, ST_LITY1);
+        let cx0 = gs(stats, ST_LITX0);
+        let cx1 = gs(stats, ST_LITX1);
+        while cy <= cy1 {
+            let cx = cx0;
+            while cx <= cx1 {
+                let ca = map + cy * MAP_W + cx;
+                heap_set_u8(ca, heap_get_u8(ca) & 239);
+                cx = cx + 1;
+            }
+            cy = cy + 1;
+        }
+    }
+    // Halo bounds (clamped); the room bounds join below as whole rectangles,
+    // so the light loops carry no per-cell bookkeeping.
+    let x0 = px - 1;
+    if x0 < 0 { x0 = 0; }
+    let y0 = py - 1;
+    if y0 < 0 { y0 = 0; }
+    let x1 = px + 1;
+    if x1 >= MAP_W { x1 = MAP_W - 1; }
+    let y1 = py + 1;
+    if y1 >= MAP_H { y1 = MAP_H - 1; }
+
+    let inroom = 0 - 1;
+    let r = 0;
+    while r < nrooms {
+        let rx = heap_get_u8(rooms + r * 4);
+        let ry = heap_get_u8(rooms + r * 4 + 1);
+        let rw = heap_get_u8(rooms + r * 4 + 2);
+        let rh = heap_get_u8(rooms + r * 4 + 3);
+        // Light only the first room containing the player. Rooms may overlap;
+        // lighting every containing room could put ~100 lit tiles on screen at
+        // once, blowing the device's 96-command immediate budget (hardware
+        // showed pixels=95 + ovf growing — entities and HUD tail-dropped).
+        if inroom < 0 && px >= rx && px < rx + rw && py >= ry && py < ry + rh {
+            inroom = r;
+            let yy = ry - 1;
+            while yy <= ry + rh {
+                let xx = rx - 1;
+                while xx <= rx + rw {
+                    if xx >= 0 && xx < MAP_W && yy >= 0 && yy < MAP_H {
+                        let a = map + yy * MAP_W + xx;
+                        heap_set_u8(a, heap_get_u8(a) | 24);
+                    }
+                    xx = xx + 1;
+                }
+                yy = yy + 1;
+            }
+            let b = rx - 1;
+            if b < 0 { b = 0; }
+            if b < x0 { x0 = b; }
+            b = ry - 1;
+            if b < 0 { b = 0; }
+            if b < y0 { y0 = b; }
+            b = rx + rw;
+            if b >= MAP_W { b = MAP_W - 1; }
+            if b > x1 { x1 = b; }
+            b = ry + rh;
+            if b >= MAP_H { b = MAP_H - 1; }
+            if b > y1 { y1 = b; }
+        }
+        r = r + 1;
+    }
+    let dy = 0 - 1;
+    while dy <= 1 {
+        let dx = 0 - 1;
+        while dx <= 1 {
+            let xx = px + dx;
+            let yy = py + dy;
+            if xx >= 0 && xx < MAP_W && yy >= 0 && yy < MAP_H {
+                let a = map + yy * MAP_W + xx;
+                heap_set_u8(a, heap_get_u8(a) | 24);
+            }
+            dx = dx + 1;
+        }
+        dy = dy + 1;
+    }
+    ss(stats, ST_LITX0, x0);
+    ss(stats, ST_LITY0, y0);
+    ss(stats, ST_LITX1, x1);
+    ss(stats, ST_LITY1, y1);
+    return inroom;
+}
+
+// Carve a horizontal corridor on row y between columns xa..xb.
+fn carve_h(map: int, xa: int, xb: int, y: int) {
+    let x = xa;
+    let e = xb;
+    if x > e { let tmp = x; x = e; e = tmp; }
+    while x <= e {
+        let a = map + y * MAP_W + x;
+        if (heap_get_u8(a) & 7) == 0 { heap_set_u8(a, T_FLOOR); }
+        x = x + 1;
+    }
+}
+
+// Carve a vertical corridor on column x between rows ya..yb.
+fn carve_v(map: int, ya: int, yb: int, x: int) {
+    let y = ya;
+    let e = yb;
+    if y > e { let tmp = y; y = e; e = tmp; }
+    while y <= e {
+        let a = map + y * MAP_W + x;
+        if (heap_get_u8(a) & 7) == 0 { heap_set_u8(a, T_FLOOR); }
+        y = y + 1;
+    }
+}
+
+// Build a fresh dungeon level: walls, rooms, connecting corridors, stairs,
+// scattered items, and monsters scaled to `depth`. Writes the player start into
+// stats. RNG state is threaded through stats so each level differs.
+fn gen_level(map: int, rooms: int, actors: int, stats: int, depth: int) {
+    let n = MAP_W * MAP_H;
+    let i = 0;
+    while i < n { heap_set_u8(map + i, T_WALL); i = i + 1; }
+
+    let prevx = 0;
+    let prevy = 0;
+    let r = 0;
+    while r < ROOM_MAX {
+        let rw = 4 + rng(stats, 3);
+        let rh = 3 + rng(stats, 3);
+        let rx = 1 + rng(stats, MAP_W - rw - 2);
+        let ry = 1 + rng(stats, MAP_H - rh - 2);
+        heap_set_u8(rooms + r * 4, rx);
+        heap_set_u8(rooms + r * 4 + 1, ry);
+        heap_set_u8(rooms + r * 4 + 2, rw);
+        heap_set_u8(rooms + r * 4 + 3, rh);
+        let yy = ry;
+        while yy < ry + rh {
+            let xx = rx;
+            while xx < rx + rw {
+                heap_set_u8(map + yy * MAP_W + xx, T_FLOOR);
+                xx = xx + 1;
+            }
+            yy = yy + 1;
+        }
+        let cx = rx + rw / 2;
+        let cy = ry + rh / 2;
+        if r > 0 {
+            carve_h(map, prevx, cx, prevy);
+            carve_v(map, prevy, cy, cx);
+        }
+        prevx = cx;
+        prevy = cy;
+        r = r + 1;
+    }
+
+    // Player starts at the centre of the first room.
+    let p0x = heap_get_u8(rooms) + heap_get_u8(rooms + 2) / 2;
+    let p0y = heap_get_u8(rooms + 1) + heap_get_u8(rooms + 3) / 2;
+    ss(stats, ST_PX, p0x);
+    ss(stats, ST_PY, p0y);
+    // Stairs sit at the centre of the last room placed.
+    heap_set_u8(map + prevy * MAP_W + prevx, T_STAIRS);
+
+    // Scatter gold (and the occasional potion) on open floor.
+    let items = 4 + depth;
+    let k = 0;
+    while k < items {
+        let x = rng(stats, MAP_W);
+        let y = rng(stats, MAP_H);
+        let a = map + y * MAP_W + x;
+        if (heap_get_u8(a) & 7) == T_FLOOR && (x != p0x || y != p0y) {
+            if rng(stats, 3) == 0 { heap_set_u8(a, T_POTION); }
+            else { heap_set_u8(a, T_GOLD); }
+        }
+        k = k + 1;
+    }
+
+    // Populate monsters in rooms other than the player's, scaled by depth.
+    let count = 3 + depth;
+    if count > MON_MAX { count = MON_MAX; }
+    let maxt = depth / 2;
+    if maxt > 5 { maxt = 5; }
+    let m = 0;
+    while m < MON_MAX {
+        if m < count {
+            let rr = 1 + rng(stats, ROOM_MAX - 1);
+            let mx = heap_get_u8(rooms + rr * 4) + rng(stats, heap_get_u8(rooms + rr * 4 + 2));
+            let my = heap_get_u8(rooms + rr * 4 + 1) + rng(stats, heap_get_u8(rooms + rr * 4 + 3));
+            let t = rng(stats, maxt + 1);
+            actor_set_pos(actors, m, mx, my);
+            actor_set_vel(actors, m, 0, 0);
+            actor_set_frame(actors, m, t);
+            actor_set_state(actors, m, mon_hp(t));
+            actor_set_timer(actors, m, 1);
+        } else {
+            actor_set_timer(actors, m, 0);
+        }
+        m = m + 1;
+    }
+}
+
+// Run every monster's turn. Lit monsters chase the player; adjacent ones attack.
+// Returns the total damage dealt to the player this turn.
+fn monsters_act(map: int, actors: int, n: int, stats: int) -> int {
+    let px = gs(stats, ST_PX);
+    let py = gs(stats, ST_PY);
+    let dmg = 0;
+    let i = 0;
+    while i < n {
+        if actor_timer(actors, i) != 0 {
+            let mx = actor_x(actors, i);
+            let my = actor_y(actors, i);
+            let adx = px - mx;
+            let ady = py - my;
+            let dist = iabs(adx) + iabs(ady);
+            if dist == 1 {
+                dmg = dmg + mon_atk(actor_frame(actors, i));
+            } else if (heap_get_u8(map + my * MAP_W + mx) & 16) != 0 && dist <= 8 {
+                let sx = 0;
+                let sy = 0;
+                if iabs(adx) >= iabs(ady) {
+                    if adx < 0 { sx = 0 - 1; } else if adx > 0 { sx = 1; }
+                } else {
+                    if ady < 0 { sy = 0 - 1; } else if ady > 0 { sy = 1; }
+                }
+                if canstep(map, actors, n, px, py, mx + sx, my + sy) == 0 {
+                    sx = 0;
+                    sy = 0;
+                    if iabs(adx) >= iabs(ady) {
+                        if ady < 0 { sy = 0 - 1; } else if ady > 0 { sy = 1; }
+                    } else {
+                        if adx < 0 { sx = 0 - 1; } else if adx > 0 { sx = 1; }
+                    }
+                }
+                if canstep(map, actors, n, px, py, mx + sx, my + sy) == 1 {
+                    actor_set_pos(actors, i, mx + sx, my + sy);
+                    // Start the visual slide from the old tile toward the new one.
+                    actor_set_vel(actors, i, 0 - sx * TILE, 0 - sy * TILE);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return dmg;
+}

@@ -1,0 +1,5 @@
+# KotoVN tiny script fixture for KOTO-0028.
+background assets/bg_room.rle
+text speaker="Koto" "Welcome to the tiny VN fixture."
+text "Backgrounds are streamed, decoded, and drawn by the host engine."
+end

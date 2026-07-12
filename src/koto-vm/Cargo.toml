@@ -1,0 +1,22 @@
+[package]
+name = "koto-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Opt-in per-opcode execution counting for profiling (KOTO-0153). Off by default so
+# `no_std`/device builds do not carry the 2 KiB counter table; the rest of the
+# execution-stats surface (cumulative counts, budget peaks) is always available.
+opcode_stats = []
+# Opt-in SRAM placement of the interpreter hot loop (KOTO-0169 Stage 2, lever
+# H2-b): tags `execute_frame_with` / `step` / `exec_binary` with a `.data.*`
+# link section so a cortex-m-rt-style startup copies them to RAM and per-op
+# dispatch stops paying flash-XIP fetch misses. Semantics are untouched — the
+# attribute only moves where the machine code lives. Device-only: it needs a
+# linker script that loads `.data.*` into RAM (the firmware's cortex-m-rt
+# link.x); off by default so host/sim builds are byte-identical.
+ram_interpreter = []

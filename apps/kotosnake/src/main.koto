@@ -1,0 +1,605 @@
+// dev.koto.games.kotosnake — "KotoSnake", a deliberately over-the-top Snake game for
+// KotoOS authored in the Koto language (see docs/spec/KOTO_APP_LANGUAGE.md and
+// docs/spec/KOTO_SDK.md). The classic rules are tiny; the *presentation* is the point:
+// a flowing-rainbow snake, a pulsing glowing apple, screen shake, a particle burst on
+// every bite (an ActorArray of 24 sparks), an eat-flash frame, a rising "+10" popup,
+// a "SPEED UP!" banner, and a dramatic explosion + slamming panel on death.
+//
+// The board is an 18x14 grid of 16px cells (252 cells, so a cell index fits one byte).
+// The snake is a ring buffer of cell indices in `body` with an `occ` occupancy grid,
+// so each step is O(1): drop the tail's cell, claim the new head's. Walls wrap to the
+// opposite edge (running into yourself is the only way to lose), and segments ease
+// smoothly between cells (interpolated by the step progress). Audio is host-owned
+// (KOTO-0095): SFX use package `.kmml`, and the BGM uses a *package-defined custom
+// wavetable instrument* (`#INST` + `.kwt`, KOTOMML wavetable extension) so the music
+// carries KotoSnake's own timbre rather than a built-in voice.
+//
+// Controls: Arrow keys turn, F1 start / retry, F10 quit.
+
+// --- RGB565 palette ---
+const C_BG = 4168;        // near-black violet page
+const C_FIELD = 6284;     // dark playfield
+const C_GRID = 12562;     // faint cell grid
+const C_TOP = 20632;      // header / HUD bar
+const C_TOPHI = 49183;    // accent line on bars (violet)
+const C_TEXT = 65535;     // white
+const C_DIM = 33808;      // muted label grey
+const C_GOLD = 65156;     // score gold
+const C_FOOD = 63694;     // apple body (hot pink-red)
+const C_FOODGLOW = 41032; // apple halo
+const C_EYE = 2113;       // snake eye ink
+const C_OVER = 63754;     // game-over panel red
+const C_SHADOW = 2080;    // soft drop shadow
+
+// Retained Game2D layers (KOTO-0136 / KOTO-0141, the KotoBlocks playbook). The page
+// background, the fixed playfield + grid, the header/HUD bars, and the static labels
+// are captured once into the host's static layer on the title->play transition, so
+// they cost no host call and no immediate draw command per gameplay frame. The live
+// HUD numbers are retained text, keyed by a stable id, so an unchanged value costs
+// nothing and they never shift the (snake/particle-driven) immediate command list.
+// Only the animated snake/apple/particles and transient overlays stay immediate.
+const T_SCORE = 0;
+const T_LEN = 1;
+const T_BEST = 2;
+
+// Length-aware snake-body render budget. The near-head zone — the head plus the next
+// RICH_N-1 body cells — keeps the full visual identity: a flowing-rainbow block, a
+// glossy glint, and smooth sub-cell sliding. Older tail segments beyond RICH_N are
+// coalesced into collinear *run* rects (one rect per straight stretch of the body,
+// cell-aligned), and the number of those run rects is capped at TAIL_BUDGET. So the
+// snake's immediate draw-command cost is bounded by a constant
+// (head 8 + (RICH_N-1)*2 + TAIL_BUDGET = 46 rects) no matter how long it grows,
+// keeping APP_DRAW well under the 96-command device cap — no AreaExceeded /
+// RectsExceeded overflow on a very long snake. See
+// docs/devlog/KOTO_KOTOSNAKE_LONG_SNAKE_BUDGET.md.
+const RICH_N = 12;
+const TAIL_BUDGET = 16;
+
+// A 12-hue rainbow for the flowing snake body, the particles, and the flashing chrome.
+fn rainbow(k: int) -> int {
+    if k == 0 { return 63488; }   // red
+    if k == 1 { return 64256; }   // orange
+    if k == 2 { return 65344; }   // yellow
+    if k == 3 { return 38880; }   // chartreuse
+    if k == 4 { return 2016; }    // green
+    if k == 5 { return 2034; }    // spring
+    if k == 6 { return 1887; }    // cyan
+    if k == 7 { return 1119; }    // azure
+    if k == 8 { return 8479; }    // blue
+    if k == 9 { return 28703; }   // indigo
+    if k == 10 { return 49183; }  // violet
+    return 63512;                 // magenta
+}
+
+fn sfx_eat()   { play_sfx_asset("audio/kotosnake_eat.kmml", 24); }
+fn sfx_turn()  { play_sfx_asset("audio/kotosnake_turn.kmml", 25); }
+fn sfx_over()  { play_sfx_asset("audio/kotosnake_over.kmml", 25); }
+fn sfx_start() { play_sfx_asset("audio/kotosnake_start.kmml", 26); }
+fn sfx_level() { play_sfx_asset("audio/kotosnake_level.kmml", 26); }
+
+// Spawn up to `n` sparks at pixel (bx, by) into the 24-slot ActorArray `parts`. Each
+// spark stores sub-pixel (x8) position/velocity, a rainbow colour in `frame`, and a
+// life in `timer`. Velocities come from the passed RNG `seed`, returned so the caller
+// keeps the sequence moving. The LCG stays < 65537 so it never overflows i32.
+fn spawn_burst(parts: int, bx: int, by: int, n: int, seed: int) -> int {
+    let placed = 0;
+    let j = 0;
+    while j < 24 {
+        if placed >= n { break; }
+        if actor_state(parts, j) == 0 {
+            seed = (seed * 75 + 74) % 65537;
+            let vx = (seed % 17) - 8;
+            seed = (seed * 75 + 74) % 65537;
+            let vy = (seed % 13) - 9;
+            actor_set_pos(parts, j, bx * 8, by * 8);
+            actor_set_vel(parts, j, vx * 5, vy * 5);
+            actor_set_state(parts, j, 1);
+            actor_set_frame(parts, j, j % 12);
+            actor_set_timer(parts, j, 20 + seed % 14);
+            placed = placed + 1;
+        }
+        j = j + 1;
+    }
+    return seed;
+}
+
+// Advance and draw every live spark: integrate velocity with a little gravity, shrink
+// the spark as its life runs out, and retire it at zero.
+fn step_particles(parts: int) {
+    let j = 0;
+    while j < 24 {
+        if actor_state(parts, j) != 0 {
+            let life = actor_timer(parts, j);
+            if life <= 1 {
+                actor_set_state(parts, j, 0);
+            } else {
+                actor_set_timer(parts, j, life - 1);
+                let vx = actor_vx(parts, j);
+                let vy = actor_vy(parts, j) + 2;
+                let x = actor_x(parts, j) + vx;
+                let y = actor_y(parts, j) + vy;
+                actor_set_vel(parts, j, vx, vy);
+                actor_set_pos(parts, j, x, y);
+                let sz = 2 + life / 7;
+                draw_rect(x / 8, y / 8, sz, sz, rainbow(actor_frame(parts, j) % 12));
+            }
+        }
+        j = j + 1;
+    }
+}
+
+fn main() {
+    buf body[256];   // ring buffer of snake cell indices (tail..head)
+    buf occ[256];    // occupancy grid keyed by cell index (1 = snake)
+    buf num[6];      // decimal formatting scratch
+
+    let parts = actor_array_new(24);  // particle pool (sparks)
+
+    // Persistent game state.
+    let state = 0;       // 0 title, 1 play, 2 game over
+    let dir = 0;         // committed heading: 0 R, 1 D, 2 L, 3 U
+    let ndir = 0;        // pending heading (applied at the next step)
+    let hx = 8;          // head cell x / y
+    let hy = 7;
+    let head = 3;        // ring index of the head
+    let len = 4;         // snake length (cells)
+    let fx = 0;          // apple cell x / y
+    let fy = 0;
+    let score = 0;
+    let best = 0;
+    let stepc = 0;       // frames since the last step
+    let speed = 8;       // frames per step (falls as the snake grows)
+    let tick = 0;        // global animation clock
+    let shake = 0;       // screen-shake frames remaining
+    let eatflash = 0;    // eat-flash frames remaining
+    let rng = 24691;     // RNG state (kept < 65537)
+    let deatht = 0;      // game-over animation clock
+    let popt = 0;        // "+10" popup frames remaining
+    let levt = 0;        // "SPEED UP!" banner frames remaining
+    let mstage = 0;      // current music stage (0/1/2): the BGM escalates as the snake grows
+    let mbanner = 0;     // music-change banner frames remaining
+
+    // Reused scratch (the 45-slot user-local file is shared, so these double as
+    // transient temporaries at non-overlapping times).
+    let intent = 0;
+    let i = 0;
+    let t = 0;
+    let sx = 0;
+    let sy = 0;
+    let c = 0;       // also the shake x-offset during render
+    let v = 0;       // also the shake y-offset during render
+    let col = 0;
+    let cell = 0;
+    let px = 0;      // render scratch: per-segment slide delta; also tail-run min x/y
+    let py = 0;      //   (px/py) during the coalesced-tail pass, where the slide is unused
+    // Coalesced-tail run state (reused only in the render's tail pass): `ry1` is the
+    // run's max cell-y (px=min x, intent=max x, py=min y form the rest of the bbox),
+    // and `rbud` is the remaining run-rect budget. Two slots, the only ones this
+    // length-aware change adds (43 -> 45 user slots, at the cap).
+    let ry1 = 0;
+    let rbud = 0;
+
+    loop {
+        intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
+        tick = tick + 1;
+        if shake > 0 { shake = shake - 1; }
+        if eatflash > 0 { eatflash = eatflash - 1; }
+        if popt > 0 { popt = popt - 1; }
+        if levt > 0 { levt = levt - 1; }
+        if mbanner > 0 { mbanner = mbanner - 1; }
+
+        // ---- Title ----
+        if state == 0 {
+            if (intent & INTENT_IME_TOGGLE) != 0 || (intent & INTENT_NEWLINE) != 0 {
+                // (Re)initialise a fresh game and dive in.
+                i = 0;
+                while i < 256 { occ[i] = 0; i = i + 1; }
+                len = 4; hx = 8; hy = 7; head = 3; dir = 0; ndir = 0;
+                i = 0;
+                while i < 4 {
+                    c = 7 * 18 + 5 + i;   // cells x=5..8 at y=7 (tail..head)
+                    body[i] = c;
+                    occ[c] = 1;
+                    i = i + 1;
+                }
+                score = 0; speed = 8; stepc = 0;
+                eatflash = 0; shake = 0; deatht = 0; popt = 0; levt = 0;
+                mstage = 0; mbanner = 0;
+                // Place the first apple on a random empty cell.
+                c = -1; i = 0;
+                while i < 80 {
+                    rng = (rng * 75 + 74) % 65537;
+                    v = rng % 252;
+                    if occ[v] == 0 { c = v; i = 80; }
+                    i = i + 1;
+                }
+                if c < 0 { c = 100; }
+                fx = c % 18; fy = c / 18;
+                state = 1;
+                sfx_start();
+                play_bgm_asset("audio/kotosnake_bgm.kmml", 24);
+
+                // Build the retained static chrome layer once (KOTO-0136): the page
+                // background (also the host's full-screen base), the header/HUD bars,
+                // the fixed playfield + faint grid, and the fixed labels are identical
+                // on every gameplay frame and never move, so capturing them here drops
+                // ~43 immediate draw commands per frame -- enough that a long snake no
+                // longer overflows the 96-command device draw budget -- and gives the
+                // device a layout-stable base its positional command diff never
+                // re-examines. Reuses `i` as the grid cursor (free after game init).
+                game2d_static_begin();
+                draw_rect(0, 0, 320, 320, C_BG);
+                draw_rect(0, 0, 320, 34, C_TOP);
+                draw_rect(0, 34, 320, 2, C_TOPHI);
+                draw_text_color(196, 11, "スコア", 9, C_DIM);
+                draw_rect(16, 44, 288, 224, C_FIELD);
+                i = 0;
+                while i <= 18 { draw_rect(16 + i * 16, 44, 1, 224, C_GRID); i = i + 1; }
+                i = 0;
+                while i <= 14 { draw_rect(16, 44 + i * 16, 288, 1, C_GRID); i = i + 1; }
+                draw_rect(0, 270, 320, 50, C_TOP);
+                draw_rect(0, 270, 320, 2, C_TOPHI);
+                draw_text_color(10, 280, "ながさ", 9, C_DIM);
+                draw_text_color(118, 280, "ベスト", 9, C_DIM);
+                draw_text_color(10, 301, "やじるし そうさ   F10 おわり", 36, C_DIM);
+                game2d_static_end();
+            }
+
+            draw_rect(0, 0, 320, 320, C_BG);
+            // Big rainbow logo with a shadow + colour-cycling fill.
+            draw_text_color(57, 79, "KotoSnake", 9, C_SHADOW);
+            draw_text_color(55, 77, "KotoSnake", 9, rainbow((tick / 3) % 12));
+            draw_text_color(126, 104, "- DELUXE -", 10, C_DIM);
+
+            // A decorative zigzag snake slithering across the screen.
+            i = 0;
+            while i < 14 {
+                t = (i * 2 + tick / 3) % 8;
+                if t > 4 { t = 8 - t; }
+                sx = 18 + i * 21;
+                sy = 150 + t * 9;
+                draw_rect(sx, sy, 18, 18, rainbow((i + tick / 2) % 12));
+                draw_rect(sx + 3, sy + 3, 6, 4, C_TEXT);
+                i = i + 1;
+            }
+
+            if (tick & 16) != 0 {
+                draw_text_color(96, 250, "F1 ではじめる", 18, C_TEXT);
+            } else {
+                draw_text_color(96, 250, "F1 ではじめる", 18, C_GOLD);
+            }
+            draw_text_color(92, 285, "やじるしでうごく", 24, C_DIM);
+            yield_frame();
+            continue;
+        }
+
+        // ---- Play: capture turns every frame, step on the speed clock ----
+        if state == 1 {
+            // The music escalates with the snake: stage 1 -> 2 -> 3 swaps to a faster,
+            // busier (then frantic, different) BGM. `len` only grows, so this only ever
+            // steps up; switching restarts the loop with a flourish banner.
+            t = 0;
+            if len >= 10 { t = 1; }
+            if len >= 18 { t = 2; }
+            if t != mstage {
+                mstage = t;
+                mbanner = 44;
+                if mstage == 1 { play_bgm_asset("audio/kotosnake_bgm2.kmml", 25); }
+                if mstage == 2 { play_bgm_asset("audio/kotosnake_bgm3.kmml", 25); }
+            }
+
+            t = ndir;
+            if (intent & INTENT_LEFT) != 0  && dir != 0 { ndir = 2; }
+            if (intent & INTENT_RIGHT) != 0 && dir != 2 { ndir = 0; }
+            if (intent & INTENT_UP) != 0    && dir != 1 { ndir = 3; }
+            if (intent & INTENT_DOWN) != 0  && dir != 3 { ndir = 1; }
+            if ndir != t { sfx_turn(); }
+
+            speed = 8 - (len - 4) / 3;
+            if speed < 3 { speed = 3; }
+            stepc = stepc + 1;
+            if stepc >= speed {
+                stepc = 0;
+                dir = ndir;
+                // Next head cell.
+                sx = hx; sy = hy;
+                if dir == 0 { sx = hx + 1; }
+                if dir == 1 { sy = hy + 1; }
+                if dir == 2 { sx = hx - 1; }
+                if dir == 3 { sy = hy - 1; }
+
+                // Walls wrap to the opposite side (forgiving edges, no wall death).
+                if sx < 0 { sx = 17; }
+                if sx > 17 { sx = 0; }
+                if sy < 0 { sy = 13; }
+                if sy > 13 { sy = 0; }
+
+                c = sy * 18 + sx;            // new head cell index
+                v = 0;
+                if sx == fx && sy == fy { v = 1; }   // about to eat?
+                if v == 0 {
+                    // Free the tail before the self-collision test so the snake may
+                    // follow its own vacating tail.
+                    i = body[(head - len + 1 + 256) % 256];
+                    occ[i] = 0;
+                }
+                if occ[c] != 0 {
+                    // Ran into itself: die (the only way to lose now).
+                    state = 2; deatht = 0; shake = 9;
+                    rng = spawn_burst(parts, 16 + hx * 16 + 8, 44 + hy * 16 + 8, 22, rng);
+                    sfx_over(); stop_bgm();
+                } else {
+                    head = (head + 1) % 256;
+                    body[head] = c;
+                    occ[c] = 1;
+                    hx = sx; hy = sy;
+                    if v != 0 {
+                        len = len + 1;
+                        score = score + 10;
+                        if score > best { best = score; }
+                        eatflash = 6; shake = 5; popt = 18;
+                        rng = spawn_burst(parts, 16 + hx * 16 + 8, 44 + hy * 16 + 8, 10, rng);
+                        sfx_eat();
+                        if (len - 4) % 3 == 0 { levt = 26; sfx_level(); }
+                        // New apple on a random empty cell.
+                        c = -1; i = 0;
+                        while i < 80 {
+                            rng = (rng * 75 + 74) % 65537;
+                            v = rng % 252;
+                            if occ[v] == 0 { c = v; i = 80; }
+                            i = i + 1;
+                        }
+                        if c < 0 {
+                            v = 0;
+                            while v < 252 { if occ[v] == 0 { c = v; v = 252; } v = v + 1; }
+                        }
+                        if c >= 0 { fx = c % 18; fy = c / 18; }
+                    }
+                }
+            }
+        } else {
+            // ---- Game over ----
+            deatht = deatht + 1;
+            if (intent & INTENT_IME_TOGGLE) != 0 || (intent & INTENT_NEWLINE) != 0 {
+                state = 0;
+                // Returning to the title (which redraws fully every frame): drop the
+                // retained HUD values and empty the static chrome layer so neither
+                // lingers under the title screen. The simulator composites the
+                // retained text/static-label layers *above* the title's immediate
+                // background fill, so without this the old score/labels would show
+                // through; re-entering play rebuilds both.
+                game2d_text_clear_all();
+                game2d_static_begin();
+                game2d_static_end();
+            }
+        }
+
+        // ====== Render ======
+        // Shake offsets (also reuse c/v as scratch elsewhere; here they are the offset).
+        c = 0; v = 0;
+        if shake > 0 {
+            c = (shake & 1) * 6 - 3;
+            v = (tick & 1) * 6 - 3;
+        }
+
+        // The page background, header/HUD bars, the fixed playfield + faint grid, and
+        // the fixed labels are in the retained Game2D static layer (built once on the
+        // title->play transition); the host composites it beneath this per-frame render,
+        // so only the animated snake/apple/particles, the live HUD values (retained
+        // text), and transient overlays are emitted below. The playfield is fixed now,
+        // so screen-shake (c, v) jolts only the snake/apple/effects over a steady field
+        // rather than the whole board.
+
+        // Header: the colour-cycling logo stays immediate (it animates every frame),
+        // while the live score is retained text (T_SCORE) -- free on frames it does not
+        // change and never shifting the snake/particle-driven immediate command list.
+        draw_text_color(10, 9, "KotoSnake", 9, rainbow((tick / 4) % 12));
+        t = score; i = 5;
+        while i >= 0 { num[i] = 48 + t % 10; t = t / 10; i = i - 1; }
+        game2d_text_set(T_SCORE, 250, 9, num, 6, C_GOLD);
+
+        // Apple: a pulsing halo, a body that breathes, and a shine, with an orbiting
+        // sparkle for good measure.
+        sx = 16 + fx * 16 + c;
+        sy = 44 + fy * 16 + v;
+        t = tick % 16;
+        if t > 8 { t = 16 - t; }      // 0..8 triangle pulse
+        if (tick & 4) != 0 {
+            draw_rect(sx - 2, sy - 2, 20, 20, C_FOODGLOW);
+        }
+        col = 10 + t;                  // breathing size 10..18
+        draw_rect(sx + (16 - col) / 2, sy + (16 - col) / 2, col, col, C_FOOD);
+        draw_rect(sx + 4, sy + 3, 3, 3, C_TEXT);
+        // Sparkle orbits the apple on the animation clock.
+        i = tick % 4;
+        if i == 0 { draw_rect(sx + 13, sy + 6, 3, 3, C_TEXT); }
+        if i == 1 { draw_rect(sx + 6, sy + 13, 3, 3, C_TEXT); }
+        if i == 2 { draw_rect(sx - 1, sy + 6, 3, 3, C_TEXT); }
+        if i == 3 { draw_rect(sx + 6, sy - 1, 3, 3, C_TEXT); }
+
+        // Snake, near-head zone: the head plus the next RICH_N-1 body cells keep the
+        // full look — a flowing-rainbow block with a glossy glint, the head's bright
+        // chrome outline + eyes, and smooth sub-cell sliding. On death the whole snake
+        // strobes white for the first few frames. Segments beyond RICH_N are handed to
+        // the coalesced-tail pass below so a very long snake stays within APP_DRAW.
+        i = 0;
+        while i < len {
+            if i >= RICH_N { break; }
+            t = (head - i + 256) % 256;
+            cell = body[t];
+            sx = 16 + (cell % 18) * 16;
+            sy = 44 + (cell / 18) * 16;
+            // Smooth movement: while playing, ease each segment from its previous cell
+            // toward its current one by the step progress (stepc/speed). On a board wrap
+            // (cells jump by more than one) the slide is skipped so it does not streak
+            // across the field.
+            if state == 1 {
+                t = body[(head - i - 1 + 256) % 256];   // previous cell
+                px = (cell % 18) - (t % 18);
+                py = (cell / 18) - (t / 18);
+                if px <= 1 && px >= -1 && py <= 1 && py >= -1 {
+                    sx = sx - px * 16 + px * 16 * stepc / speed;
+                    sy = sy - py * 16 + py * 16 * stepc / speed;
+                }
+            }
+            sx = sx + c;
+            sy = sy + v;
+            col = rainbow((i + tick / 2) % 12);
+            if state == 2 && deatht < 12 && (deatht & 1) == 0 { col = C_TEXT; }
+            draw_rect(sx + 1, sy + 1, 14, 14, col);
+            draw_rect(sx + 3, sy + 3, 6, 3, C_TEXT);
+            if i == 0 {
+                draw_rect(sx, sy, 16, 2, C_TEXT);
+                draw_rect(sx, sy + 14, 16, 2, C_TEXT);
+                draw_rect(sx, sy, 2, 16, C_TEXT);
+                draw_rect(sx + 14, sy, 2, 16, C_TEXT);
+                // Eyes lead the heading.
+                if dir == 0 { draw_rect(sx + 10, sy + 3, 3, 3, C_EYE); draw_rect(sx + 10, sy + 10, 3, 3, C_EYE); }
+                if dir == 2 { draw_rect(sx + 3, sy + 3, 3, 3, C_EYE); draw_rect(sx + 3, sy + 10, 3, 3, C_EYE); }
+                if dir == 1 { draw_rect(sx + 3, sy + 10, 3, 3, C_EYE); draw_rect(sx + 10, sy + 10, 3, 3, C_EYE); }
+                if dir == 3 { draw_rect(sx + 3, sy + 3, 3, 3, C_EYE); draw_rect(sx + 10, sy + 3, 3, 3, C_EYE); }
+            }
+            i = i + 1;
+        }
+
+        // Snake, coalesced tail (segments RICH_N..len-1). A snake's body is a path of
+        // adjacent cells, so a stretch heading the same way is a straight run that can
+        // be drawn as ONE rect instead of one-per-cell. Walking head→tail, contiguous
+        // collinear cells are merged into a bounding run (px/intent = min/max cell x,
+        // py/ry1 = min/max cell y); a turn (or board wrap) flushes the run as a single
+        // rainbow rect and starts a new one. `rbud` caps the run rects at TAIL_BUDGET,
+        // so however long or wiggly the tail, this pass adds at most TAIL_BUDGET
+        // commands; if a pathologically zig-zagging tail would exceed that, the oldest
+        // (last-walked) runs are dropped — the snake reads a touch shorter rather than
+        // overflowing APP_DRAW. The tail is cell-aligned (no sub-cell slide) and one
+        // rainbow hue per run; near the head, where the eye is, everything still flows.
+        if len > RICH_N {
+            rbud = TAIL_BUDGET;
+            i = RICH_N;
+            cell = body[(head - i + 256) % 256];
+            px = cell % 18; intent = px;          // run min/max x
+            py = cell / 18; ry1 = py;             // run min/max y
+            i = i + 1;
+            while i <= len {
+                if i < len {
+                    cell = body[(head - i + 256) % 256];
+                    sx = cell % 18;
+                    sy = cell / 18;
+                    // Extend the current run if (sx, sy) is the cell adjacent to one of
+                    // its ends along the run's axis; otherwise fall through and flush.
+                    // The adjacency test (sx/sy exactly one past an end) is what stops a
+                    // board-wrap cell — same row/column but on the far edge — from
+                    // merging the whole row into one rect.
+                    if px == intent && py == ry1 {
+                        // Single cell so far: extend toward any of the four neighbours.
+                        if sx == px && (sy == py - 1 || sy == py + 1) {
+                            if sy < py { py = sy; } else { ry1 = sy; }
+                            i = i + 1;
+                            continue;
+                        }
+                        if sy == py && (sx == px - 1 || sx == px + 1) {
+                            if sx < px { px = sx; } else { intent = sx; }
+                            i = i + 1;
+                            continue;
+                        }
+                    } else {
+                        if py == ry1 {
+                            if sy == py && (sx == px - 1 || sx == intent + 1) {
+                                if sx < px { px = sx; } else { intent = sx; }  // horizontal
+                                i = i + 1;
+                                continue;
+                            }
+                        } else {
+                            if sx == px && (sy == py - 1 || sy == ry1 + 1) {
+                                if sy < py { py = sy; } else { ry1 = sy; }     // vertical
+                                i = i + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // Flush the current run as one rect (a turn/wrap, or the tail end at
+                // i == len). `rbud` caps the run rects at TAIL_BUDGET; once spent, the
+                // remaining (oldest) tail is dropped rather than overflowing APP_DRAW.
+                if rbud <= 0 { break; }
+                col = rainbow((i + tick / 2) % 12);
+                if state == 2 && deatht < 12 && (deatht & 1) == 0 { col = C_TEXT; }
+                draw_rect(16 + px * 16 + c + 1, 44 + py * 16 + v + 1,
+                          (intent - px + 1) * 16 - 2, (ry1 - py + 1) * 16 - 2, col);
+                rbud = rbud - 1;
+                if i >= len { break; }
+                px = sx; intent = sx; py = sy; ry1 = sy;   // start a new run here
+                i = i + 1;
+            }
+        }
+
+        // Sparks over the field.
+        step_particles(parts);
+
+        // Eat-flash: a bright rainbow frame snapped around the field for a few frames.
+        if eatflash > 0 {
+            col = rainbow(tick % 12);
+            draw_rect(13 + c, 41 + v, 294, 3, col);
+            draw_rect(13 + c, 265 + v, 294, 3, col);
+            draw_rect(13 + c, 41 + v, 3, 227, col);
+            draw_rect(301 + c, 41 + v, 3, 227, col);
+        }
+
+        // Rising "+10" popup after a bite.
+        if popt > 0 {
+            sy = 70 - (18 - popt);
+            col = rainbow(tick % 12);
+            draw_text_color(146, sy + 1, "+10", 3, C_SHADOW);
+            draw_text_color(145, sy, "+10", 3, col);
+        }
+
+        // "SPEED UP!" banner when the snake quickens.
+        if levt > 0 {
+            draw_rect(96, 118, 128, 28, C_TOP);
+            draw_rect(96, 118, 128, 2, rainbow(tick % 12));
+            draw_text_color(118, 126, "SPEED UP!", 9, C_TEXT);
+        }
+
+        // Music-stage banner when the BGM escalates (tempo up / new tune).
+        if mbanner > 0 {
+            draw_rect(72, 158, 176, 34, C_OVER);
+            draw_rect(72, 158, 176, 3, rainbow(tick % 12));
+            if mstage == 1 {
+                draw_text_color(104, 168, "TEMPO UP!", 9, C_TEXT);
+            } else {
+                draw_text_color(100, 168, "OVERDRIVE!", 10, C_GOLD);
+            }
+        }
+
+        // Bottom HUD: the bar, the ながさ/ベスト labels, and the controls hint live in
+        // the static layer; only the live length and best values render here, as
+        // retained text (T_LEN / T_BEST).
+        t = len; i = 5;
+        while i >= 0 { num[i] = 48 + t % 10; t = t / 10; i = i - 1; }
+        game2d_text_set(T_LEN, 64, 280, num + 3, 3, C_TEXT);
+        t = best; i = 5;
+        while i >= 0 { num[i] = 48 + t % 10; t = t / 10; i = i - 1; }
+        game2d_text_set(T_BEST, 172, 280, num, 6, C_GOLD);
+
+        // Game-over overlay: a panel slams down over the field.
+        if state == 2 {
+            sy = -70 + deatht * 7;
+            if sy > 96 { sy = 96; }
+            draw_rect(40, sy, 240, 92, C_OVER);
+            draw_rect(40, sy, 240, 3, C_TEXT);
+            draw_text_color(94, sy + 14, "ゲームオーバー", 21, C_TEXT);
+            draw_text_color(78, sy + 40, "スコア", 9, C_DIM);
+            t = score; i = 5;
+            while i >= 0 { num[i] = 48 + t % 10; t = t / 10; i = i - 1; }
+            draw_text_color(138, sy + 40, num, 6, C_GOLD);
+            if (tick & 16) != 0 {
+                draw_text_color(74, sy + 66, "F1 でもういちど", 21, C_GOLD);
+            } else {
+                draw_text_color(74, sy + 66, "F1 でもういちど", 21, C_TEXT);
+            }
+        }
+
+        yield_frame();
+    }
+}

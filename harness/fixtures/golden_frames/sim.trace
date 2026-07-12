@@ -1,0 +1,28 @@
+golden-frame-trace v1
+[shell:list]
+selected=0 packages=16
+render rect x=0 y=0 w=320 h=20 on 320x320 Rgb565
+render rect x=0 y=20 w=65 h=84 on 320x320 Rgb565
+render rect x=65 y=20 w=65 h=84 on 320x320 Rgb565
+render rect x=130 y=20 w=65 h=84 on 320x320 Rgb565
+render rect x=0 y=104 w=65 h=84 on 320x320 Rgb565
+render rect x=65 y=104 w=65 h=84 on 320x320 Rgb565
+render rect x=130 y=104 w=65 h=84 on 320x320 Rgb565
+render rect x=0 y=188 w=65 h=84 on 320x320 Rgb565
+render rect x=65 y=188 w=65 h=84 on 320x320 Rgb565
+render rect x=130 y=188 w=65 h=84 on 320x320 Rgb565
+render rect x=0 y=272 w=196 h=16 on 320x320 Rgb565
+render rect x=196 y=20 w=124 h=268 on 320x320 Rgb565
+render rect x=0 y=288 w=320 h=14 on 320x320 Rgb565
+render rect x=0 y=302 w=320 h=18 on 320x320 Rgb565
+[shell:selection-feedback]
+selected=1 selection_frames=6 page_frames=0 sound=Some(Navigation)
+render rect x=0 y=20 w=65 h=84 on 320x320 Rgb565
+render rect x=65 y=20 w=65 h=84 on 320x320 Rgb565
+render rect x=196 y=20 w=124 h=268 on 320x320 Rgb565
+render rect x=0 y=288 w=320 h=14 on 320x320 Rgb565
+[app:dev.koto.samples.hello-text:frame1]
+result=yielded
+draw_rect x=0 y=0 w=320 h=320 rgb565=0
+draw_text x=16 y=24 text="hello from KotoSDK"
+draw_text x=16 y=44 text="press F10 to exit"

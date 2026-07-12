@@ -1,0 +1,9 @@
+[package]
+name = "koto-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+koto-core = { path = "../../src/koto-core" }
+kbc-asm = { path = "../kbc-asm" }

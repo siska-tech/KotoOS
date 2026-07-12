@@ -1,0 +1,14 @@
+# ActorArray budget scenario: let the sample initialize the player plus eight
+# actors, then run several update/draw frames before exiting.
+
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+exit

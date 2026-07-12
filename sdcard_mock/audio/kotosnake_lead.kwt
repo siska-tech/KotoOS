@@ -1,0 +1,5 @@
+# KotoSnake lead - a bright reedy/vocal wavetable (formant-boosted 3rd/4th harmonics). Rich and buzzy, unmistakably not a plain square or sine.
+KWT1
+WAVE 0 71 100 83 49 28 22 23 26 33 40 40 32 22 16 9 0 -9 -16 -22 -32 -40 -40 -33 -26 -23 -22 -28 -49 -83 -100 -71
+ENV 5 70 70 100
+GAIN 130

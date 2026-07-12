@@ -1,0 +1,4 @@
+path,type,offset,size,alignment,flags,padding_before
+bytecode/main.kbc,bytecode,4096,10,512,sequential|entry,0
+assets/title.rle,image-rle-index8,4608,11,512,sequential|preload,502
+icons/sample.kicon,image,5120,15,512,none,501

@@ -1,0 +1,75 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.games.koto-blocks",
+  "name": "KotoBlocks",
+  "entry": "bytecode/koto_blocks.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/koto_blocks.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#1A263E",
+    "primary": "#2ACADC",
+    "secondary": "#F6C236",
+    "accent": "#B058D2",
+    "highlight": "#46BE69",
+    "shadow": "#0E1626"
+  },
+  "description": "落ち物ブロックパズル。スプライト・タイル描画のサンプル。",
+  "category": "ゲーム",
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/koto_blocks.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/koto_blocks.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "audio/koto_blocks_bgm.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/koto_blocks_move.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/koto_blocks_rotate.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/koto_blocks_lock.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/koto_blocks_clear.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/koto_blocks_over.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/koto_blocks_tetris.kmml",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

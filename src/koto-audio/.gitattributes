@@ -1,0 +1,7 @@
+# KOTO-0180: the koto-audio-tools MML generator emits LF-terminated Rust, and
+# its tests (mml.rs) compare that output byte-for-byte against these checked-in
+# fixtures. Pin the fixtures to LF so KotoOS's core.autocrlf=true does not
+# rewrite them to CRLF on checkout — otherwise
+# practical_mml_example_generated_fragment_matches_checked_in_output fails on
+# any Windows clone.
+examples/** text eol=lf

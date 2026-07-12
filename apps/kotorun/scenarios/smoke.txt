@@ -1,0 +1,3 @@
+# Draw the title and exit cleanly.
+frame
+exit

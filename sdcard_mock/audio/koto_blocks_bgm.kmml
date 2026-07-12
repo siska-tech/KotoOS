@@ -1,0 +1,50 @@
+# KotoBlocks — 32 bars, T120, 4/4, about 64 seconds.
+# Extended falling-block theme based on the compact E-G-B-G motif.
+
+#TRACK CH1
+@0 T120 V8 O5 L8 [
+R4 E G B G E G  A G E G B G E G  D F A F D F A F  E G B G C4 R4
+E G B G E G B G  D G B G D G B G  C E A E C E A E  D F A F G4 R4
+E G B G A G E G  F A C A F A C A  D F A F E G B G  A2 G4 R4
+C E G E D F A F  E G B G A G E D  F A C A G B D B  E2. R4
+A C E C B D F D  G B D B A C E C  F A C A E G B G  D4 E8 F8 G2
+E G B G E G A B  C A E A D B G B  C E A E F A C A  B G D G E4 R4
+E G B G A G E G  D F A F G A B G  C E A E D F A F  G4 E8 D8 C2
+F A C A E G B G  D F A F E G B G  C E G E D F A F  E G B G C4 R4
+]
+
+#TRACK CH2
+@1 T120 V4 O4 L8 [
+C E G E C E G E  C E G E B E G E  D F A F D F A F  C E G E G E C E
+C E G E C E G E  G D G D B D G D  A E A E C E A E  G D G D B D G D
+C E G E E G B G  F C F C A C F C  D A D A F A D A  G D G D B D G D
+C G C G D A D A  E B E B A E A E  F C F C G D G D  E B E B E B G B
+A E A E C E A E  G D G D B D G D  F C F C E B E B  D A D A G D G D
+C E G E C E A E  D F A F D F B F  C E A E F A C A  G D G D E B E B
+C E G E E G B G  D F A F G D G D  A E A E D A D A  G D G D C G C G
+F C F C E B E B  D A D A G D G D  C G C G D A D A  C E G E C4 R4
+]
+
+#TRACK CH3
+@2 T120 V6 O2 L4 [
+C C G G  C G C G  D D A A  C G C R
+C C G G  G G D D  A A E E  G G D D
+C C G G  F F C C  D D A A  G G D R
+C C D D  E E A A  F F G G  E B E R
+A A E E  G G D D  F F E E  D D G G
+C C A A  D D B B  A A F F  G G E E
+C C G G  D D G G  A A D D  G G C C
+F F E E  D D G G  C C D D  C G C R
+]
+
+#TRACK CH4
+@4 T120 V5 O2 L8 [
+C R C R G R C R  C R G R C C R C  C R C R G R C R  C C R C G R C R
+C R C R G R C R  C R G R C C R C  C R C R G R C R  C R G R C C R C
+C R C C G R C R  C R G R C C R C  C R C R G R C R  C C R C G R C R
+C R G R C R G R  C C R C G R C R  C R C C G R C R  C4 R4 G8 R8 C4
+C R C R G R C R  C R G R C C R C  C R C C G R C R  C R G R C C R C
+C R C R G R C R  C C R C G R C R  C R C C G R C R  C R G R C C R C
+C R C R G R C R  C R G R C C R C  C R C C G R C R  C C R C G R C R
+C R G R C R G R  C R C C G R C R  C4 R4 C4 R4  C R G R C4 R4
+]

@@ -1,0 +1,13 @@
+[package]
+name = "koto-gfx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# KotoGFX v0 is a pure, hardware-independent graphics foundation: no heap, no
+# dependencies, `no_std` outside of tests. It must stay buildable for the Pico
+# firmware target (thumbv6m-none-eabi), so keep this dependency-free.
+[dependencies]

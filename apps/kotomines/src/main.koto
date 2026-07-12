@@ -1,0 +1,507 @@
+// dev.koto.games.kotomines — Minesweeper for KotoOS.
+//
+// Controls:
+//   Arrow keys   Move cursor
+//   Enter/Space  Open a cell
+//   F            Toggle flag
+//   F1           Restart
+//   M            Return to size selection
+//   F10          Exit
+//
+// Cell byte: low nibble = adjacent mines, bit 4 = mine, bit 5 = open,
+// bit 6 = flag. The second half of `board` is a flood-fill queue.
+//
+// Render model (current Koto-GFX): the whole closed-board look — page chrome,
+// HUD labels, the board frame, and a bevel grid that makes every cell read as a
+// raised button — lives in the retained Game2D static layer, rebuilt only when
+// entering play. Per frame the immediate list draws just the *differences* from
+// that closed look: opened cells as one rectangle per horizontal run, their
+// numbers, the placed flags (from the `marked` list), the cursor, the live HUD
+// digits, and the result panel. That keeps the default 9x9 board inside the
+// device's per-frame draw-command budget (the old model re-emitted 250+ cell
+// commands every frame and tail-dropped on hardware).
+//
+// Code-window layout (KOTO-0156 model): the size menu ends in `yield_frame();
+// continue;` so `outline_cold_blocks` relocates it to the code tail, and the
+// per-frame board loops keep small bodies so no 256-iteration loop straddles a
+// 16 KiB code-window tile. Build with the apps.json `codegen` opts.
+
+const C_BG = 63390;
+const C_TOP = 4258;
+const C_TOP_HI = 10895;
+const C_TEXT = 65503;
+const C_DIM = 44373;
+const C_PANEL = 65535;
+const C_CLOSED = 40179;
+const C_CLOSED_HI = 52825;
+const C_CLOSED_LO = 25388;
+const C_OPEN = 59164;
+const C_GRID = 46518;
+const C_CURSOR = 65504;
+const C_FLAG = 58183;
+const C_FLAG_DARK = 35110;
+const C_MINE = 4226;
+const C_BOOM = 64168;
+const C_WIN = 21163;
+const C_ONE = 17148;
+const C_TWO = 13963;
+const C_THREE = 55755;
+const C_FOUR = 10574;
+const C_FIVE = 39368;
+const C_SIX = 19317;
+const C_SEVEN = 8452;
+const C_EIGHT = 33808;
+
+fn number_color(n: int) -> int {
+    if n == 1 { return C_ONE; }
+    if n == 2 { return C_TWO; }
+    if n == 3 { return C_THREE; }
+    if n == 4 { return C_FOUR; }
+    if n == 5 { return C_FIVE; }
+    if n == 6 { return C_SIX; }
+    if n == 7 { return C_SEVEN; }
+    return C_EIGHT;
+}
+
+fn sfx_move() { play_sfx_asset("audio/kotomines_move.kmml", 25); }
+fn sfx_rotate() { play_sfx_asset("audio/kotomines_rotate.kmml", 27); }
+fn sfx_lock() { play_sfx_asset("audio/kotomines_lock.kmml", 25); }
+fn sfx_clear() { play_sfx_asset("audio/kotomines_clear.kmml", 26); }
+fn sfx_over() { play_sfx_asset("audio/kotomines_over.kmml", 25); }
+
+fn main() {
+    buf board[512];
+    buf marked[256];
+    buf mine_pos[40];
+    buf num[3];
+
+    let state = 0;       // 0 size menu, 1 ready, 2 running, 3 won, 4 lost
+    let size = 9;
+    let mines = 10;
+    let cells = 81;
+    let cursor = 40;
+    let flags = 0;
+    let opened = 0;
+    let frames = 0;
+    let seconds = 0;
+    let seed = 173;
+    let fx = 0;
+    let sdirty = 0;      // rebuild the retained static layer this frame
+    let intent = 0;
+    let cp = 0;
+    let action = 0;
+    let i = 0;
+    let x = 0;
+    let y = 0;
+    let nx = 0;
+    let ny = 0;
+    let idx = 0;
+    let nidx = 0;
+    let placed = 0;
+    let bad = 0;
+    let head = 0;
+    let tail = 0;
+    let v = 0;
+    let n = 0;
+    let cell = 26;
+    let ox = 43;
+    let oy = 45;
+    let sx = 0;
+    let sy = 0;
+    let remain = 0;
+
+    loop {
+        intent = text_intent();
+        cp = text_input();
+        if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
+
+        seed = (seed * 75 + 74) % 65537;
+        if fx > 0 { fx = fx - 1; }
+
+        // ---- Size selection (cold: ends in `continue`, outlined to the tail) ----
+        if state == 0 {
+            if (intent & INTENT_LEFT) != 0 || (intent & INTENT_UP) != 0 {
+                size = 9; mines = 10; cells = 81;
+                sfx_move();
+            }
+            if (intent & INTENT_RIGHT) != 0 || (intent & INTENT_DOWN) != 0 {
+                size = 16; mines = 40; cells = 256;
+                sfx_move();
+            }
+            if cp == 49 { size = 9; mines = 10; cells = 81; }
+            if cp == 50 { size = 16; mines = 40; cells = 256; }
+            if (intent & INTENT_NEWLINE) != 0 || (intent & INTENT_IME_TOGGLE) != 0 {
+                i = 0;
+                while i < 512 { board[i] = 0; i = i + 1; }
+                cursor = (size / 2) * size + size / 2;
+                flags = 0; opened = 0; frames = 0; seconds = 0; fx = 0;
+                state = 1; sdirty = 1;
+                play_bgm_asset("audio/kotomines_bgm.kmml", 24);
+                sfx_rotate();
+            }
+
+            draw_rect(0, 0, 320, 320, C_BG);
+            draw_rect(0, 0, 320, 42, C_TOP);
+            draw_rect(0, 42, 320, 3, C_TOP_HI);
+            draw_text_color(78, 13, "KotoMines", 9, C_TEXT);
+
+            // Decorative mine.
+            draw_rect(137, 72, 46, 46, C_MINE);
+            draw_rect(151, 62, 18, 66, C_MINE);
+            draw_rect(127, 86, 66, 18, C_MINE);
+            draw_rect(145, 80, 7, 7, C_PANEL);
+
+            draw_text_color(105, 143, "盤面サイズ", 12, C_MINE);
+            if size == 9 {
+                draw_rect(36, 174, 112, 54, C_TOP);
+                draw_rect(172, 174, 112, 54, C_PANEL);
+                draw_text_color(69, 190, "9 x 9", 5, C_TEXT);
+                draw_text_color(199, 190, "16 x 16", 7, C_MINE);
+            } else {
+                draw_rect(36, 174, 112, 54, C_PANEL);
+                draw_rect(172, 174, 112, 54, C_TOP);
+                draw_text_color(69, 190, "9 x 9", 5, C_MINE);
+                draw_text_color(199, 190, "16 x 16", 7, C_TEXT);
+            }
+            draw_text_color(65, 246, "← → で選択 / Enter", 22, C_DIM);
+            draw_text_color(74, 278, "F10 で終了", 13, C_DIM);
+            yield_frame();
+            continue;
+        }
+
+        // Return to the size menu: empty the static layer so nothing leaks
+        // under the menu scene, then re-dispatch so it renders this frame.
+        if cp == 109 || cp == 77 {
+            state = 0;
+            game2d_static_begin();
+            game2d_static_end();
+            stop_bgm();
+            continue;
+        }
+
+        // F1 restarts the current size.
+        if (intent & INTENT_IME_TOGGLE) != 0 {
+            i = 0;
+            while i < 512 { board[i] = 0; i = i + 1; }
+            cursor = (size / 2) * size + size / 2;
+            flags = 0; opened = 0; frames = 0; seconds = 0; fx = 0;
+            state = 1; sdirty = 1;
+            play_bgm_asset("audio/kotomines_bgm.kmml", 24);
+            sfx_rotate();
+        }
+
+        // Enter after a result starts another random board.
+        if state == 3 || state == 4 {
+            if (intent & INTENT_NEWLINE) != 0 {
+                i = 0;
+                while i < 512 { board[i] = 0; i = i + 1; }
+                cursor = (size / 2) * size + size / 2;
+                flags = 0; opened = 0; frames = 0; seconds = 0; fx = 0;
+                state = 1; sdirty = 1;
+                play_bgm_asset("audio/kotomines_bgm.kmml", 24);
+                sfx_rotate();
+            }
+        } else {
+            // Cursor movement.
+            x = cursor % size; y = cursor / size;
+            if (intent & INTENT_LEFT) != 0 {
+                if x > 0 { cursor = cursor - 1; sfx_move(); }
+            }
+            if (intent & INTENT_RIGHT) != 0 {
+                if x + 1 < size { cursor = cursor + 1; sfx_move(); }
+            }
+            if (intent & INTENT_UP) != 0 {
+                if y > 0 { cursor = cursor - size; sfx_move(); }
+            }
+            if (intent & INTENT_DOWN) != 0 {
+                if y + 1 < size { cursor = cursor + size; sfx_move(); }
+            }
+
+            // Flag.
+            if cp == 102 || cp == 70 {
+                v = board[cursor];
+                if (v & 32) == 0 {
+                    if (v & 64) == 0 {
+                        board[cursor] = v | 64;
+                        marked[flags] = cursor;
+                        flags = flags + 1;
+                    } else {
+                        board[cursor] = v & 191;
+                        idx = 0;
+                        while idx < flags {
+                            if marked[idx] == cursor {
+                                nidx = idx;
+                                while nidx + 1 < flags {
+                                    marked[nidx] = marked[nidx + 1];
+                                    nidx = nidx + 1;
+                                }
+                                idx = flags;
+                            }
+                            idx = idx + 1;
+                        }
+                        flags = flags - 1;
+                    }
+                    fx = 5;
+                    sfx_rotate();
+                }
+            }
+
+            action = 0;
+            if (intent & INTENT_NEWLINE) != 0 { action = 1; }
+            if cp == 32 { action = 1; }
+            if action != 0 {
+                v = board[cursor];
+                if (v & 64) == 0 && (v & 32) == 0 {
+                    // Delay mine generation until the first open. The selected cell
+                    // and its neighbours are excluded, guaranteeing a useful start.
+                    // Generation and the flood fill below run to completion in one
+                    // frame: the retained render is cheap enough that neither needs
+                    // the old mid-loop `yield_frame()` fuel escape (which would now
+                    // present a frame with an empty immediate list).
+                    if state == 1 {
+                        placed = 0;
+                        while placed < mines {
+                            seed = (seed * 75 + 74) % 65537;
+                            idx = seed % cells;
+                            x = idx % size; y = idx / size;
+                            nx = cursor % size; ny = cursor / size;
+                            bad = 0;
+                            if x >= nx - 1 && x <= nx + 1 {
+                                if y >= ny - 1 && y <= ny + 1 { bad = 1; }
+                            }
+                            if (board[idx] & 16) != 0 { bad = 1; }
+                            if bad == 0 {
+                                board[idx] = board[idx] | 16;
+                                mine_pos[placed] = idx;
+                                placed = placed + 1;
+                                // Update adjacent counts as each mine is placed.
+                                ny = y - 1;
+                                while ny <= y + 1 {
+                                    nx = x - 1;
+                                    while nx <= x + 1 {
+                                        if nx >= 0 && nx < size && ny >= 0 && ny < size {
+                                            nidx = ny * size + nx;
+                                            if (board[nidx] & 16) == 0 {
+                                                board[nidx] = board[nidx] + 1;
+                                            }
+                                        }
+                                        nx = nx + 1;
+                                    }
+                                    ny = ny + 1;
+                                }
+                            }
+                        }
+                        state = 2;
+                    }
+
+                    if (board[cursor] & 16) != 0 {
+                        board[cursor] = board[cursor] | 32;
+                        state = 4; fx = 20;
+                        stop_bgm();
+                        sfx_over();
+                    } else {
+                        // Breadth-first opening of empty regions.
+                        head = opened;
+                        board[256 + opened] = cursor;
+                        board[cursor] = board[cursor] | 32;
+                        opened = opened + 1;
+                        tail = opened;
+                        while head < tail {
+                            idx = board[256 + head]; head = head + 1;
+                            if (board[idx] & 15) == 0 {
+                                x = idx % size; y = idx / size;
+                                ny = y - 1;
+                                while ny <= y + 1 {
+                                    nx = x - 1;
+                                    while nx <= x + 1 {
+                                        if nx >= 0 && nx < size && ny >= 0 && ny < size {
+                                            nidx = ny * size + nx;
+                                            v = board[nidx];
+                                            if (v & 48) == 0 {
+                                                if (v & 64) == 0 {
+                                                    board[nidx] = v | 32;
+                                                    board[256 + opened] = nidx;
+                                                    opened = opened + 1;
+                                                    if (v & 15) == 0 {
+                                                        tail = opened;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        nx = nx + 1;
+                                    }
+                                    ny = ny + 1;
+                                }
+                            }
+                        }
+                        fx = 4;
+                        sfx_lock();
+                        if opened >= cells - mines {
+                            state = 3; fx = 30;
+                            stop_bgm();
+                            sfx_clear();
+                        }
+                    }
+                }
+            }
+        }
+
+        if state == 2 {
+            frames = frames + 1;
+            if frames >= 60 {
+                frames = 0;
+                if seconds < 999 { seconds = seconds + 1; }
+            }
+        }
+
+        // Board geometry (also used by the static builder below).
+        if size == 9 { cell = 26; ox = 43; oy = 47; }
+        else { cell = 16; ox = 32; oy = 42; }
+
+        // ---- Retained static layer ----
+        // Chrome + the closed-board look, rebuilt only on entering play. Every
+        // cell reads as a raised button via one highlight/shadow pass per board
+        // row and column (3*size+2 commands) instead of 3+ commands per cell.
+        if sdirty != 0 {
+            sdirty = 0;
+            game2d_static_begin();
+            draw_rect(0, 0, 320, 320, C_BG);
+            draw_rect(0, 0, 320, 38, C_TOP);
+            draw_rect(0, 38, 320, 3, C_TOP_HI);
+            draw_text_color(10, 11, "KotoMines", 9, C_TEXT);
+            draw_text_color(151, 11, "旗", 3, C_DIM);
+            draw_text_color(231, 11, "TIME", 4, C_DIM);
+
+            draw_rect(ox - 4, oy - 4, size * cell + 8, size * cell + 8, C_TOP);
+            draw_rect(ox, oy, size * cell, size * cell, C_CLOSED);
+            i = 0;
+            while i < size {
+                draw_rect(ox, oy + i * cell, size * cell, 2, C_CLOSED_HI);
+                draw_rect(ox, oy + i * cell + cell - 2, size * cell, 2, C_CLOSED_LO);
+                draw_rect(ox + i * cell + cell - 2, oy, 2, size * cell, C_CLOSED_LO);
+                i = i + 1;
+            }
+
+            draw_rect(0, 298, 320, 22, C_TOP);
+            draw_text_color(12, 303, "矢印 移動  Enter 開く  F 旗  F1 再開  M 選択", 55, C_DIM);
+            game2d_static_end();
+        }
+
+        // ---- Render (immediate): only the differences from the closed look ----
+
+        // Opened cells, one rectangle per horizontal run (flood regions are
+        // contiguous, so a whole open blob row costs one command).
+        y = 0;
+        while y < size {
+            nx = -1;   // run start column, -1 = no open run in progress
+            x = 0;
+            while x <= size {
+                v = 0;
+                if x < size {
+                    if (board[y * size + x] & 32) != 0 { v = 1; }
+                }
+                if v != 0 {
+                    if nx < 0 { nx = x; }
+                } else {
+                    if nx >= 0 {
+                        draw_rect(ox + nx * cell, oy + y * cell, (x - nx) * cell - 1, cell - 1, C_OPEN);
+                        nx = -1;
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+
+        // Numbers on opened cells (suppressed behind the centered result panel,
+        // which is composited after these text draws).
+        idx = 0;
+        while idx < cells {
+            v = board[idx];
+            if (v & 32) != 0 && (v & 16) == 0 {
+                n = v & 15;
+                if n > 0 {
+                    sy = oy + (idx / size) * cell;
+                    if state < 3 || sy + cell <= 128 || sy >= 198 {
+                        num[0] = 48 + n;
+                        draw_text_color(ox + (idx % size) * cell + cell / 2 - 3, sy + cell / 2 - 6, num, 1, number_color(n));
+                    }
+                }
+            }
+            idx = idx + 1;
+        }
+
+        // Flags, straight from the marked list (2 commands each).
+        i = 0;
+        while i < flags {
+            idx = marked[i];
+            sx = ox + (idx % size) * cell;
+            sy = oy + (idx / size) * cell;
+            draw_rect(sx + cell / 2 - 1, sy + 3, 2, cell - 6, C_FLAG_DARK);
+            draw_rect(sx + cell / 2 + 1, sy + 3, cell / 3, cell / 3, C_FLAG);
+            i = i + 1;
+        }
+
+        // On a loss, reveal the mines (suppressed behind the result panel band
+        // and capped so the reveal cannot blow the draw budget on 16x16).
+        if state == 4 {
+            n = 0;
+            i = 0;
+            while i < mines {
+                idx = mine_pos[i];
+                sy = oy + (idx / size) * cell;
+                if (sy + cell <= 128 || sy >= 198) && n < 24 {
+                    sx = ox + (idx % size) * cell;
+                    draw_rect(sx + cell / 2 - 4, sy + cell / 2 - 4, 8, 8, C_MINE);
+                    draw_rect(sx + cell / 2 - 2, sy + cell / 2 - 2, 2, 2, C_BOOM);
+                    n = n + 1;
+                }
+                i = i + 1;
+            }
+            // The exploded cell itself always shows, above the panel band rule.
+            sx = ox + (cursor % size) * cell;
+            sy = oy + (cursor / size) * cell;
+            draw_rect(sx + 2, sy + 2, cell - 5, cell - 5, C_BOOM);
+            draw_rect(sx + cell / 2 - 4, sy + cell / 2 - 4, 8, 8, C_MINE);
+        }
+
+        // Cursor frame.
+        if state != 3 && state != 4 {
+            remain = C_CURSOR;
+            if fx > 0 { remain = C_PANEL; }
+            sx = ox + (cursor % size) * cell;
+            sy = oy + (cursor / size) * cell;
+            draw_rect(sx, sy, cell - 1, 2, remain);
+            draw_rect(sx, sy + cell - 3, cell - 1, 2, remain);
+            draw_rect(sx, sy, 2, cell - 1, remain);
+            draw_rect(sx + cell - 3, sy, 2, cell - 1, remain);
+        }
+
+        // Live HUD digits.
+        remain = mines - flags;
+        if remain < 0 { remain = 0; }
+        num[0] = 48 + (remain / 100) % 10;
+        num[1] = 48 + (remain / 10) % 10;
+        num[2] = 48 + remain % 10;
+        draw_text_color(174, 11, num, 3, C_TEXT);
+        num[0] = 48 + (seconds / 100) % 10;
+        num[1] = 48 + (seconds / 10) % 10;
+        num[2] = 48 + seconds % 10;
+        draw_text_color(279, 11, num, 3, C_TEXT);
+
+        // Result panel, always on top.
+        if state == 3 {
+            draw_rect(57, 128, 206, 70, C_TOP);
+            draw_rect(57, 128, 206, 4, C_WIN);
+            draw_text_color(136, 145, "CLEAR!", 6, C_TEXT);
+            draw_text_color(111, 174, "Enter もう一度", 18, C_DIM);
+        }
+        if state == 4 {
+            draw_rect(57, 128, 206, 70, C_TOP);
+            draw_rect(57, 128, 206, 4, C_BOOM);
+            draw_text_color(124, 145, "GAME OVER", 9, C_TEXT);
+            draw_text_color(111, 174, "Enter もう一度", 18, C_DIM);
+        }
+        yield_frame();
+    }
+}

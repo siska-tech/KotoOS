@@ -1,0 +1,24 @@
+{
+  "format": "kotovn-image-inputs",
+  "version": 1,
+  "background": {
+    "path": "assets/bg_room.rle",
+    "package_type": "image-rle-index8",
+    "width": 320,
+    "height": 200,
+    "palette": {
+      "entries": 256,
+      "source_format": "rgb888",
+      "packed_format": "rgb565"
+    },
+    "encoding": {
+      "name": "rle-index8",
+      "run_layout": "count:u8,index:u8",
+      "scan_order": "row-major",
+      "max_run_length": 255
+    },
+    "transparent_index": null,
+    "sequential": true,
+    "preload": true
+  }
+}

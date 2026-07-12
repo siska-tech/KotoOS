@@ -1,0 +1,5 @@
+path,type,offset,size,alignment,flags,padding_before
+bytecode/main.kbc,bytecode,4096,9,512,sequential|entry,0
+icons/pipeline.kicon,image,4608,1688,512,preload,503
+fonts/mplus10.kfont,font,6656,251657,512,sequential,360
+previews/pipeline_icon.pbm,data,258560,3289,512,sequential,247

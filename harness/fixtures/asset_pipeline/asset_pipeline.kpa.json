@@ -1,0 +1,36 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.asset-pipeline",
+  "name": "Asset Pipeline Fixture",
+  "entry": "bytecode/main.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/pipeline.kicon",
+  "assets": [
+    {
+      "path": "bytecode/main.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/pipeline.kicon",
+      "type": "image",
+      "sequential": false,
+      "preload": true
+    },
+    {
+      "path": "fonts/mplus10.kfont",
+      "type": "font",
+      "sequential": true
+    },
+    {
+      "path": "previews/pipeline_icon.pbm",
+      "type": "data",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

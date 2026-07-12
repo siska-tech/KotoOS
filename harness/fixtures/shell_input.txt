@@ -1,0 +1,5 @@
+# Whitespace-separated host input tokens.
+down
+up
+down
+confirm

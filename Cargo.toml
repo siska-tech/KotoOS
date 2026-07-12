@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "src/koto-core",
+    "src/koto-gfx",
+    "src/koto-game2d",
+    "src/koto-pico",
+    "src/koto-sim",
+    "src/koto-vm",
+    "tools/kbc-asm",
+    "tools/koto-audio-gen",
+    "tools/koto-compiler",
+    "tools/koto-app-scaffold",
+    "tools/kpa-packer",
+]
+# KOTO-0180: koto-audio is vendored from its sibling repo (subtree merge under
+# src/koto-audio) so a fresh KotoOS clone builds standalone. It is kept as its
+# own nested workspace and excluded here on purpose: as a non-member path
+# dependency cargo caps its lints (`--cap-lints allow`), so the check_all
+# fmt/clippy `-D warnings` gate does not police vendored upstream code — the
+# same reason firmware escapes the host gate. It still builds against this
+# tree's [profile.release] (KOTO-0176 fat LTO), because profiles are read from
+# the root of whatever build pulls it in as a dependency.
+exclude = ["src/koto-audio"]
+default-members = [
+    "src/koto-core",
+    "src/koto-gfx",
+    "src/koto-game2d",
+    "src/koto-sim",
+    "src/koto-vm",
+    "tools/kbc-asm",
+    "tools/koto-audio-gen",
+    "tools/koto-compiler",
+    "tools/koto-app-scaffold",
+    "tools/kpa-packer",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+# KOTO-0176: deterministic release code layout. At the default
+# codegen-units=16 with no LTO, firmware function layout reshuffles per build
+# and an unlucky layout defeats XIP-cache residency for the raster hot loops
+# (~2x CPU + BGM crackle in the KOTO-0174 H-D incident). Fat LTO + one
+# codegen unit makes the layout a function of the tree, not the build.
+# opt-level stays at the default 3 — one variable at a time.
+[profile.release]
+lto = "fat"
+codegen-units = 1

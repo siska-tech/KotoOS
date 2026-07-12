@@ -1,0 +1,81 @@
+# Memo worst-ish budget scenario (KOTO-0101). Enable the Japanese IME, enter kana
+# via romaji, run an SKK conversion with candidate navigation and commit, grow the
+# document across several lines, navigate and edit, then drive the save-as filename
+# prompt and the file-open dialog before saving and exiting. This walks the editor
+# and IME host buffers and the dialog locals along their busiest paths.
+#
+# One input per frame (tokens on the same line apply to one frame; only the last
+# character token survives). Controls (see apps/memo/src/main.koto): F2 (save)
+# opens the save/save-as prompt, F4 (open) the file dialog.
+
+# --- Enable IME, type kana straight into the document: ka -> か. ---
+ime-toggle
+'k'
+'a'
+
+# --- Sticky Shift starts an SKK reading: かさ, convert, navigate, commit. ---
+shift
+'k'
+'a'
+'s'
+'a'
+convert
+convert
+commit
+
+# --- Type more kana and grow the document with several newlines. ---
+'n'
+'i'
+'h'
+'o'
+'n'
+'g'
+'o'
+newline
+'t'
+'e'
+'s'
+'t'
+newline
+'m'
+'e'
+'m'
+'o'
+newline
+'a'
+'b'
+'c'
+'d'
+'e'
+'f'
+newline
+
+# --- Navigate the document and edit. ---
+home
+up
+up
+down
+left
+left
+right
+backspace
+delete
+end
+
+# --- Save-as: open the prompt, type a sandbox filename, confirm. ---
+save
+'n'
+'o'
+'t'
+'e'
+'2'
+commit
+
+# --- Open dialog: list saved files, move the selection, then cancel out. ---
+open
+down
+up
+cancel
+
+# --- Save and exit. ---
+exit

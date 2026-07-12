@@ -1,0 +1,75 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.games.kotoshogi",
+  "name": "KotoShogi",
+  "entry": "bytecode/kotoshogi.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/kotoshogi.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#FAE8B4",
+    "primary": "#223052",
+    "secondary": "#FFFFFF",
+    "accent": "#C4302A",
+    "highlight": "#FADC96",
+    "shadow": "#D2972A"
+  },
+  "description": "本将棋を端末で。合法手・持ち駒・成り・王手と盤上演出に対応。",
+  "category": "ゲーム",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "assets": [
+    {
+      "path": "bytecode/kotoshogi.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/kotoshogi.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotoshogi_bgm.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotoshogi_move.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotoshogi_rotate.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotoshogi_lock.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotoshogi_clear.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotoshogi_over.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotoshogi_tetris.kmml",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

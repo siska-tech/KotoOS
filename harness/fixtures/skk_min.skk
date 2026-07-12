@@ -1,0 +1,12 @@
+;; KotoOS minimal SKK fixture dictionary.
+;; UTF-8 encoded. Okuri-nasi entries only, sorted ascending by reading.
+;; Line format: reading <space> /candidate/.../  with optional ;annotation.
+;; okuri-nasi entries.
+あい /愛/相/藍/
+かい /回/会/貝/
+かさ /傘/笠/
+かんじ /漢字/感じ/幹事/
+きょう /今日;today/京/強/
+さくら /桜/
+にほん /日本/二本/
+ひらがな /平仮名/

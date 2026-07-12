@@ -1,0 +1,65 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.games.kotorun",
+  "name": "KotoRun",
+  "entry": "bytecode/kotorun.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/kotorun.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#151238",
+    "primary": "#FFD84A",
+    "secondary": "#7654D8",
+    "accent": "#F04464",
+    "highlight": "#44D8F0",
+    "shadow": "#080718"
+  },
+  "description": "走って、跳んで、ダイブで破壊。穴やドローンを越える高速横スクロールアクション。",
+  "category": "ゲーム",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "assets": [
+    {
+      "path": "bytecode/kotorun.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/kotorun.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotorun_bgm.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorun_jump.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorun_coin.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorun_hit.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotorun_start.kmml",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

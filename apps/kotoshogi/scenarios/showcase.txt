@@ -1,0 +1,9 @@
+# Start and leave a completed opening pawn move on screen for frame capture.
+frame
+newline
+frame
+newline
+up
+newline
+frame
+frame

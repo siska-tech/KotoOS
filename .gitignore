@@ -1,0 +1,9 @@
+/target/
+**/*.pdb
+__pycache__/
+**/__pycache__/
+sdcard_mock/data/
+docs/Reference/
+
+# Alternate build-artifact trees (manual target/ copies)
+/target-alt-*/

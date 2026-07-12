@@ -1,0 +1,29 @@
+[package]
+name = "koto-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Opt-in interactive window backend; headless builds/CI stay dependency-free.
+window = ["dep:minifb", "dep:cpal"]
+# Opt-in per-opcode execution histogram for the fixture profiler (KOTO-0153),
+# forwarded down to koto-vm. Off by default so normal `cargo test` is unaffected.
+opcode_stats = ["koto-core/opcode_stats"]
+
+[dependencies]
+koto-core = { path = "../koto-core" }
+# M13 bounded audio runtime (sibling project). Used for the generated-sequence
+# BGM/SFX workflow that KotoBlocks drives; the crate itself is unmodified.
+koto-audio = { path = "../koto-audio/crates/koto-audio", features = [
+    "sldpcm4-drums",
+] }
+serde_json = "1.0"
+minifb = { version = "0.28", optional = true }
+cpal = { version = "0.15", optional = true }
+
+[dev-dependencies]
+koto-compiler = { path = "../../tools/koto-compiler" }
+# Fixture-test-only: the KotoGFX immediate-overlay budget model, exercised in
+# observation mode by the fixture runner (no production koto-sim dependency on it).
+koto-gfx = { path = "../koto-gfx" }

@@ -1,0 +1,41 @@
+// Sandboxed file sample: write and read a note through the app save sandbox.
+
+fn write_note() {
+    let handle = file_open("note.txt", 8, MODE_WRITE);
+    if handle >= 0 {
+        file_write(handle, "saved from SDK sample", 21);
+        file_close(handle);
+    }
+}
+
+fn main() {
+    buf doc[64];
+    let len = 0;
+
+    let handle = file_open("note.txt", 8, MODE_READ);
+    if handle >= 0 {
+        len = file_read(handle, doc, 64);
+        file_close(handle);
+    } else {
+        write_note();
+        let created = file_open("note.txt", 8, MODE_READ);
+        if created >= 0 {
+            len = file_read(created, doc, 64);
+            file_close(created);
+        }
+    }
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            exit(0);
+        }
+
+        draw_rect(0, 0, 320, 320, 0);
+        draw_text(16, 24, "sandbox note:", 13);
+        if len >= 0 {
+            draw_text(16, 44, doc, len);
+        }
+        yield_frame();
+    }
+}

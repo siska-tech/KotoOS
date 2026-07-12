@@ -1,0 +1,602 @@
+// dev.koto.games.kotorun — a fast, one-button side-scrolling action game.
+//
+// Controls:
+//   F1 / Enter / Up   Jump (press again shortly after leaving an edge: coyote time)
+//   Down (in air)     Dive attack; smash hazards and rebound
+//   Left / Right      Brake / boost
+//   F10               Exit
+//
+// The runner stays near the left side while the world streams past. Terrain and
+// hazards are generated from the world segment number, so the course is endless
+// without storing a tilemap. Physics use eighth-pixel fixed point.
+
+const GROUND_Y = 246;
+const RUNNER_X = 72;
+const SEG = 96;
+
+const S_TITLE = 0;
+const S_PLAY = 1;
+const S_OVER = 2;
+
+const C_SKY = 10847;
+const C_SKY2 = 19071;
+const C_SUN = 65502;
+const C_CLOUD = 57087;
+const C_FAR = 12657;
+const C_MID = 18994;
+const C_GRASS = 20006;
+const C_GRASS_HI = 40907;
+const C_DIRT = 21286;
+const C_DIRT_D = 10627;
+const C_INK = 2113;
+const C_WHITE = 65535;
+const C_RED = 63754;
+const C_GOLD = 65376;
+const C_CYAN = 2047;
+const C_PURPLE = 47327;
+const C_PANEL = 4259;
+const C_DIM = 40179;
+
+fn hazard(seg: int) -> int {
+    if seg < 5 { return 0; }
+    let v = seg % 12;
+    if v == 11 || (seg > 20 && v == 4) { return 3; } // gap
+    if v == 5 || (seg > 12 && v == 1) { return 1; }  // spikes
+    // Drone runs create deliberate aerial combo lines after the first spike.
+    if v == 6 || v == 7 || v == 8 { return 2; }      // drone
+    return 0;
+}
+
+fn fmt6(out: int, value: int) {
+    let i = 5;
+    while i >= 0 {
+        heap_set_u8(out + i, 48 + value % 10);
+        value = value / 10;
+        i = i - 1;
+    }
+}
+
+fn sfx_jump() { play_sfx_asset("audio/kotorun_jump.kmml", 23); }
+fn sfx_coin() { play_sfx_asset("audio/kotorun_coin.kmml", 23); }
+fn sfx_hit() { play_sfx_asset("audio/kotorun_hit.kmml", 22); }
+fn sfx_start() { play_sfx_asset("audio/kotorun_start.kmml", 24); }
+
+// KOTO-0175: the device present path diffs the immediate command list
+// positionally, so a frame-to-frame COUNT change misaligns the whole scrolled
+// tail and escalates to a ~100 ms full-surface repaint (CommandCountShift,
+// fps 8). Every conditional draw in this app therefore keeps its slots
+// reserved: when the real thing is absent it emits this 1x1 off-screen rect
+// instead. The pad is recorded (the count holds) but clips to nothing, so it
+// paints zero pixels, and its bytes never change, so it contributes zero
+// dirty. The per-state command counts are fixed: PLAY 92 / OVER 93 / TITLE 17
+// of the 96-command budget; a state transition is the only count shift left
+// (one full repaint at death/restart, which is a scene change anyway).
+fn pad_cmds(n: int) {
+    while n > 0 {
+        draw_rect(-8, -8, 1, 1, 0);
+        n = n - 1;
+    }
+}
+
+// The 7-segment visible window [first, first+6] holds at most one segment of
+// each residue class mod 12, and hazard() keys off seg % 12 — so a hazard's
+// residue is a stable slot key while the world scrolls: its slot tracks "its"
+// segment continuously (small dirty unions) instead of hazards hopping
+// between slots (cross-screen unions). Returns the window segment with
+// s % 12 == r, or -1 (out-of-range results are harmless: hazard() is 0 for
+// every seg < 5, so the caller's type check pads the slot).
+fn seg_for(first: int, r: int) -> int {
+    let d = (r - first % 12 + 12) % 12;
+    if d > 6 { return -1; }
+    return first + d;
+}
+
+// The particle pool is 12 slots (KOTO-0168): big smash bursts degrade by
+// spawning fewer motes instead of pushing the immediate command list past its
+// 96-slot budget and tail-dropping whatever draws last.
+fn spawn_dust(parts: int, x: int, y: int, n: int, seed: int) -> int {
+    let made = 0;
+    let i = 0;
+    while i < 12 {
+        if made >= n { break; }
+        if actor_state(parts, i) == 0 {
+            seed = (seed * 75 + 74) % 65537;
+            actor_set_pos(parts, i, x * 8, y * 8);
+            actor_set_vel(parts, i, 0 - 10 - seed % 24, 0 - seed % 18);
+            actor_set_timer(parts, i, 12 + seed % 10);
+            actor_set_frame(parts, i, seed % 3);
+            actor_set_state(parts, i, 1);
+            made = made + 1;
+        }
+        i = i + 1;
+    }
+    return seed;
+}
+
+// Always exactly 12 commands, one per pool slot (KOTO-0175): a burst spawning
+// or a mote dying must never shift the immediate command count, so dead slots
+// emit the off-screen pad.
+fn draw_particles(parts: int) {
+    let i = 0;
+    while i < 12 {
+        let live = 0;
+        if actor_state(parts, i) != 0 {
+            let life = actor_timer(parts, i);
+            if life <= 1 {
+                actor_set_state(parts, i, 0);
+            } else {
+                let x = actor_x(parts, i) + actor_vx(parts, i);
+                let y = actor_y(parts, i) + actor_vy(parts, i);
+                actor_set_pos(parts, i, x, y);
+                actor_set_vel(parts, i, actor_vx(parts, i), actor_vy(parts, i) + 2);
+                actor_set_timer(parts, i, life - 1);
+                let col = C_CLOUD;
+                if actor_frame(parts, i) == 1 { col = C_GOLD; }
+                if actor_frame(parts, i) == 2 { col = C_GRASS_HI; }
+                let sz = 2 + life / 7;
+                draw_rect(x / 8, y / 8, sz, sz, col);
+                live = 1;
+            }
+        }
+        if live == 0 { pad_cmds(1); }
+        i = i + 1;
+    }
+}
+
+// `dpad` reserves the 3 dive-streak slots while diving is possible (S_PLAY):
+// the runner is then always 14 commands. Title/game-over pass 0 (dive is
+// forced 0 there) and get a constant 11 (KOTO-0175).
+fn draw_runner(y: int, vy: int, tick: int, flash: int, dive: int, dpad: int) {
+    let py = y / 8;
+    let body = C_PURPLE;
+    if flash > 0 && (flash & 1) == 0 { body = C_WHITE; }
+
+    // Shadow shrinks while airborne.
+    let air = (GROUND_Y - 27) - py;
+    if air < 0 { air = 0; }
+    let sw = 28 - air / 5;
+    if sw < 8 { sw = 8; }
+    draw_rect(RUNNER_X + 14 - sw / 2, GROUND_Y - 3, sw, 3, 10565);
+
+    // The dive turns the silhouette downward and adds speed streaks.
+    if dive != 0 {
+        draw_rect(RUNNER_X - 2, py - 13, 4, 18, C_CYAN);
+        draw_rect(RUNNER_X + 10, py - 19, 3, 16, C_WHITE);
+        draw_rect(RUNNER_X + 25, py - 10, 4, 13, C_CYAN);
+    } else if dpad != 0 {
+        pad_cmds(3);
+    }
+
+    // Scarf streams farther at speed and gives the silhouette a strong direction.
+    draw_rect(RUNNER_X - 13, py + 6, 18, 5, C_RED);
+    draw_rect(RUNNER_X - 18 - (tick & 3), py + 8, 10, 4, C_RED);
+
+    // Body, face and bright visor.
+    draw_rect(RUNNER_X, py + 5, 23, 20, body);
+    draw_rect(RUNNER_X + 5, py, 17, 10, body);
+    draw_rect(RUNNER_X + 10, py + 3, 12, 5, C_CYAN);
+    draw_rect(RUNNER_X + 18, py + 4, 3, 2, C_WHITE);
+    draw_rect(RUNNER_X + 2, py + 9, 4, 8, C_WHITE);
+
+    // Running legs alternate; in the air they tuck according to vertical
+    // motion. Always 3 slots: the variants below emit 2 real legs + 1 pad, or
+    // 3 real rects in the falling pose (KOTO-0175).
+    if py < GROUND_Y - 27 {
+        draw_rect(RUNNER_X + 3, py + 22, 7, 7, C_INK);
+        draw_rect(RUNNER_X + 15, py + 21, 7, 6, C_INK);
+        if vy > 0 { draw_rect(RUNNER_X + 12, py + 25, 10, 4, C_INK); } else { pad_cmds(1); }
+    } else if (tick & 4) == 0 {
+        draw_rect(RUNNER_X + 3, py + 23, 7, 5, C_INK);
+        draw_rect(RUNNER_X + 15, py + 22, 12, 5, C_INK);
+        pad_cmds(1);
+    } else {
+        draw_rect(RUNNER_X, py + 22, 12, 5, C_INK);
+        draw_rect(RUNNER_X + 16, py + 23, 7, 5, C_INK);
+        pad_cmds(1);
+    }
+}
+
+fn draw_world(cam: int, tick: int, smashseg: int) {
+    // The sky gradient, sun, parallax base bands, and the flat ground bands all
+    // live in the retained static layer; only elements that visibly move are
+    // emitted here. Every immediate command below is kept byte-stable between
+    // frames unless its pixels actually change, so the present-path diff can
+    // localize damage instead of unioning the whole screen.
+    // All background motion is quantized: each layer keeps its average speed
+    // but moves in coarse steps, so on most frames its commands are
+    // byte-identical to the previous frame and contribute zero dirty. The
+    // step sizes divide the wrap moduli, so the tiling stays seamless.
+    let off = (cam / 27) * 3 % 380;
+    draw_rect(24 - off, 44, 62, 12, C_CLOUD);
+    draw_rect(42 - off, 36, 30, 12, C_CLOUD);
+    draw_rect(230 - (cam / 39) * 3 % 440, 82, 74, 10, C_CLOUD);
+
+    // Parallax towers over the static base bands. The i = -1 tile of each layer
+    // is never on screen for any offset, so the loops start at 0. The far
+    // towers end at y=204 where the mid band used to overpaint them, so moving
+    // the bands to the static layer keeps the same pixels.
+    off = (cam / 24) * 4 % 120;
+    let i = 0;
+    while i < 4 {
+        let x = i * 120 - off;
+        draw_rect(x + 24, 147, 74, 57, C_FAR);
+        draw_rect(x + 46, 127, 34, 77, C_FAR);
+        i = i + 1;
+    }
+    off = (cam / 12) * 4 % 84;
+    i = 0;
+    while i < 5 {
+        let x = i * 84 - off;
+        draw_rect(x + 13, 181, 22, 65, C_MID);
+        draw_rect(x + 51, 190, 17, 56, C_MID);
+        draw_rect(x + 18, 176 + ((tick / 8) & 1), 4, 4, C_GOLD);
+        i = i + 1;
+    }
+
+    // The ground itself is static; gaps are painted as ink overlays over it, so
+    // a flat course costs zero ground commands (and zero ground dirty). The ink
+    // spans x+1..x+SEG, matching the 1-px overhang the old merged runs painted
+    // into the gap's left edge. (The old per-segment dirt flecks are gone: the
+    // merged run rects were flushed after them, so they were never visible.)
+    //
+    // Hazards draw through fixed per-residue slots (KOTO-0175): hazard() keys
+    // off seg % 12, so each hazard residue owns one slot in a fixed order —
+    // 2 gap (v 11, 4) + 2 spike (v 5, 1) + 3 drone (v 6, 7, 8) — and pads it
+    // while that hazard is off the course. The command count never changes
+    // and every slot's dirty union stays local. The hazards are pairwise
+    // segment-disjoint, so this order paints the same pixels the old
+    // segment-order scan did. (Each slot kind is a loop over its residues,
+    // not a helper per slot: the compiler inlines every call, so a loop body
+    // is the only shape that exists once in the bytecode — KOTO-0173's
+    // two-tile code window is a hard budget for this app's hot loop.)
+    let first = cam / SEG - 1;
+    i = 0;
+    while i < 2 {
+        // Gap slots: residues 11, 4 (2 commands each).
+        let s = seg_for(first, 11 - i * 7);
+        if s >= 0 && hazard(s) == 3 {
+            let x = s * SEG - cam;
+            draw_rect(x + 1, GROUND_Y, SEG - 1, 74, C_INK);
+            // Stone lip on the approach edge. (The old right-edge lip is
+            // gone: the next merged run's rects always overpainted it, so
+            // it was never visible.)
+            draw_rect(x - 5, GROUND_Y, 5, 74, C_DIRT_D);
+        } else {
+            pad_cmds(2);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < 2 {
+        // Spike slots: residues 5, 1 (4 commands each); a smashed segment
+        // pads (the burst covers it).
+        let s = seg_for(first, 5 - i * 4);
+        if s >= 0 && hazard(s) == 1 && s != smashseg {
+            let ox = s * SEG - cam + 39;
+            draw_rect(ox, GROUND_Y - 8, 36, 8, C_RED);
+            draw_rect(ox + 4, GROUND_Y - 17, 7, 9, C_WHITE);
+            draw_rect(ox + 15, GROUND_Y - 22, 7, 14, C_WHITE);
+            draw_rect(ox + 26, GROUND_Y - 17, 7, 9, C_WHITE);
+        } else {
+            pad_cmds(4);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < 3 {
+        // Drone slots: residues 6, 7, 8 (5 commands each).
+        let s = seg_for(first, 6 + i);
+        if s >= 0 && hazard(s) == 2 && s != smashseg {
+            let bob = (tick + s * 3) & 15;
+            if bob > 8 { bob = 16 - bob; }
+            let ox = s * SEG - cam + 48;
+            let oy = 183 + bob;
+            draw_rect(ox, oy, 32, 14, C_INK);
+            draw_rect(ox + 5, oy + 3, 22, 8, C_RED);
+            draw_rect(ox + 12, oy + 5, 8, 4, C_CYAN);
+            draw_rect(ox - 7, oy + 5, 8, 4, C_WHITE);
+            draw_rect(ox + 31, oy + 5, 8, 4, C_WHITE);
+        } else {
+            pad_cmds(5);
+        }
+        i = i + 1;
+    }
+}
+
+fn main() {
+    // One shared format buffer, partitioned so each displayed value owns its
+    // bytes and its draw command stays byte-stable while the value is stable:
+    // score at +0, coins at +8, best at +16, chain digit at +23 (KOTO-0168).
+    buf num[24];
+    let parts = actor_array_new(12);
+
+    let state = S_TITLE;
+    let y = (GROUND_Y - 27) * 8;
+    let vy = 0;
+    let cam = 0;
+    let speed = 4;
+    let score = 0;
+    let best = 0;
+    let coins = 0;
+    let smashseg = -1;
+    let coinseg = -1;
+    let bonus_score = 0;
+    let chain = 0;
+    let coyote = 0;
+    let tick = 0;
+    let flash = 0;
+    let shake = 0;
+    let rng = 19331;
+    let deadt = 0;
+    let bonus = 0;
+    let dive = 0;
+    let prev_ground = 1;
+    let sdirty = 1;
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
+
+        // ---- Retained static layer (built once) ----
+        // Everything that never moves on screen: the full-screen sky base
+        // (which also gives the device present path its retained base colour —
+        // this app never draws a full-screen immediate rect in play), the
+        // horizon band, the sun, the parallax base bands, and the flat ground
+        // bands (KOTO-0168 — gaps reveal the abyss via immediate ink overlays).
+        // Every scene draws over this, so it is never rebuilt.
+        if sdirty != 0 {
+            sdirty = 0;
+            game2d_static_begin();
+            draw_rect(0, 0, 320, 320, C_SKY);
+            draw_rect(0, 160, 320, 86, C_SKY2);
+            draw_rect(252, 30, 38, 38, C_SUN);
+            draw_rect(0, 174, 320, 72, C_FAR);
+            draw_rect(0, 204, 320, 42, C_MID);
+            draw_rect(0, GROUND_Y, 320, 74, C_DIRT);
+            draw_rect(0, GROUND_Y, 320, 6, C_GRASS);
+            draw_rect(0, GROUND_Y + 6, 320, 3, C_GRASS_HI);
+            game2d_static_end();
+        }
+        tick = tick + 1;
+        if flash > 0 { flash = flash - 1; }
+        if shake > 0 { shake = shake - 1; }
+        if bonus > 0 { bonus = bonus - 1; }
+
+        let jump = 0;
+        if (intent & INTENT_NEWLINE) != 0 || (intent & INTENT_IME_TOGGLE) != 0 || (intent & INTENT_UP) != 0 {
+            jump = 1;
+        }
+
+        if state == S_TITLE {
+            if jump != 0 {
+                state = S_PLAY;
+                y = (GROUND_Y - 27) * 8;
+                vy = 0; cam = 0; speed = 4; score = 0; coins = 0;
+                smashseg = -1; coinseg = -1; bonus_score = 0; chain = 0;
+                coyote = 5; deadt = 0; dive = 0;
+                sfx_start();
+                play_bgm_asset("audio/kotorun_bgm.kmml", 22);
+            }
+
+            // (KOTO-0175: the old title screen drew the scrolling world here
+            // and then hid it entirely under this opaque full-screen panel —
+            // zero visible pixels for a second inlined copy of draw_world,
+            // which alone pushed the steady-play code span past the two-tile
+            // window. Dropped; the panel is what the player sees.)
+            draw_rect(0, 0, 320, 320, 4098);
+            draw_text_color(71, 70, "KotoRun", 7, C_INK);
+            draw_text_color(68, 67, "KotoRun", 7, C_GOLD);
+            draw_text_color(80, 104, "NEON DASH", 9, C_CYAN);
+            draw_runner(184 * 8, 0, tick, 0, 0, 0);
+            if (tick & 16) != 0 {
+                draw_text_color(76, 266, "F1 / Enter ではじめる", 26, C_WHITE);
+            } else {
+                draw_text_color(76, 266, "F1 / Enter ではじめる", 26, C_GOLD);
+            }
+            draw_text_color(76, 290, "空中 ↓ でダイブ攻撃！", 32, C_DIM);
+            yield_frame();
+            continue;
+        }
+
+        if state == S_OVER {
+            deadt = deadt + 1;
+            if jump != 0 {
+                state = S_TITLE;
+            }
+        } else {
+            // Speed ramps with distance; Left/Right allow a little tactical control.
+            speed = 4 + cam / 1800;
+            if speed > 8 { speed = 8; }
+            if (intent & INTENT_RIGHT) != 0 { speed = speed + 2; }
+            if (intent & INTENT_LEFT) != 0 { speed = speed - 2; if speed < 3 { speed = 3; } }
+            cam = cam + speed;
+            score = cam / 4 + coins * 100 + bonus_score;
+
+            let wx = cam + RUNNER_X + 11;
+            let seg = wx / SEG;
+            let h = hazard(seg);
+            let sx = wx % SEG;
+            let ground = 1;
+            if h == 3 && sx > 4 && sx < SEG - 4 { ground = 0; }
+
+            // Ground/coyote-time and fixed-point jump physics.
+            let feet = y / 8 + 27;
+            let onground = 0;
+            if ground != 0 && feet >= GROUND_Y && vy >= 0 {
+                y = (GROUND_Y - 27) * 8;
+                vy = 0;
+                onground = 1;
+                coyote = 5;
+                chain = 0;
+                if prev_ground == 0 { rng = spawn_dust(parts, RUNNER_X + 10, GROUND_Y - 2, 7, rng); }
+            } else {
+                if coyote > 0 { coyote = coyote - 1; }
+            }
+            prev_ground = onground;
+
+            if jump != 0 && coyote > 0 {
+                vy = 0 - 91;
+                coyote = 0;
+                dive = 0;
+                rng = spawn_dust(parts, RUNNER_X + 8, y / 8 + 25, 5, rng);
+                sfx_jump();
+            }
+            // Down is a committed attack, not merely a faster fall. It can be used
+            // once per jump and persists until landing or a successful smash.
+            if (intent & INTENT_DOWN) != 0 && onground == 0 && dive == 0 {
+                dive = 1;
+                if vy < 76 { vy = 76; }
+            }
+            vy = vy + 7;
+            if vy > 96 { vy = 96; }
+            y = y + vy;
+
+            // One floating coin per safe segment; entering a new segment resets it.
+            if h == 0 && seg > 2 && coinseg != seg {
+                let coinx = seg * SEG + 62;
+                let coiny = GROUND_Y - 58 - (seg % 3) * 18;
+                let dx = wx - coinx;
+                let dy = y / 8 + 13 - coiny;
+                if dx > -15 && dx < 15 && dy > -17 && dy < 17 {
+                    coins = coins + 1;
+                    coinseg = seg;
+                    bonus = 24;
+                    rng = spawn_dust(parts, RUNNER_X + 12, y / 8 + 10, 9, rng);
+                    sfx_coin();
+                }
+            }
+
+            // Dive attacks shatter spikes and drones, award a bonus, and rebound.
+            // Touching either hazard without diving remains fatal.
+            let hit = 0;
+            if h == 1 && seg != smashseg && sx > 35 && sx < 82 && y / 8 + 25 > GROUND_Y - 22 {
+                if dive != 0 {
+                    smashseg = seg;
+                    chain = chain + 1;
+                    if chain > 6 { chain = 6; }
+                    bonus_score = bonus_score + 50 * chain;
+                    bonus = 24;
+                    vy = 0 - 78 - chain * 10;
+                    y = y - 12;
+                    dive = 0;
+                    rng = spawn_dust(parts, RUNNER_X + 12, GROUND_Y - 8, 12 + chain, rng);
+                    sfx_hit();
+                } else { hit = 1; }
+            }
+            if h == 2 && seg != smashseg && sx > 42 && sx < 87 && y / 8 < 215 && y / 8 + 25 > 181 {
+                if dive != 0 && vy > 0 {
+                    smashseg = seg;
+                    chain = chain + 1;
+                    if chain > 6 { chain = 6; }
+                    bonus_score = bonus_score + 100 * chain;
+                    bonus = 24;
+                    vy = 0 - 82 - chain * 10;
+                    dive = 0;
+                    rng = spawn_dust(parts, RUNNER_X + 12, y / 8 + 24, 12 + chain, rng);
+                    sfx_hit();
+                } else { hit = 1; }
+            }
+            if onground != 0 && dive != 0 {
+                dive = 0;
+                rng = spawn_dust(parts, RUNNER_X + 12, GROUND_Y - 3, 10, rng);
+            }
+            if y / 8 > 330 { hit = 1; }
+            if hit != 0 {
+                state = S_OVER;
+                deadt = 0; flash = 12; shake = 12;
+                // Clear the transient-draw state so every S_OVER frame keeps
+                // one fixed command count (KOTO-0175): the dive streaks, the
+                // SMASH! toast and the chain badge die with the runner
+                // instead of expiring (and count-shifting) mid-game-over.
+                dive = 0; bonus = 0; chain = 0;
+                if score > best { best = score; }
+                rng = spawn_dust(parts, RUNNER_X + 12, y / 8 + 12, 16, rng);
+                stop_bgm();
+                sfx_hit();
+            }
+        }
+
+        let sh = 0;
+        if shake > 0 {
+            if (shake & 1) == 0 { sh = 4; } else { sh = 0 - 4; }
+        }
+        draw_world(cam + sh, tick, smashseg);
+
+        // Draw the current segment's uncollected coin over the world. The 3
+        // slots stay reserved while no coin is up (KOTO-0175: collecting or
+        // outrunning a coin must not shift the command count).
+        let cs = (cam + RUNNER_X + 11) / SEG;
+        if hazard(cs) == 0 && cs > 2 && coinseg != cs {
+            let cx = cs * SEG + 62 - cam;
+            let cy = GROUND_Y - 58 - (cs % 3) * 18;
+            draw_rect(cx - 7, cy - 9, 14, 18, C_GOLD);
+            draw_rect(cx - 3, cy - 6, 6, 12, C_WHITE);
+            draw_rect(cx + 7, cy - 2, 3, 4, C_GOLD);
+        } else {
+            pad_cmds(3);
+        }
+
+        let dpad = 0;
+        if state == S_PLAY { dpad = 1; }
+        draw_runner(y, vy, tick, flash, dive, dpad);
+
+        // Compact HUD. The displayed score refreshes every 8 frames (and every
+        // frame outside play, so the game-over panel row is exact): between
+        // refreshes its text command is byte-identical and the ~4.5k-px text
+        // band stays clean. `cam < 40` covers the first frames of a fresh run
+        // before the tick gate first fires. Coins reformat every frame, but
+        // unchanged values produce identical bytes, so the command is stable.
+        draw_rect(0, 0, 320, 28, C_PANEL);
+        draw_text_color(8, 7, "SCORE", 5, C_DIM);
+        if state != S_PLAY || (tick & 7) == 0 || cam < 40 {
+            fmt6(num, score);
+        }
+        draw_text_color(58, 5, num, 6, C_WHITE);
+        draw_text_color(190, 7, "COIN", 4, C_DIM);
+        fmt6(num + 8, coins);
+        draw_text_color(240, 5, num + 11, 3, C_GOLD);
+        draw_rect(0, 28, 320, 2, C_CYAN);
+
+        // SMASH! toast and chain badge: their slots stay reserved during play
+        // (KOTO-0175). In S_OVER both are forced to 0 at death, so the state
+        // has its own fixed count without these pads.
+        if bonus > 0 {
+            draw_text_color(126, 74 - (24 - bonus), "SMASH!", 6, C_GOLD);
+        } else if state == S_PLAY {
+            pad_cmds(1);
+        }
+        if chain > 1 {
+            draw_rect(222, 36, 90, 25, C_PANEL);
+            draw_text_color(230, 43, "CHAIN x", 7, C_CYAN);
+            heap_set_u8(num + 23, 48 + chain);
+            draw_text_color(294, 43, num + 23, 1, C_GOLD);
+        } else if state == S_PLAY {
+            pad_cmds(3);
+        }
+
+        if state == S_OVER {
+            let oy = -90 + deadt * 8;
+            if oy > 78 { oy = 78; }
+            draw_rect(34, oy, 252, 154, C_PANEL);
+            draw_rect(34, oy, 252, 4, C_RED);
+            draw_text_color(92, oy + 20, "RUN OVER", 8, C_RED);
+            draw_text_color(70, oy + 53, "スコア", 9, C_DIM);
+            fmt6(num, score);
+            draw_text_color(142, oy + 51, num, 6, C_WHITE);
+            draw_text_color(70, oy + 79, "ベスト", 9, C_DIM);
+            fmt6(num + 16, best);
+            draw_text_color(142, oy + 77, num + 16, 6, C_GOLD);
+            if (tick & 16) != 0 {
+                draw_text_color(72, oy + 116, "F1 / Enter でもう一度", 26, C_WHITE);
+            } else {
+                pad_cmds(1);
+            }
+        }
+
+        // Dust/burst particles draw last: they sit on top of everything and are
+        // pure decoration, so a device draw-budget overflow drops them first.
+        draw_particles(parts);
+
+        yield_frame();
+    }
+}

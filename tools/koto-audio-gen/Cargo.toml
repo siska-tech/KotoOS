@@ -1,0 +1,15 @@
+[package]
+name = "koto-audio-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Offline generator for the Pico primary-audio cue tables (KOTO-0165). Parses the
+# per-app `apps/*/audio/*.kmml` sources with the koto-audio-tools MML frontend,
+# converts the legacy KotoMML dialect (0-15 volumes, legacy synth instrument ids)
+# to the KotoAudio builtin-instrument model, and emits the vendored
+# `src/koto-pico/src/firmware/audio_cues_generated.rs` sequence statics.
+
+[dependencies]
+koto-audio = { path = "../../src/koto-audio/crates/koto-audio" }
+koto-audio-tools = { path = "../../src/koto-audio/crates/koto-audio-tools" }

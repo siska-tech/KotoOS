@@ -1,0 +1,370 @@
+{
+  "comment": "Registry of source-built apps. `kind` selects the build tool: `koto` uses the koto-compiler (high-level source), `asm` uses kbc-asm (low-level IR). `output` is the committed bytecode under sdcard_mock; `manifest` must declare it as the entry. An optional `maps` block embeds `*.txt` tilemaps from `dir` into `source` (between the generated-stage markers) at build time. An optional `images` block compiles `.kspr` ASCII sprite sheets into committed `.kim` (KIM1 RGB565) package assets. Rebuild with `python harness/build_apps.py`; verify drift with `--check`.",
+  "apps": [
+    {
+      "app_id": "dev.koto.memo",
+      "kind": "koto",
+      "source": "apps/memo/src/main.koto",
+      "output": "sdcard_mock/bytecode/memo.kbc",
+      "manifest": "sdcard_mock/apps/memo.kpa.json"
+    },
+    {
+      "app_id": "dev.koto.games.koto-blocks",
+      "kind": "koto",
+      "source": "apps/koto_blocks/src/main.koto",
+      "output": "sdcard_mock/bytecode/koto_blocks.kbc",
+      "manifest": "sdcard_mock/apps/koto_blocks.kpa.json",
+      "codegen": {
+        "comment": "KOTO-0156: the per-frame loop body exceeds one 16 KiB PSRAM code-window tile. Relocating the one-time string-init preamble to the tail (relocate_preamble) AND outlining the cold title-state block (outline_cold_blocks) together front-load the steady loop into a single tile -> steady gameplay refills 2 -> 0. Neither alone wins (preamble-only regresses to 442 refills, outline-only to 14); only the pair. See docs/devlog/KOTO_KOTOBLOCKS_COLD_BLOCK_OUTLINING.md.",
+        "relocate_preamble": true,
+        "outline_cold_blocks": true
+      },
+      "assets": [
+        {
+          "source": "apps/koto_blocks/audio/bgm.kmml",
+          "output": "sdcard_mock/audio/koto_blocks_bgm.kmml"
+        },
+        {
+          "source": "apps/koto_blocks/audio/move.kmml",
+          "output": "sdcard_mock/audio/koto_blocks_move.kmml"
+        },
+        {
+          "source": "apps/koto_blocks/audio/rotate.kmml",
+          "output": "sdcard_mock/audio/koto_blocks_rotate.kmml"
+        },
+        {
+          "source": "apps/koto_blocks/audio/lock.kmml",
+          "output": "sdcard_mock/audio/koto_blocks_lock.kmml"
+        },
+        {
+          "source": "apps/koto_blocks/audio/clear.kmml",
+          "output": "sdcard_mock/audio/koto_blocks_clear.kmml"
+        },
+        {
+          "source": "apps/koto_blocks/audio/over.kmml",
+          "output": "sdcard_mock/audio/koto_blocks_over.kmml"
+        },
+        {
+          "source": "apps/koto_blocks/audio/tetris.kmml",
+          "output": "sdcard_mock/audio/koto_blocks_tetris.kmml"
+        }
+      ]
+    },
+    {
+      "app_id": "dev.koto.games.sokoban",
+      "kind": "koto",
+      "source": "apps/sokoban/src/main.koto",
+      "output": "sdcard_mock/bytecode/sokoban.kbc",
+      "manifest": "sdcard_mock/apps/sokoban.kpa.json",
+      "maps": {
+        "dir": "apps/sokoban/maps",
+        "source": "apps/sokoban/src/main.koto",
+        "width": 10,
+        "height": 8,
+        "glyphs": "#.oO*@ "
+      },
+      "assets": [
+        {
+          "source": "apps/sokoban/audio/bgm.kmml",
+          "output": "sdcard_mock/audio/sokoban_bgm.kmml"
+        },
+        {
+          "source": "apps/sokoban/audio/move.kmml",
+          "output": "sdcard_mock/audio/sokoban_move.kmml"
+        },
+        {
+          "source": "apps/sokoban/audio/rotate.kmml",
+          "output": "sdcard_mock/audio/sokoban_rotate.kmml"
+        },
+        {
+          "source": "apps/sokoban/audio/lock.kmml",
+          "output": "sdcard_mock/audio/sokoban_lock.kmml"
+        },
+        {
+          "source": "apps/sokoban/audio/clear.kmml",
+          "output": "sdcard_mock/audio/sokoban_clear.kmml"
+        }
+      ]
+    },
+    {
+      "app_id": "dev.koto.games.kotoshogi",
+      "kind": "koto",
+      "source": "apps/kotoshogi/src/main.koto",
+      "output": "sdcard_mock/bytecode/kotoshogi.kbc",
+      "manifest": "sdcard_mock/apps/kotoshogi.kpa.json",
+      "codegen": {
+        "comment": "KOTO-0156 model: the steady play frame walked four 16 KiB code-window tiles and the 81-cell glyph loop straddled a tile boundary (hardware phase=160: refills=166, vm_us~230ms, fps=4). The title/victory scenes end in `continue` so outline_cold_blocks relocates them to the tail, and relocate_preamble pulls the loop start toward word 0, shrinking the steady play walk. KOTO-0169 Stage 4: the compact comparison templates re-broke that carefully tuned layout (sim tile profile regressed past the 2-refill floor), so this app also pins the pre-Stage-4 templates.",
+        "relocate_preamble": true,
+        "outline_cold_blocks": true,
+        "legacy_compare_templates": true
+      },
+      "assets": [
+        {
+          "source": "apps/kotoshogi/audio/bgm.kmml",
+          "output": "sdcard_mock/audio/kotoshogi_bgm.kmml"
+        },
+        {
+          "source": "apps/kotoshogi/audio/move.kmml",
+          "output": "sdcard_mock/audio/kotoshogi_move.kmml"
+        },
+        {
+          "source": "apps/kotoshogi/audio/rotate.kmml",
+          "output": "sdcard_mock/audio/kotoshogi_rotate.kmml"
+        },
+        {
+          "source": "apps/kotoshogi/audio/lock.kmml",
+          "output": "sdcard_mock/audio/kotoshogi_lock.kmml"
+        },
+        {
+          "source": "apps/kotoshogi/audio/clear.kmml",
+          "output": "sdcard_mock/audio/kotoshogi_clear.kmml"
+        },
+        {
+          "source": "apps/kotoshogi/audio/over.kmml",
+          "output": "sdcard_mock/audio/kotoshogi_over.kmml"
+        },
+        {
+          "source": "apps/kotoshogi/audio/tetris.kmml",
+          "output": "sdcard_mock/audio/kotoshogi_tetris.kmml"
+        }
+      ]
+    },
+    {
+      "app_id": "dev.koto.games.kotosnake",
+      "kind": "koto",
+      "source": "apps/kotosnake/src/main.koto",
+      "output": "sdcard_mock/bytecode/kotosnake.kbc",
+      "manifest": "sdcard_mock/apps/kotosnake.kpa.json",
+      "codegen": {
+        "comment": "KOTO-0169 Stage 4: the compact boolean/comparison templates shrink this app's code just enough to slide a hot main<->helper pair across a code-window tile boundary - steady play regressed from the KOTO-0155 2-refill monotone walk to a 10-refill ping-pong in the sim tile profile. Pinned to the pre-Stage-4 templates (byte-identical layout) instead; kotosnake already ships without the KOTO-0156 pair for the same tile-layout fragility.",
+        "legacy_compare_templates": true
+      },
+      "assets": [
+        {
+          "source": "apps/kotosnake/audio/bgm.kmml",
+          "output": "sdcard_mock/audio/kotosnake_bgm.kmml"
+        },
+        {
+          "source": "apps/kotosnake/audio/bgm2.kmml",
+          "output": "sdcard_mock/audio/kotosnake_bgm2.kmml"
+        },
+        {
+          "source": "apps/kotosnake/audio/bgm3.kmml",
+          "output": "sdcard_mock/audio/kotosnake_bgm3.kmml"
+        },
+        {
+          "source": "apps/kotosnake/audio/lead.kwt",
+          "output": "sdcard_mock/audio/kotosnake_lead.kwt"
+        },
+        {
+          "source": "apps/kotosnake/audio/bass.kwt",
+          "output": "sdcard_mock/audio/kotosnake_bass.kwt"
+        },
+        {
+          "source": "apps/kotosnake/audio/pluck.kwt",
+          "output": "sdcard_mock/audio/kotosnake_pluck.kwt"
+        },
+        {
+          "source": "apps/kotosnake/audio/drum.kwt",
+          "output": "sdcard_mock/audio/kotosnake_drum.kwt"
+        },
+        {
+          "source": "apps/kotosnake/audio/eat.kmml",
+          "output": "sdcard_mock/audio/kotosnake_eat.kmml"
+        },
+        {
+          "source": "apps/kotosnake/audio/turn.kmml",
+          "output": "sdcard_mock/audio/kotosnake_turn.kmml"
+        },
+        {
+          "source": "apps/kotosnake/audio/over.kmml",
+          "output": "sdcard_mock/audio/kotosnake_over.kmml"
+        },
+        {
+          "source": "apps/kotosnake/audio/start.kmml",
+          "output": "sdcard_mock/audio/kotosnake_start.kmml"
+        },
+        {
+          "source": "apps/kotosnake/audio/level.kmml",
+          "output": "sdcard_mock/audio/kotosnake_level.kmml"
+        }
+      ]
+    },
+    {
+      "app_id": "dev.koto.games.kotomines",
+      "kind": "koto",
+      "codegen": {
+        "comment": "KOTO-0156 model (applied after the KotoShogi refill fix): the size menu ends in `continue` so outline_cold_blocks relocates it to the tail, and relocate_preamble pulls the steady play loop toward word 0 so its walk stays a short monotone tile sequence.",
+        "relocate_preamble": true,
+        "outline_cold_blocks": true
+      },
+      "source": "apps/kotomines/src/main.koto",
+      "output": "sdcard_mock/bytecode/kotomines.kbc",
+      "manifest": "sdcard_mock/apps/kotomines.kpa.json",
+      "assets": [
+        {
+          "source": "apps/kotomines/audio/bgm.kmml",
+          "output": "sdcard_mock/audio/kotomines_bgm.kmml"
+        },
+        {
+          "source": "apps/kotomines/audio/move.kmml",
+          "output": "sdcard_mock/audio/kotomines_move.kmml"
+        },
+        {
+          "source": "apps/kotomines/audio/rotate.kmml",
+          "output": "sdcard_mock/audio/kotomines_rotate.kmml"
+        },
+        {
+          "source": "apps/kotomines/audio/lock.kmml",
+          "output": "sdcard_mock/audio/kotomines_lock.kmml"
+        },
+        {
+          "source": "apps/kotomines/audio/clear.kmml",
+          "output": "sdcard_mock/audio/kotomines_clear.kmml"
+        },
+        {
+          "source": "apps/kotomines/audio/over.kmml",
+          "output": "sdcard_mock/audio/kotomines_over.kmml"
+        }
+      ]
+    },
+    {
+      "app_id": "dev.koto.games.kotorogue",
+      "kind": "koto",
+      "source": "apps/kotorogue/src/main.koto",
+      "output": "sdcard_mock/bytecode/kotorogue.kbc",
+      "manifest": "sdcard_mock/apps/kotorogue.kpa.json",
+      "codegen": {
+        "comment": "KOTO-0156 pair (see KotoShogi/KotoMines): the code spans ~4 tiles; the title and result blocks end in `continue` so outline_cold_blocks relocates them, and relocate_preamble pulls the steady play loop toward word 0. kotorogue_code_window_tile_profile guards the measured walk.",
+        "relocate_preamble": true,
+        "outline_cold_blocks": true
+      },
+      "images": [
+        {
+          "source": "apps/kotorogue/sprites/tiles.kspr",
+          "output": "sdcard_mock/sprites/kotorogue_tiles.kim"
+        }
+      ],
+      "assets": [
+        {
+          "source": "apps/kotorogue/audio/bgm.kmml",
+          "output": "sdcard_mock/audio/kotorogue_bgm.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/step.kmml",
+          "output": "sdcard_mock/audio/kotorogue_step.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/hit.kmml",
+          "output": "sdcard_mock/audio/kotorogue_hit.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/kill.kmml",
+          "output": "sdcard_mock/audio/kotorogue_kill.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/gold.kmml",
+          "output": "sdcard_mock/audio/kotorogue_gold.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/potion.kmml",
+          "output": "sdcard_mock/audio/kotorogue_potion.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/stairs.kmml",
+          "output": "sdcard_mock/audio/kotorogue_stairs.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/hurt.kmml",
+          "output": "sdcard_mock/audio/kotorogue_hurt.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/over.kmml",
+          "output": "sdcard_mock/audio/kotorogue_over.kmml"
+        },
+        {
+          "source": "apps/kotorogue/audio/win.kmml",
+          "output": "sdcard_mock/audio/kotorogue_win.kmml"
+        }
+      ]
+    },
+    {
+      "app_id": "dev.koto.games.kotorun",
+      "kind": "koto",
+      "source": "apps/kotorun/src/main.koto",
+      "output": "sdcard_mock/bytecode/kotorun.kbc",
+      "manifest": "sdcard_mock/apps/kotorun.kpa.json",
+      "assets": [
+        {
+          "source": "apps/kotorun/audio/bgm.kmml",
+          "output": "sdcard_mock/audio/kotorun_bgm.kmml"
+        },
+        {
+          "source": "apps/kotorun/audio/jump.kmml",
+          "output": "sdcard_mock/audio/kotorun_jump.kmml"
+        },
+        {
+          "source": "apps/kotorun/audio/coin.kmml",
+          "output": "sdcard_mock/audio/kotorun_coin.kmml"
+        },
+        {
+          "source": "apps/kotorun/audio/hit.kmml",
+          "output": "sdcard_mock/audio/kotorun_hit.kmml"
+        },
+        {
+          "source": "apps/kotorun/audio/start.kmml",
+          "output": "sdcard_mock/audio/kotorun_start.kmml"
+        }
+      ]
+    },
+    {
+      "app_id": "dev.koto.samples.hello-text",
+      "kind": "koto",
+      "source": "apps/samples/hello_text/src/main.koto",
+      "output": "sdcard_mock/bytecode/sample_hello_text.kbc",
+      "manifest": "sdcard_mock/apps/sample_hello_text.kpa.json"
+    },
+    {
+      "app_id": "dev.koto.samples.input-echo",
+      "kind": "koto",
+      "source": "apps/samples/input_echo/src/main.koto",
+      "output": "sdcard_mock/bytecode/sample_input_echo.kbc",
+      "manifest": "sdcard_mock/apps/sample_input_echo.kpa.json"
+    },
+    {
+      "app_id": "dev.koto.samples.counter-loop",
+      "kind": "koto",
+      "source": "apps/samples/counter_loop/src/main.koto",
+      "output": "sdcard_mock/bytecode/sample_counter_loop.kbc",
+      "manifest": "sdcard_mock/apps/sample_counter_loop.kpa.json"
+    },
+    {
+      "app_id": "dev.koto.samples.file-note",
+      "kind": "koto",
+      "source": "apps/samples/file_note/src/main.koto",
+      "output": "sdcard_mock/bytecode/sample_file_note.kbc",
+      "manifest": "sdcard_mock/apps/sample_file_note.kpa.json"
+    },
+    {
+      "app_id": "dev.koto.samples.ime-playground",
+      "kind": "koto",
+      "source": "apps/samples/ime_playground/src/main.koto",
+      "output": "sdcard_mock/bytecode/sample_ime_playground.kbc",
+      "manifest": "sdcard_mock/apps/sample_ime_playground.kpa.json"
+    },
+    {
+      "app_id": "dev.koto.samples.dirty-rects",
+      "kind": "koto",
+      "source": "apps/samples/dirty_rects/src/main.koto",
+      "output": "sdcard_mock/bytecode/sample_dirty_rects.kbc",
+      "manifest": "sdcard_mock/apps/sample_dirty_rects.kpa.json"
+    },
+    {
+      "app_id": "dev.koto.samples.actor-array",
+      "kind": "koto",
+      "source": "apps/samples/actor_array/src/main.koto",
+      "output": "sdcard_mock/bytecode/sample_actor_array.kbc",
+      "manifest": "sdcard_mock/apps/sample_actor_array.kpa.json"
+    }
+  ]
+}

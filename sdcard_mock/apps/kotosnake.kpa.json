@@ -1,0 +1,100 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.games.kotosnake",
+  "name": "KotoSnake",
+  "entry": "bytecode/kotosnake.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/kotosnake.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#0A0820",
+    "primary": "#2ACADC",
+    "secondary": "#F6C236",
+    "accent": "#E0489E",
+    "highlight": "#46BE69",
+    "shadow": "#0A0810"
+  },
+  "description": "演出過剰なヘビゲーム。虹色のヘビ・粒子・画面シェイク、BGMはカスタム音色。",
+  "category": "ゲーム",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "assets": [
+    {
+      "path": "bytecode/kotosnake.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/kotosnake.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotosnake_bgm.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotosnake_bgm2.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotosnake_bgm3.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotosnake_lead.kwt",
+      "type": "instrument",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotosnake_bass.kwt",
+      "type": "instrument",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotosnake_pluck.kwt",
+      "type": "instrument",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotosnake_drum.kwt",
+      "type": "instrument",
+      "sequential": false
+    },
+    {
+      "path": "audio/kotosnake_eat.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotosnake_turn.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotosnake_over.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotosnake_start.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/kotosnake_level.kmml",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

@@ -1,0 +1,873 @@
+// dev.koto.games.kotoshogi — local two-player shogi for KotoOS.
+//
+// Controls:
+//   Arrows  move cursor
+//   Enter   select / move / promote
+//   Space   decline optional promotion
+//   H       cycle through available pieces in hand
+//   X       cancel selection / hand piece
+//   U       undo one move
+//   Q       resign
+//   F1      restart
+//   F10     exit
+//
+// Render model (current Koto-GFX): everything that only changes on a completed
+// action — page chrome, the turn chip, the board base + grid, the piece bodies,
+// and the hand footer — lives in the retained Game2D static layer, rebuilt via
+// `sdirty` on board/turn/hand changes. The per-frame immediate list carries only
+// the piece glyphs, cursor, ghost markers, and transient effects, so it stays
+// inside the device's per-frame draw-command budget instead of re-emitting the
+// whole screen every frame like the deprecated full-redraw path did.
+//
+// Code-window layout (KOTO-0156 model): the device fetches code through a single
+// 16 KiB PSRAM tile, so the steady play frame must not walk more tiles than it
+// needs. The title and victory scenes are self-contained `if state == N { ...
+// yield_frame(); continue; }` blocks so `outline_cold_blocks` can relocate them
+// to the code tail, and the piece glyphs come from one packed kanji table (a
+// single literal + offset) instead of a 14-branch chain, keeping the per-frame
+// 81-cell loop body small enough to sit inside one tile. Build with the
+// apps.json `codegen` opts (relocate_preamble + outline_cold_blocks).
+
+const C_BG = 63390;
+const C_NAVY = 4258;
+const C_NAVY_HI = 10895;
+const C_BOARD_A = 64908;
+const C_BOARD_B = 62827;
+const C_LINE = 19077;
+const C_INK = 4226;
+const C_GOTE = 10667;
+const C_LIGHT = 65503;
+const C_DIM = 44373;
+const C_SELECT = 2047;
+const C_MOVE = 65099;
+const C_CHECK = 63488;
+const C_GOLD = 64800;
+const C_SHADOW = 27469;
+const C_HAND = 57051;
+
+// Returns 0 for illegal, 1 for a one-step/jump move, 2 for a sliding move.
+// dy is normalized so positive means "forward" for the moving side.
+fn move_mode(kind: int, side: int, dx: int, dy: int) -> int {
+    let ax = dx;
+    let ay = dy;
+    if ax < 0 { ax = -ax; }
+    if ay < 0 { ay = -ay; }
+    if side == 0 { dy = -dy; }
+
+    if kind == 1 {
+        if dx == 0 && dy == 1 { return 1; }
+        return 0;
+    }
+    if kind == 2 {
+        if dx == 0 && dy > 0 { return 2; }
+        return 0;
+    }
+    if kind == 3 {
+        if ax == 1 && dy == 2 { return 1; }
+        return 0;
+    }
+    if kind == 4 {
+        if dy == 1 && ax <= 1 { return 1; }
+        if dy == -1 && ax == 1 { return 1; }
+        return 0;
+    }
+    if kind == 5 || (kind >= 9 && kind <= 12) {
+        if dy == 1 && ax <= 1 { return 1; }
+        if dy == 0 && ax == 1 { return 1; }
+        if dy == -1 && dx == 0 { return 1; }
+        return 0;
+    }
+    if kind == 6 || kind == 14 {
+        if ax == ay && ax > 0 { return 2; }
+        if kind == 14 && ax + ay == 1 { return 1; }
+        return 0;
+    }
+    if kind == 7 || kind == 15 {
+        if ((dx == 0 && ay > 0) || (dy == 0 && ax > 0)) { return 2; }
+        if kind == 15 && ax == 1 && ay == 1 { return 1; }
+        return 0;
+    }
+    if kind == 8 {
+        if ax <= 1 && ay <= 1 && ax + ay > 0 { return 1; }
+    }
+    return 0;
+}
+
+fn sfx_move() { play_sfx_asset("audio/kotoshogi_move.kmml", 25); }
+fn sfx_rotate() { play_sfx_asset("audio/kotoshogi_rotate.kmml", 27); }
+fn sfx_lock() { play_sfx_asset("audio/kotoshogi_lock.kmml", 25); }
+fn sfx_clear() { play_sfx_asset("audio/kotoshogi_clear.kmml", 26); }
+fn sfx_over() { play_sfx_asset("audio/kotoshogi_over.kmml", 25); }
+fn sfx_tetris() { play_sfx_asset("audio/kotoshogi_tetris.kmml", 27); }
+
+fn main() {
+    buf board[81];
+    buf hands[16];
+    buf undo_board[81];
+    buf undo_hands[16];
+    buf legal[81];
+    buf num[2];
+
+    let state = 0;       // 0 title, 1 play, 2 victory
+    let turn = 0;        // 0 sente, 1 gote
+    let undo_turn = 0;
+    let undo_ok = 0;
+    let cx = 4;
+    let cy = 6;
+    let sel = 0;
+    let selx = 0;
+    let sely = 0;
+    let hand = 0;
+    let pending = 0;     // optional promotion decision
+    let winner = 0;
+    let check = 0;
+    let tick = 0;
+    let fx = 0;
+    let from = -2;
+    let to = 0;
+    let msg = 0;
+    let sdirty = 0;      // rebuild the retained static layer this frame
+
+    let intent = 0;
+    let cp = 0;
+    let dx = 0;
+    let dy = 0;
+    let i = 0;
+    let j = 0;
+    let v = 0;
+    let k = 0;
+    let side = 0;
+    let mode = 0;
+    let bad = 0;
+    let px = 0;
+    let py = 0;
+    let tx = 0;
+    let ty = 0;
+    let target = 0;
+    let capture = 0;
+    let count = 0;
+
+    loop {
+        intent = text_intent();
+        cp = text_input();
+        if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
+        tick = tick + 1;
+        if fx > 0 { fx = fx - 1; }
+        if fx == 0 && msg < 0 { msg = 0; }
+        if msg > 0 { msg = msg - 1; }
+
+        // ---- Title (cold: ends in `continue`, outlined to the code tail) ----
+        if state == 0 {
+            if (intent & INTENT_NEWLINE) != 0 {
+                i = 0;
+                while i < 81 { board[i] = 0; undo_board[i] = 0; legal[i] = 0; i = i + 1; }
+                i = 0;
+                while i < 16 { hands[i] = 0; undo_hands[i] = 0; i = i + 1; }
+
+                // Gote camp.
+                board[0] = 18; board[1] = 19; board[2] = 20; board[3] = 21;
+                board[4] = 24; board[5] = 21; board[6] = 20; board[7] = 19; board[8] = 18;
+                board[10] = 23; board[16] = 22;
+                i = 18;
+                while i < 27 { board[i] = 17; i = i + 1; }
+
+                // Sente camp.
+                i = 54;
+                while i < 63 { board[i] = 1; i = i + 1; }
+                board[64] = 6; board[70] = 7;
+                board[72] = 2; board[73] = 3; board[74] = 4; board[75] = 5;
+                board[76] = 8; board[77] = 5; board[78] = 4; board[79] = 3; board[80] = 2;
+
+                turn = 0; undo_ok = 0; cx = 4; cy = 6; sel = 0; hand = 0;
+                pending = 0; winner = 0; check = 0; fx = 20; msg = 0; from = -2;
+                state = 1; sdirty = 1;
+                play_bgm_asset("audio/kotoshogi_bgm.kmml", 24);
+                sfx_tetris();
+                // One more title frame renders below; play begins next frame,
+                // which also consumes this Enter before any board input.
+            }
+
+            // Symmetrical title board and crest, fully immediate each frame.
+            draw_rect(0, 0, 320, 320, C_BG);
+            draw_rect(0, 0, 320, 28, C_NAVY);
+            draw_rect(0, 28, 320, 2, C_NAVY_HI);
+            draw_text_color(10, 8, "KotoShogi", 9, C_LIGHT);
+            draw_rect(65, 45, 190, 174, C_SHADOW);
+            draw_rect(70, 40, 180, 174, C_BOARD_A);
+            draw_rect(78, 48, 164, 158, C_BOARD_B);
+            i = 0;
+            while i <= 9 {
+                draw_rect(78 + i * 18, 48, 1, 158, C_LINE);
+                draw_rect(78, 48 + i * 17, 164, 1, C_LINE);
+                i = i + 1;
+            }
+            draw_rect(130, 73, 60, 105, C_SHADOW);
+            draw_rect(134, 68, 52, 104, C_HAND);
+            draw_rect(140, 63, 40, 7, C_HAND);
+            draw_text_color(151, 89, "将", 3, C_INK);
+            draw_text_color(151, 128, "棋", 3, C_INK);
+            i = 0;
+            while i < 8 {
+                px = 42 + ((i * 31 + tick * 2) % 34);
+                py = 66 + ((i * 47 + tick) % 126);
+                draw_rect(px, py, 3, 3, C_GOLD);
+                draw_rect(317 - px, py, 3, 3, C_SELECT);
+                i = i + 1;
+            }
+            draw_text_color(88, 231, "盤上に、静かな火花を。", 33, C_NAVY);
+            if (tick & 16) == 0 {
+                draw_rect(64, 267, 192, 30, C_NAVY);
+                draw_text_color(101, 277, "Enter 対局開始", 18, C_LIGHT);
+            } else {
+                draw_rect(64, 267, 192, 30, C_BOARD_A);
+                draw_text_color(101, 277, "Enter 対局開始", 18, C_INK);
+            }
+            yield_frame();
+            continue;
+        }
+
+        // ---- Victory (cold: ends in `continue`, outlined to the code tail) ----
+        if state == 2 {
+            if (intent & INTENT_IME_TOGGLE) != 0 {
+                state = 0;
+                sfx_rotate();
+            }
+            // The static layer was emptied on entry, so no board state can leak
+            // in front of the result window.
+            draw_rect(0, 0, 320, 320, C_BG);
+            draw_rect(0, 0, 320, 28, C_NAVY);
+            draw_rect(0, 28, 320, 2, C_NAVY_HI);
+            draw_text_color(10, 8, "KotoShogi", 9, C_LIGHT);
+            draw_rect(0, 30, 320, 290, C_NAVY);
+            draw_rect(18, 48, 284, 244, C_GOTE);
+            draw_rect(24, 54, 272, 232, C_NAVY);
+            // Deterministic gold-petal celebration.
+            i = 0;
+            while i < 22 {
+                px = (i * 43 + tick * (2 + i % 3)) % 320;
+                py = (i * 29 + tick * (1 + i % 2)) % 295;
+                if (i & 1) == 0 { draw_rect(px, py, 5, 8, C_GOLD); }
+                else { draw_rect(px, py, 8, 4, C_SELECT); }
+                i = i + 1;
+            }
+            draw_rect(40, 111, 240, 100, C_NAVY);
+            draw_rect(40, 111, 240, 4, C_GOLD);
+            draw_text_color(112, 129, "対局終了", 12, C_LIGHT);
+            if winner == 1 { draw_text_color(101, 156, "先手の勝ち！", 18, C_GOLD); }
+            else { draw_text_color(101, 156, "後手の勝ち！", 18, C_GOLD); }
+            draw_text_color(82, 188, "F1 でもう一局", 18, C_DIM);
+            yield_frame();
+            continue;
+        }
+
+        // ---- Play (state 1) ----
+        if (intent & INTENT_IME_TOGGLE) != 0 {
+            state = 0;
+            game2d_static_begin();
+            game2d_static_end();
+            sfx_rotate();
+            continue;   // re-dispatch: the title renders this same frame
+        }
+        if cp == 113 || cp == 81 {
+            winner = 2 - turn; state = 2; pending = 0; sel = 0; hand = 0;
+            game2d_static_begin();
+            game2d_static_end();
+            stop_bgm(); sfx_clear();
+            continue;   // re-dispatch: the victory scene renders this same frame
+        }
+
+        // Promotion choice freezes the board until Enter or Space.
+        if pending != 0 {
+            if (intent & INTENT_NEWLINE) != 0 {
+                board[to] = board[to] + 8;
+                pending = 0; turn = 1 - turn; check = -1; sel = 0; fx = 20; msg = -1;
+                capture = 0; sdirty = 1;
+                sfx_tetris();
+            } else {
+                if cp == 32 {
+                    pending = 0; turn = 1 - turn; check = -1; sel = 0; fx = 8;
+                    sdirty = 1;
+                    sfx_move();
+                }
+            }
+        } else {
+            // Restart, undo, cancel and hand selection.
+            if cp == 117 || cp == 85 {
+                if undo_ok != 0 {
+                    i = 0;
+                    while i < 81 { board[i] = undo_board[i]; i = i + 1; }
+                    i = 0;
+                    while i < 16 { hands[i] = undo_hands[i]; i = i + 1; }
+                    turn = undo_turn; check = -1; undo_ok = 0; sel = 0; hand = 0;
+                    fx = 10; msg = 28; capture = 0; sdirty = 1;
+                    sfx_rotate();
+                }
+            }
+            if cp == 120 || cp == 88 {
+                sel = 0; hand = 0; j = 0; sdirty = 1; sfx_move();
+            }
+            if cp == 104 || cp == 72 {
+                sel = 0;
+                j = 0;
+                i = hand + 1;
+                hand = 0;
+                count = 0;
+                while count < 7 {
+                    if i > 7 { i = 1; }
+                    if hands[turn * 8 + i - 1] > 0 {
+                        hand = i; count = 7;
+                    } else {
+                        i = i + 1; count = count + 1;
+                    }
+                }
+                i = 0;
+                while i < 81 { legal[i] = 0; i = i + 1; }
+                if hand != 0 { j = 1; }
+                sdirty = 1;
+                sfx_rotate();
+            }
+
+            dx = 0; dy = 0;
+            if (intent & INTENT_LEFT) != 0 { dx = -1; }
+            if (intent & INTENT_RIGHT) != 0 { dx = 1; }
+            if (intent & INTENT_UP) != 0 { dy = -1; }
+            if (intent & INTENT_DOWN) != 0 { dy = 1; }
+            if dx != 0 || dy != 0 {
+                cx = cx + dx; cy = cy + dy;
+                if cx < 0 { cx = 8; }
+                if cx > 8 { cx = 0; }
+                if cy < 0 { cy = 8; }
+                if cy > 8 { cy = 0; }
+                sfx_move();
+            }
+
+            if (intent & INTENT_NEWLINE) != 0 {
+                to = cy * 9 + cx;
+                target = board[to];
+
+                // Drop the selected hand piece.
+                if hand != 0 {
+                    bad = 0;
+                    if target != 0 { bad = 1; }
+                    if hand == 1 {
+                        i = 0;
+                        while i < 9 {
+                            v = board[i * 9 + cx];
+                            if v != 0 && v / 16 == turn && v % 16 == 1 { bad = 1; }
+                            i = i + 1;
+                        }
+                    }
+                    if turn == 0 {
+                        if (hand == 1 || hand == 2) && cy == 0 { bad = 1; }
+                        if hand == 3 && cy <= 1 { bad = 1; }
+                    } else {
+                        if (hand == 1 || hand == 2) && cy == 8 { bad = 1; }
+                        if hand == 3 && cy >= 7 { bad = 1; }
+                    }
+
+                    if bad == 0 {
+                        i = 0;
+                        while i < 81 { undo_board[i] = board[i]; i = i + 1; }
+                        i = 0;
+                        while i < 16 { undo_hands[i] = hands[i]; i = i + 1; }
+                        undo_turn = turn;
+                        board[to] = turn * 16 + hand;
+                        hands[turn * 8 + hand - 1] = hands[turn * 8 + hand - 1] - 1;
+
+                        // Reject drops that leave the moving king attacked.
+                        bad = 0; target = -1; i = 0;
+                        while i < 81 {
+                            if board[i] == turn * 16 + 8 { target = i; }
+                            i = i + 1;
+                        }
+                        i = 0;
+                        while i < 81 {
+                            v = board[i];
+                            if v != 0 && v / 16 == 1 - turn && target >= 0 {
+                                k = v % 16;
+                                dx = target % 9 - i % 9;
+                                dy = target / 9 - i / 9;
+                                mode = move_mode(k, 1 - turn, dx, dy);
+                                if mode != 0 {
+                                    count = 0;
+                                    if mode == 2 {
+                                        px = 0; py = 0;
+                                        if dx < 0 { px = -1; } else if dx > 0 { px = 1; }
+                                        if dy < 0 { py = -1; } else if dy > 0 { py = 1; }
+                                        tx = i % 9 + px; ty = i / 9 + py;
+                                        while tx != target % 9 || ty != target / 9 {
+                                            if board[ty * 9 + tx] != 0 { count = 1; }
+                                            tx = tx + px; ty = ty + py;
+                                        }
+                                    }
+                                    if count == 0 { bad = 1; }
+                                }
+                            }
+                            i = i + 1;
+                        }
+                        if bad != 0 {
+                            i = 0;
+                            while i < 81 { board[i] = undo_board[i]; i = i + 1; }
+                            i = 0;
+                            while i < 16 { hands[i] = undo_hands[i]; i = i + 1; }
+                            msg = 48; sfx_over();
+                        } else {
+                            undo_ok = 1; from = -1; hand = 0; turn = 1 - turn; check = -1;
+                            capture = 0; sdirty = 1;
+                            fx = 14; msg = 20; sfx_lock();
+                        }
+                    } else {
+                        msg = 36; sfx_over();
+                    }
+                } else {
+                    // Select one of the current player's board pieces.
+                    if sel == 0 {
+                        if target != 0 && target / 16 == turn {
+                            sel = 1; selx = cx; sely = cy;
+                            i = 0;
+                            while i < 81 { legal[i] = 0; i = i + 1; }
+                            j = 1;
+                            sfx_rotate();
+                        } else {
+                            msg = 20; sfx_over();
+                        }
+                    } else {
+                        from = sely * 9 + selx;
+                        v = board[from];
+                        if target != 0 && target / 16 == turn {
+                            selx = cx; sely = cy;
+                            i = 0;
+                            while i < 81 { legal[i] = 0; i = i + 1; }
+                            j = 1;
+                            sfx_rotate();
+                        } else {
+                            k = v % 16;
+                            dx = cx - selx; dy = cy - sely;
+                            mode = move_mode(k, turn, dx, dy);
+                            bad = 0;
+                            if mode == 0 { bad = 1; }
+                            if mode == 2 {
+                                px = 0; py = 0;
+                                if dx < 0 { px = -1; } else if dx > 0 { px = 1; }
+                                if dy < 0 { py = -1; } else if dy > 0 { py = 1; }
+                                tx = selx + px; ty = sely + py;
+                                while tx != cx || ty != cy {
+                                    if board[ty * 9 + tx] != 0 { bad = 1; }
+                                    tx = tx + px; ty = ty + py;
+                                }
+                            }
+                            if bad == 0 {
+                                i = 0;
+                                while i < 81 { undo_board[i] = board[i]; i = i + 1; }
+                                i = 0;
+                                while i < 16 { undo_hands[i] = hands[i]; i = i + 1; }
+                                undo_turn = turn;
+
+                                capture = target;
+                                board[to] = v; board[from] = 0;
+                                if capture != 0 {
+                                    k = capture % 16;
+                                    if k > 8 { k = k - 8; }
+                                    hands[turn * 8 + k - 1] = hands[turn * 8 + k - 1] + 1;
+                                }
+
+                                // Reject moves that expose the moving king.
+                                bad = 0; target = -1; i = 0;
+                                while i < 81 {
+                                    if board[i] == turn * 16 + 8 { target = i; }
+                                    i = i + 1;
+                                }
+                                i = 0;
+                                while i < 81 {
+                                    v = board[i];
+                                    if v != 0 && v / 16 == 1 - turn && target >= 0 {
+                                        k = v % 16;
+                                        dx = target % 9 - i % 9;
+                                        dy = target / 9 - i / 9;
+                                        mode = move_mode(k, 1 - turn, dx, dy);
+                                        if mode != 0 {
+                                            count = 0;
+                                            if mode == 2 {
+                                                px = 0; py = 0;
+                                                if dx < 0 { px = -1; } else if dx > 0 { px = 1; }
+                                                if dy < 0 { py = -1; } else if dy > 0 { py = 1; }
+                                                tx = i % 9 + px; ty = i / 9 + py;
+                                                while tx != target % 9 || ty != target / 9 {
+                                                    if board[ty * 9 + tx] != 0 { count = 1; }
+                                                    tx = tx + px; ty = ty + py;
+                                                }
+                                            }
+                                            if count == 0 { bad = 1; }
+                                        }
+                                    }
+                                    i = i + 1;
+                                }
+                                if bad != 0 {
+                                    i = 0;
+                                    while i < 81 { board[i] = undo_board[i]; i = i + 1; }
+                                    i = 0;
+                                    while i < 16 { hands[i] = undo_hands[i]; i = i + 1; }
+                                    capture = 0;
+                                    msg = 48; sfx_over();
+                                } else {
+                                    undo_ok = 1; sel = 0; j = 0; fx = 14; msg = 20;
+                                    sdirty = 1;
+                                    if capture % 16 == 8 {
+                                        winner = turn + 1; state = 2; fx = 0;
+                                        game2d_static_begin();
+                                        game2d_static_end();
+                                        stop_bgm(); sfx_clear();
+                                    } else {
+                                        k = board[to] % 16;
+                                        bad = 0;
+                                        if k >= 1 && k <= 4 { bad = 1; }
+                                        if k == 6 || k == 7 { bad = 1; }
+                                        if bad != 0 {
+                                            bad = 0;
+                                            if turn == 0 && (sely <= 2 || cy <= 2) { bad = 1; }
+                                            if turn == 1 && (sely >= 6 || cy >= 6) { bad = 1; }
+                                            if bad != 0 {
+                                                // Mandatory promotion at dead-end ranks.
+                                                if (turn == 0 && ((k == 1 || k == 2) && cy == 0 || k == 3 && cy <= 1)) ||
+                                                   (turn == 1 && ((k == 1 || k == 2) && cy == 8 || k == 3 && cy >= 7)) {
+                                                    board[to] = board[to] + 8;
+                                                    turn = 1 - turn; check = -1; fx = 20; msg = -1;
+                                                    capture = 0;
+                                                    sfx_tetris();
+                                                } else {
+                                                    pending = 1; sfx_rotate();
+                                                }
+                                            } else {
+                                                turn = 1 - turn; check = -1; sfx_lock();
+                                            }
+                                        } else {
+                                            turn = 1 - turn; check = -1; sfx_lock();
+                                        }
+                                    }
+                                }
+                            } else {
+                                msg = 30; sfx_over();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // A captured king ends play mid-logic; re-dispatch so the victory
+        // scene renders this same frame instead of a stale play frame.
+        if state != 1 { continue; }
+
+        // Build the ghost map over several frames. Six cells per frame
+        // keeps selection responsive and comfortably inside the VM fuel cap.
+        if j > 0 && (sel != 0 || hand != 0) {
+            i = j - 1;
+            count = i + 6;
+            if count > 81 { count = 81; }
+            while i < count {
+                bad = 0;
+                target = board[i];
+                if hand != 0 {
+                    if target != 0 { bad = 1; }
+                    if hand == 1 {
+                        ty = 0;
+                        while ty < 9 {
+                            v = board[ty * 9 + i % 9];
+                            if v != 0 && v / 16 == turn && v % 16 == 1 { bad = 1; }
+                            ty = ty + 1;
+                        }
+                    }
+                    if turn == 0 {
+                        if (hand == 1 || hand == 2) && i / 9 == 0 { bad = 1; }
+                        if hand == 3 && i / 9 <= 1 { bad = 1; }
+                    } else {
+                        if (hand == 1 || hand == 2) && i / 9 == 8 { bad = 1; }
+                        if hand == 3 && i / 9 >= 7 { bad = 1; }
+                    }
+                } else {
+                    if target != 0 && target / 16 == turn { bad = 1; }
+                    dx = i % 9 - selx; dy = i / 9 - sely;
+                    mode = move_mode(board[sely * 9 + selx] % 16, turn, dx, dy);
+                    if mode == 0 { bad = 1; }
+                    if mode == 2 {
+                        px = 0; py = 0;
+                        if dx < 0 { px = -1; } else if dx > 0 { px = 1; }
+                        if dy < 0 { py = -1; } else if dy > 0 { py = 1; }
+                        tx = selx + px; ty = sely + py;
+                        while tx != i % 9 || ty != i / 9 {
+                            if board[ty * 9 + tx] != 0 { bad = 1; }
+                            tx = tx + px; ty = ty + py;
+                        }
+                    }
+                }
+                if bad == 0 { legal[i] = 1; }
+                i = i + 1;
+            }
+            if count >= 81 { j = 0; } else { j = count + 1; }
+        }
+
+        // Recompute check only after a completed move or undo. Keeping this
+        // out of idle frames leaves headroom for the board effects.
+        if check < 0 {
+            check = 0; target = -1; i = 0;
+            while i < 81 {
+                if board[i] == turn * 16 + 8 { target = i; }
+                i = i + 1;
+            }
+            i = 0;
+            while i < 81 {
+                v = board[i];
+                if v != 0 && v / 16 == 1 - turn && target >= 0 {
+                    k = v % 16;
+                    dx = target % 9 - i % 9; dy = target / 9 - i / 9;
+                    mode = move_mode(k, 1 - turn, dx, dy);
+                    if mode != 0 {
+                        count = 0;
+                        if mode == 2 {
+                            px = 0; py = 0;
+                            if dx < 0 { px = -1; } else if dx > 0 { px = 1; }
+                            if dy < 0 { py = -1; } else if dy > 0 { py = 1; }
+                            tx = i % 9 + px; ty = i / 9 + py;
+                            while tx != target % 9 || ty != target / 9 {
+                                if board[ty * 9 + tx] != 0 { count = 1; }
+                                tx = tx + px; ty = ty + py;
+                            }
+                        }
+                        if count == 0 { check = 1; }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+
+        // ---- Retained static layer ----
+        // Rebuilt only when a completed action changed the board, the turn, or
+        // the hand selection. The full-screen page fill leads the layer so it
+        // also supplies the delta's retained base colour.
+        if sdirty != 0 {
+            sdirty = 0;
+            game2d_static_begin();
+            draw_rect(0, 0, 320, 320, C_BG);
+            draw_rect(0, 0, 320, 28, C_NAVY);
+            draw_rect(0, 28, 320, 2, C_NAVY_HI);
+            draw_text_color(10, 8, "KotoShogi", 9, C_LIGHT);
+            if turn == 0 {
+                draw_rect(239, 4, 73, 20, C_HAND);
+                draw_text_color(251, 9, "▲ 先手", 10, C_INK);
+            } else {
+                draw_rect(239, 4, 73, 20, C_GOTE);
+                draw_text_color(251, 9, "▽ 後手", 10, C_LIGHT);
+            }
+
+            // Board, piece bodies, then one grid pass. The glyphs are
+            // immediate (drawn above this layer every frame); at most 40
+            // bodies + 33 chrome commands stay inside the 80-command cap.
+            draw_rect(34, 34, 253, 253, C_BOARD_A);
+            i = 0;
+            while i < 81 {
+                v = board[i];
+                if v != 0 {
+                    px = 34 + (i % 9) * 28;
+                    py = 34 + (i / 9) * 28;
+                    if v / 16 == 0 {
+                        draw_rect(px + 4, py + 3, 20, 21, C_HAND);
+                    } else {
+                        draw_rect(px + 4, py + 4, 20, 21, C_GOTE);
+                    }
+                }
+                i = i + 1;
+            }
+            i = 0;
+            while i <= 9 {
+                draw_rect(34 + i * 28, 34, 1, 253, C_LINE);
+                draw_rect(34, 34 + i * 28, 253, 1, C_LINE);
+                i = i + 1;
+            }
+
+            // Footer chrome and the selected hand piece (glyph table below).
+            draw_rect(0, 288, 320, 32, C_NAVY);
+            draw_rect(0, 288, 320, 2, C_NAVY_HI);
+            draw_text_color(7, 299, "H持駒", 7, C_DIM);
+            draw_text_color(112, 299, "Enter決定 U戻 X取消 Q投了", 32, C_DIM);
+            if hand == 0 {
+                draw_text_color(49, 299, "なし", 6, C_LIGHT);
+            } else {
+                draw_text_color(49, 299, "歩香桂銀金角飛王と杏圭全馬龍" + (hand - 1) * 3, 3, C_GOLD);
+                num[0] = 48 + hands[turn * 8 + hand - 1] / 10;
+                num[1] = 48 + hands[turn * 8 + hand - 1] % 10;
+                draw_text_color(67, 299, num, 2, C_LIGHT);
+            }
+            game2d_static_end();
+        }
+
+        // ---- Render (immediate, play) ----
+        // Landing-square flash and the selected-piece frame sit under the
+        // glyphs but above the retained bodies.
+        if fx > 0 {
+            px = 34 + (to % 9) * 28;
+            py = 34 + (to / 9) * 28;
+            draw_rect(px + 2, py + 2, 24, 3, C_MOVE);
+            draw_rect(px + 2, py + 23, 24, 3, C_MOVE);
+        }
+        if sel != 0 {
+            px = 34 + selx * 28;
+            py = 34 + sely * 28;
+            draw_rect(px + 1, py + 1, 26, 3, C_SELECT);
+            draw_rect(px + 1, py + 24, 26, 3, C_SELECT);
+        }
+
+        // Piece glyphs. The bodies are retained; only the kanji are re-emitted,
+        // each as one packed-table draw (kinds 1..12 then 14 馬 / 15 龍), so the
+        // 81-cell loop stays small enough to live inside one code tile.
+        i = 0;
+        while i < 81 {
+            v = board[i];
+            if v != 0 {
+                px = 34 + (i % 9) * 28;
+                py = 34 + (i / 9) * 28;
+                k = v % 16; side = v / 16;
+                target = C_INK;
+                if side == 1 { target = C_LIGHT; }
+                if k > 8 { target = C_CHECK; }
+                if side == 1 && k > 8 { target = C_GOLD; }
+                k = k - 1;
+                if k > 12 { k = k - 1; }
+                draw_text_color(px + 10, py + 9, "歩香桂銀金角飛王と杏圭全馬龍" + k * 3, 3, target);
+            }
+            i = i + 1;
+        }
+
+        // Ghost markers, budgeted to 20 cells so a drop-anywhere hand piece
+        // cannot blow the per-frame command cap; capture targets get red
+        // bars above the piece instead of the old 4-rect frame.
+        if sel != 0 || hand != 0 {
+            count = 0;
+            i = 0;
+            while i < 81 {
+                if legal[i] != 0 && count < 20 {
+                    px = 34 + (i % 9) * 28;
+                    py = 34 + (i / 9) * 28;
+                    if board[i] == 0 {
+                        draw_rect(px + 9, py + 9, 10, 10, C_SELECT);
+                    } else {
+                        draw_rect(px + 2, py + 2, 24, 3, C_CHECK);
+                        draw_rect(px + 2, py + 23, 24, 3, C_CHECK);
+                    }
+                    count = count + 1;
+                }
+                i = i + 1;
+            }
+        }
+
+        // Cursor corners pulse.
+        px = 34 + cx * 28; py = 34 + cy * 28;
+        target = C_NAVY;
+        if (tick & 8) != 0 { target = C_SELECT; }
+        draw_rect(px + 1, py + 1, 8, 2, target);
+        draw_rect(px + 1, py + 1, 2, 8, target);
+        draw_rect(px + 19, py + 1, 8, 2, target);
+        draw_rect(px + 25, py + 1, 2, 8, target);
+        draw_rect(px + 1, py + 25, 8, 2, target);
+        draw_rect(px + 1, py + 19, 2, 8, target);
+        draw_rect(px + 19, py + 25, 8, 2, target);
+        draw_rect(px + 25, py + 19, 2, 8, target);
+
+        // A checked king makes the whole board breathe red.
+        if check != 0 && (tick & 4) == 0 {
+            draw_rect(31, 31, 259, 3, C_CHECK);
+            draw_rect(31, 287, 259, 3, C_CHECK);
+            draw_rect(31, 31, 3, 259, C_CHECK);
+            draw_rect(287, 31, 3, 259, C_CHECK);
+            draw_rect(204, 5, 29, 18, C_CHECK);
+            draw_text_color(207, 10, "王手", 6, C_LIGHT);
+        }
+
+        // Transient effects draw late so the budget tail-drops decoration,
+        // never the board UI. The old under-the-board "glow" is now a ring
+        // around the source square (the board no longer repaints over it).
+        if fx > 0 && from >= 0 {
+            px = 34 + (from % 9) * 28;
+            py = 34 + (from / 9) * 28;
+            draw_rect(px - 2, py - 2, 32, 2, C_MOVE);
+            draw_rect(px - 2, py + 28, 32, 2, C_MOVE);
+            draw_rect(px - 2, py, 2, 28, C_MOVE);
+            draw_rect(px + 28, py, 2, 28, C_MOVE);
+
+            // Move trail: gold/cyan sparks bridge the source and destination,
+            // then collapse into the landing-square flash.
+            i = 0;
+            while i < 7 {
+                if i * 2 < fx {
+                    px = 48 + (from % 9) * 28 + ((to % 9 - from % 9) * 28 * i) / 6;
+                    py = 48 + (from / 9) * 28 + ((to / 9 - from / 9) * 28 * i) / 6;
+                    if (i & 1) == 0 { draw_rect(px - 2, py - 2, 5, 5, C_GOLD); }
+                    else { draw_rect(px - 1, py - 1, 3, 3, C_SELECT); }
+                }
+                i = i + 1;
+            }
+        }
+
+        // Captures burst the defeated piece into red and gold shards.
+        if fx > 0 && capture > 0 {
+            count = 20 - fx;
+            px = 48 + (to % 9) * 28;
+            py = 48 + (to / 9) * 28;
+            draw_rect(px - 12, py - 12, 24, 3, C_CHECK);
+            draw_rect(px - 12, py + 9, 24, 3, C_GOLD);
+            draw_rect(px - 12, py - 12, 3, 24, C_GOLD);
+            draw_rect(px + 9, py - 12, 3, 24, C_CHECK);
+            draw_rect(px - count - 4, py - 2, 7, 4, C_CHECK);
+            draw_rect(px + count - 3, py - 2, 7, 4, C_GOLD);
+            draw_rect(px - 2, py - count - 4, 4, 7, C_GOLD);
+            draw_rect(px - 2, py + count - 3, 4, 7, C_CHECK);
+            draw_rect(px - count, py - count, 5, 5, C_GOLD);
+            draw_rect(px + count - 4, py - count, 5, 5, C_CHECK);
+            draw_rect(px - count, py + count - 4, 5, 5, C_CHECK);
+            draw_rect(px + count - 4, py + count - 4, 5, 5, C_GOLD);
+        }
+
+        // Promotion is a larger white-gold seal that contracts onto the piece.
+        if fx > 0 && msg == -1 {
+            count = fx / 2;
+            px = 34 + (to % 9) * 28;
+            py = 34 + (to / 9) * 28;
+            draw_rect(px - count, py - count, 28 + count * 2, 3, C_GOLD);
+            draw_rect(px - count, py + 25 + count, 28 + count * 2, 3, C_GOLD);
+            draw_rect(px - count, py - count, 3, 28 + count * 2, C_LIGHT);
+            draw_rect(px + 25 + count, py - count, 3, 28 + count * 2, C_LIGHT);
+            draw_rect(px + 12, 31, 4, 259, C_GOLD);
+        }
+
+        // Opening shutters sweep across the board for the first few frames.
+        if fx > 0 && from == -2 {
+            i = 0;
+            while i < 6 {
+                px = 34 + i * 50 + (20 - fx) * 3;
+                draw_rect(px, 34, 4, 253, C_GOLD);
+                i = i + 1;
+            }
+        }
+
+        // Modal feedback stays on top of every effect. Dialog frames carry
+        // few other commands, so these can never be budget tail-dropped.
+        if msg > 0 && pending == 0 {
+            if msg > 30 {
+                draw_rect(68, 143, 184, 35, C_CHECK);
+                draw_text_color(96, 155, "その手は指せません", 27, C_LIGHT);
+            }
+        }
+
+        if pending != 0 {
+            draw_rect(45, 126, 230, 67, C_NAVY);
+            draw_rect(45, 126, 230, 3, C_GOLD);
+            draw_text_color(113, 140, "成りますか？", 18, C_LIGHT);
+            if (tick & 8) == 0 {
+                draw_text_color(76, 169, "Enter 成る   Space 成らず", 30, C_GOLD);
+            } else {
+                draw_text_color(76, 169, "Enter 成る   Space 成らず", 30, C_LIGHT);
+            }
+        }
+
+        yield_frame();
+    }
+}

@@ -1,0 +1,504 @@
+// dev.koto.memo — the Koto Memo app, authored in the Koto language and compiled
+// to KBC1 (see docs/spec/KOTO_APP_LANGUAGE.md and docs/spec/KOTO_SDK.md).
+//
+// It loads memo.txt from its sandbox, runs a per-frame loop that routes typed
+// characters and edit intents into the host IME and text editor, renders a
+// PDA-style light-theme shell (title bar with save state, white document area
+// with a scrollbar, inline IME feedback, and a Japanese command bar), saves
+// on the save/exit intents, and exits cleanly. All editing and IME state lives
+// behind host calls — the VM drives every step.
+
+// RGB565 palette for the light "PicoCalc memo" theme.
+const C_NAVY = 6506;      // title + command bars (deep navy)
+const C_NAVY_HI = 10767;  // 1px accent line on the bars
+const C_WHITE = 65535;    // document background
+const C_TEXT = 2113;      // near-black body / chrome text on light surfaces
+const C_TEXTLIGHT = 61310;// light text on the navy bars
+const C_DIM = 31829;      // muted text on navy (filename, disabled action)
+const C_IMEBG = 57150;    // inline IME candidate background (pale blue)
+const C_IMEACC = 10967;   // IME preedit / candidate accent / scrollbar thumb
+const C_GREEN = 11593;    // "saved" badge
+const C_AMBER = 60679;    // "unsaved" badge
+const C_TRACK = 52891;    // scrollbar track
+const C_DOCBORDER = 48666;// document area outline
+
+// Save the document to the currently selected file. `name`/`name_len` are the
+// app-sandbox filename chosen in the open dialog (default `memo.txt`).
+fn save_document(doc: int, name: int, name_len: int) {
+    let len = edit_query_text(doc, 1024);
+    let handle = file_open(name, name_len, MODE_WRITE);
+    if handle >= 0 {
+        file_write(handle, doc, len);
+        file_close(handle);
+    }
+}
+
+fn main() {
+    edit_configure(49, 19);
+    buf doc[1024];
+    buf view[96];
+    buf line[96];
+    buf pos[4];
+    buf name[16];
+    buf asname[16];
+    let ime_enabled = 0;
+    let dirty = 0;
+    // Editor (0), file open dialog (1), save-as name prompt (2), or overwrite
+    // confirmation (3). `has_name` is false for a fresh F5 document.
+    let mode = 0;
+    let sel = 0;
+    let aslen = 0;
+    let has_name = 1;
+
+    // The active sandbox filename starts as `memo.txt`; the open dialog can swap
+    // it for any other file the app has saved. The name lives in a buffer so it
+    // can be passed to file_open / save_document by pointer.
+    name[0] = 109;
+    name[1] = 101;
+    name[2] = 109;
+    name[3] = 111;
+    name[4] = 46;
+    name[5] = 116;
+    name[6] = 120;
+    name[7] = 116;
+    let name_len = 8;
+
+    // Load the active file if present; a missing file just starts empty.
+    let r = file_open(name, name_len, MODE_READ);
+    if r >= 0 {
+        // Leave editing headroom even when the file fills the load window.
+        let n = file_read(r, doc, 960);
+        file_close(r);
+        if n >= 0 {
+            edit_load(doc, n);
+        }
+    }
+
+    let ch = edit_cell_height();
+
+    loop {
+        let intent = text_intent();
+
+        // F4 opens the file dialog. F5 immediately starts an unnamed empty memo.
+        // F2 asks before overwriting a named file, or asks for a name when new.
+        if mode == 0 {
+            if (intent & INTENT_OPEN) != 0 {
+                mode = 1;
+                sel = 0;
+            }
+            if (intent & INTENT_SAVE) != 0 {
+                if has_name != 0 {
+                    mode = 3;
+                } else {
+                    mode = 2;
+                    aslen = 0;
+                }
+            }
+            if (intent & INTENT_NEW) != 0 {
+                edit_load(doc, 0);
+                name_len = 0;
+                has_name = 0;
+                dirty = 1;
+                aslen = 0;
+            }
+        }
+
+        if mode == 1 {
+            let count = dir_count(view, 96, 0);
+            if (intent & INTENT_UP) != 0 {
+                if sel > 0 {
+                    sel = sel - 1;
+                }
+            }
+            if (intent & INTENT_DOWN) != 0 {
+                if sel + 1 < count {
+                    sel = sel + 1;
+                }
+            }
+            if (intent & INTENT_CANCEL) != 0 {
+                mode = 0;
+            }
+            // RShift (commit) or Enter (newline) confirms the highlighted file.
+            if (intent & (INTENT_COMMIT | INTENT_NEWLINE)) != 0 {
+                if count > 0 {
+                    let nl = dir_name(name, 16, sel);
+                    if nl > 0 {
+                        name_len = nl;
+                        has_name = 1;
+                        let h = file_open(name, name_len, MODE_READ);
+                        if h >= 0 {
+                            // The editor holds 1024 bytes; reserve 64 bytes for
+                            // continued typing after opening a long document.
+                            let dn = file_read(h, doc, 960);
+                            file_close(h);
+                            if dn >= 0 {
+                                edit_load(doc, dn);
+                            }
+                        }
+                        dirty = 0;
+                    }
+                }
+                mode = 0;
+            }
+
+            // ---- Render the full-screen file picker. ----
+            draw_rect(0, 0, 320, 320, C_WHITE);
+            draw_rect(0, 0, 320, 24, C_NAVY);
+            draw_rect(0, 24, 320, 2, C_NAVY_HI);
+            draw_text_color(10, 6, "ファイルを開く", 21, C_TEXTLIGHT);
+
+            if count == 0 {
+                draw_text_color(12, 44, "(ファイルなし)", 20, C_DIM);
+            }
+            let i = 0;
+            while i < count {
+                let nl = dir_name(view, 96, i);
+                if i == sel {
+                    draw_rect(4, 33 + i * 18, 312, 17, C_IMEBG);
+                    draw_text_color(10, 36 + i * 18, ">", 1, C_IMEACC);
+                }
+                draw_text_color(28, 36 + i * 18, view, nl, C_TEXT);
+                i = i + 1;
+            }
+
+            draw_rect(0, 274, 320, 46, C_NAVY);
+            draw_rect(0, 274, 320, 2, C_NAVY_HI);
+            draw_text_color(10, 286, "↑↓ 選択  Enter 開く  Ctrl 戻る", 40, C_TEXTLIGHT);
+
+            yield_frame();
+            continue;
+        }
+
+        if mode == 2 {
+            // Filename entry for Save As. Raw ASCII codepoints (letters, digits,
+            // and `. - _`) build the name, bypassing the IME.
+            let cp = text_input();
+            if (cp >= 97 && cp < 123) || (cp >= 48 && cp < 58) || cp == 46 || cp == 45 || cp == 95 {
+                if aslen < 15 {
+                    asname[aslen] = cp;
+                    aslen = aslen + 1;
+                }
+            }
+            if (intent & INTENT_BACKSPACE) != 0 {
+                if aslen > 0 {
+                    aslen = aslen - 1;
+                }
+            }
+            if (intent & INTENT_CANCEL) != 0 {
+                mode = 0;
+            }
+            if (intent & (INTENT_COMMIT | INTENT_NEWLINE)) != 0 {
+                if aslen > 0 {
+                    let k = 0;
+                    while k < aslen {
+                        name[k] = asname[k];
+                        k = k + 1;
+                    }
+                    name_len = aslen;
+                    has_name = 1;
+                    save_document(doc, name, name_len);
+                    dirty = 0;
+                    mode = 0;
+                }
+            }
+
+            // ---- Render the Save As prompt. ----
+            draw_rect(0, 0, 320, 320, C_WHITE);
+            draw_rect(0, 0, 320, 24, C_NAVY);
+            draw_rect(0, 24, 320, 2, C_NAVY_HI);
+            draw_text_color(10, 6, "名前を付けて保存", 24, C_TEXTLIGHT);
+
+            draw_text_color(20, 60, "現在のファイル:", 22, C_TEXT);
+            if has_name != 0 {
+                draw_text_color(40, 82, name, name_len, C_DIM);
+            } else {
+                draw_text_color(40, 82, "(新規)", 8, C_DIM);
+            }
+
+            draw_text_color(20, 120, "新しい名前:", 16, C_TEXT);
+            draw_rect(38, 140, 244, 20, C_IMEBG);
+            draw_rect(38, 140, 244, 2, C_IMEACC);
+            draw_text_color(42, 144, asname, aslen, C_TEXT);
+            draw_rect(42 + aslen * edit_cell_width(), 142, 2, 16, C_TEXT);
+
+            draw_text_color(20, 178, "ファイル名を入力してください", 36, C_DIM);
+
+            draw_rect(0, 274, 320, 46, C_NAVY);
+            draw_rect(0, 274, 320, 2, C_NAVY_HI);
+            draw_text_color(10, 286, "Enter 保存  Ctrl 取消", 25, C_TEXTLIGHT);
+
+            yield_frame();
+            continue;
+        }
+
+        if mode == 3 {
+            let cp = text_input();
+            if cp == 121 || cp == 89 {
+                save_document(doc, name, name_len);
+                dirty = 0;
+                mode = 0;
+            }
+            if cp == 110 || cp == 78 {
+                mode = 2;
+                aslen = 0;
+            }
+            if (intent & INTENT_CANCEL) != 0 {
+                mode = 0;
+            }
+        }
+
+        if (intent & INTENT_EXIT) != 0 {
+            if has_name != 0 {
+                save_document(doc, name, name_len);
+            }
+            exit(0);
+        }
+        if mode == 0 && (intent & INTENT_IME_TOGGLE) != 0 {
+            ime_feed_key(IME_TOGGLE, 0);
+            if ime_enabled == 0 {
+                ime_enabled = 1;
+            } else {
+                ime_enabled = 0;
+            }
+        }
+
+        // Sticky Shift must arm before the character it applies to, so handle it
+        // ahead of the typed codepoint (the window delivers Shift+letter together).
+        if mode == 0 && (intent & INTENT_SHIFT) != 0 {
+            ime_feed_key(IME_SHIFT, 0);
+        }
+        if mode == 0 && text_input() != 0 {
+            ime_feed_key(IME_CHARACTER, text_input());
+            dirty = 1;
+        }
+        if mode == 0 && (intent & INTENT_CONVERT) != 0 {
+            ime_convert();
+        }
+        if mode == 0 && (intent & INTENT_COMMIT) != 0 {
+            ime_feed_key(IME_COMMIT, 0);
+            dirty = 1;
+        }
+        if mode == 0 && (intent & INTENT_CANCEL) != 0 {
+            ime_feed_key(IME_CANCEL, 0);
+        }
+        if mode == 0 && (intent & INTENT_NEWLINE) != 0 {
+            ime_feed_key(IME_CHARACTER, 10);
+            dirty = 1;
+        }
+
+        // Editing: cursor movement and deletion.
+        if mode == 0 && (intent & INTENT_LEFT) != 0 {
+            edit_move(DIR_LEFT);
+        }
+        if mode == 0 && (intent & INTENT_RIGHT) != 0 {
+            edit_move(DIR_RIGHT);
+        }
+        if mode == 0 && (intent & INTENT_UP) != 0 {
+            edit_move(DIR_UP);
+        }
+        if mode == 0 && (intent & INTENT_DOWN) != 0 {
+            edit_move(DIR_DOWN);
+        }
+        if mode == 0 && (intent & INTENT_HOME) != 0 {
+            edit_move(DIR_HOME);
+        }
+        if mode == 0 && (intent & INTENT_END) != 0 {
+            edit_move(DIR_END);
+        }
+        if mode == 0 && (intent & INTENT_BACKSPACE) != 0 {
+            // While a composition is active, Backspace edits it: delete the last
+            // reading/pending character, ending the conversion when none remain,
+            // instead of editing the document.
+            ime_query_line(line, 96);
+            if line[0] != 0 {
+                ime_feed_key(IME_BACKSPACE, 0);
+            } else {
+                edit_delete(DELETE_BACKSPACE);
+                dirty = 1;
+            }
+        }
+        if mode == 0 && (intent & INTENT_DELETE) != 0 {
+            edit_delete(DELETE_FORWARD);
+            dirty = 1;
+        }
+
+        // ---- Render the PDA-style memo shell. ----
+
+        // IME feedback is inline, so all 19 document rows remain editable.
+        edit_reserve_rows(0);
+
+        // Document background (white) and a thin outline.
+        draw_rect(0, 0, 320, 320, C_WHITE);
+        draw_rect(2, 24, 316, 250, C_WHITE);
+        draw_rect(2, 24, 316, 1, C_DOCBORDER);
+
+        // Title bar: notebook icon, app name, filename, save badge.
+        draw_rect(0, 0, 320, 24, C_NAVY);
+        draw_rect(0, 24, 320, 2, C_NAVY_HI);
+        draw_rect(8, 6, 13, 13, C_TEXTLIGHT);
+        draw_rect(8, 6, 13, 3, C_NAVY_HI);
+        draw_rect(11, 11, 7, 1, C_NAVY);
+        draw_rect(11, 14, 7, 1, C_NAVY);
+        draw_rect(11, 17, 7, 1, C_NAVY);
+        draw_text_color(28, 6, "メモ帳", 9, C_TEXTLIGHT);
+        if has_name != 0 {
+            draw_text_color(74, 9, name, name_len, C_DIM);
+        } else {
+            draw_text_color(74, 9, "(新規)", 8, C_DIM);
+        }
+        if dirty == 0 {
+            draw_text_color(248, 6, "●", 3, C_GREEN);
+            draw_text_color(264, 6, "保存済", 9, C_GREEN);
+        } else {
+            draw_text_color(248, 6, "●", 3, C_AMBER);
+            draw_text_color(264, 6, "未保存", 9, C_AMBER);
+        }
+
+        // Query IME state before painting rows. When active, the cursor row is
+        // split into prefix / temporary composition / suffix so the composition
+        // behaves like inserted text without mutating the document.
+        ime_query_line(line, 96);
+
+        // Visible document rows in near-black on the white page.
+        let row = 0;
+        while row < 19 {
+            let vlen = edit_visible_line(view, 96, row);
+            if row == edit_cursor_row() && line[0] != 0 {
+                let split = 0;
+                let cells = 0;
+                while split < vlen && cells < edit_cursor_col() {
+                    if view[split] < 128 {
+                        split = split + 1;
+                        cells = cells + 1;
+                    } else {
+                        split = split + 3;
+                        cells = cells + 2;
+                    }
+                }
+
+                let plen = line[2];
+                let rlen = line[3 + plen];
+                let clen = line[4 + plen + rlen];
+                let ix = 8 + edit_cursor_col() * edit_cell_width();
+                let iy = 26 + row * ch;
+                let iw = 0;
+
+                draw_text_color(8, iy, view, split, C_TEXT);
+                if clen > 0 {
+                    iw = clen * 4;
+                    draw_rect(ix, iy, iw, ch, C_IMEBG);
+                    draw_text_color(ix, iy, line + 5 + plen + rlen, clen, C_TEXT);
+                    draw_rect(ix, iy + ch - 2, iw, 2, C_IMEACC);
+                } else {
+                    if rlen > 0 {
+                        iw = rlen * 4;
+                        draw_text_color(ix, iy, line + 4 + plen, rlen, C_IMEACC);
+                        draw_rect(ix, iy + ch - 2, iw, 2, C_IMEACC);
+                    } else {
+                        iw = plen * edit_cell_width();
+                        draw_text_color(ix, iy, line + 3, plen, C_IMEACC);
+                        draw_rect(ix, iy + ch - 2, iw, 2, C_IMEACC);
+                    }
+                }
+                draw_text_color(ix + iw, iy, view + split, vlen - split, C_TEXT);
+            } else {
+                draw_text_color(8, 26 + row * ch, view, vlen, C_TEXT);
+            }
+            row = row + 1;
+        }
+
+        // Text caret. During composition it follows the temporary inserted text;
+        // clamp at the document edge when the preedit is intentionally clipped.
+        if edit_cursor_row() >= 0 {
+            let cx = 8 + edit_cursor_col() * edit_cell_width();
+            if line[0] != 0 {
+                let plen = line[2];
+                let rlen = line[3 + plen];
+                let clen = line[4 + plen + rlen];
+                if clen > 0 {
+                    cx = cx + clen * 4;
+                } else {
+                    if rlen > 0 {
+                        cx = cx + rlen * 4;
+                    } else {
+                        cx = cx + plen * edit_cell_width();
+                    }
+                }
+            }
+            if cx > 304 {
+                cx = 304;
+            }
+            draw_rect(cx, 26 + edit_cursor_row() * ch, 2, ch, C_TEXT);
+        }
+
+        // Scrollbar with up/down arrows and a proportional thumb.
+        if edit_total_lines() > 19 {
+            draw_rect(306, 26, 10, 244, C_TRACK);
+            draw_text_color(305, 24, "▲", 3, C_IMEACC);
+            draw_text_color(305, 256, "▼", 3, C_IMEACC);
+            draw_rect(
+                306,
+                42 + (edit_scroll_row() * 180) / (edit_total_lines() - 19),
+                10,
+                26,
+                C_IMEACC
+            );
+        }
+
+        // Horizontal scrollbar, shown only when wrapping is off and the cursor's
+        // line is wider than the viewport.
+        if edit_wrap() == 0 {
+            if edit_line_cols() > 49 {
+                draw_rect(6, 271, 300, 3, C_TRACK);
+                draw_rect(
+                    6 + (edit_hscroll() * 300) / edit_line_cols(),
+                    271,
+                    (49 * 300) / edit_line_cols(),
+                    3,
+                    C_IMEACC
+                );
+            }
+        }
+
+        // Command bar: actions for the current state plus the cursor position.
+        draw_rect(0, 274, 320, 46, C_NAVY);
+        draw_rect(0, 274, 320, 2, C_NAVY_HI);
+        ime_query_line(line, 96);
+        if mode == 3 {
+            draw_text_color(10, 286, "上書き保存しますか? (y/n)", 34, C_TEXTLIGHT);
+        } else {
+            if line[0] >= 2 {
+            draw_text_color(10, 286, "Tab 変換  RShift 確定  Ctrl 取消", 38, C_TEXTLIGHT);
+            } else {
+                draw_text_color(10, 286, "F1入力 F2保存 F3折返 F4開く F5新規", 44, C_TEXTLIGHT);
+            }
+        }
+
+        // IME on/off indicator and the cursor position.
+        if ime_enabled != 0 {
+            draw_text_color(10, 303, "IME: あ", 8, C_TEXTLIGHT);
+        } else {
+            draw_text_color(10, 303, "IME: Aa", 7, C_DIM);
+        }
+        // Candidate position is status-only; the candidate itself stays inline.
+        if line[0] == 3 {
+            let plen = line[2];
+            let rlen = line[3 + plen];
+            let clen = line[4 + plen + rlen];
+            pos[0] = 49 + line[5 + plen + rlen + clen];
+            pos[1] = 47;
+            pos[2] = 48 + line[6 + plen + rlen + clen];
+            draw_text_color(72, 303, "候補", 6, C_TEXTLIGHT);
+            draw_text_color(102, 303, pos, 3, C_TEXTLIGHT);
+        }
+        // Wrap mode indicator (F3 toggles wrap / horizontal scroll).
+        if edit_wrap() != 0 {
+            draw_text_color(132, 303, "折返ON", 8, C_DIM);
+        } else {
+            draw_text_color(132, 303, "折返OFF", 9, C_DIM);
+        }
+        draw_text_color(218, 303, view, edit_cursor_status(view, 96), C_DIM);
+
+        yield_frame();
+    }
+}

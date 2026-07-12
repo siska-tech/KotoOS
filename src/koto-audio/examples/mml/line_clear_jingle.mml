@@ -1,0 +1,14 @@
+; KotoAudio M13-005 short line-clear jingle.
+; Two melodic tracks plus a tiny drum accent.
+
+#TRACK melody
+T150 L8 O5 @3 V116
+c e g > c < g e c# d.
+
+#TRACK harmony
+T150 L8 O4 @1 V84
+e g > c < g e c r4.
+
+#TRACK drums
+T150 L16 V110
+!bd r !hh r !sd r !oh r8

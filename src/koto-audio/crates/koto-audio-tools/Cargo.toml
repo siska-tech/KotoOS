@@ -1,0 +1,32 @@
+[package]
+name = "koto-audio-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side asset conversion tools for KotoAudio"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+koto-audio = { path = "../koto-audio" }
+
+[features]
+experimental-sldpcm4 = ["koto-audio/experimental-sldpcm4"]
+
+[[bin]]
+name = "koto-audio-convert"
+path = "src/bin/koto-audio-convert.rs"
+
+[[bin]]
+name = "koto-audio-decode"
+path = "src/bin/koto-audio-decode.rs"
+
+[[bin]]
+name = "koto-audio-drum-table"
+path = "src/bin/koto-audio-drum-table.rs"
+
+[[bin]]
+name = "koto-audio-mml-table"
+path = "src/bin/koto-audio-mml-table.rs"
+
+[[bin]]
+name = "koto-audio-mml-render"
+path = "src/bin/koto-audio-mml-render.rs"

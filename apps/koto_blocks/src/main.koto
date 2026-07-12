@@ -1,0 +1,915 @@
+// dev.koto.games.koto-blocks — "KotoBlocks", a Tetris-style block puzzle authored
+// in the Koto language and compiled to KBC1 (see docs/spec/KOTO_APP_LANGUAGE.md and
+// docs/spec/KOTO_SDK.md). It is the first game and the first sprite/tile-graphics sample:
+// the 7 tetromino colours are baked once into 16x16 RGB565 tiles in the app heap and
+// blitted with `draw_pixels` (the PicoMings tile/sprite model — see
+// docs/spec/PICOMINGS_SPRITE_MODEL.md). The board is a tile grid; the falling piece is a
+// "sprite" composed over it (empty cells are simply not blitted = transparency).
+//
+// All mutable state lives in `main` locals and three heap buffers, because Koto
+// buffers are function-scoped (the heap is reachable by `buf` name only): pure
+// helpers compute piece shapes/colours and issue blits (which take an integer
+// pointer), while every board/tile read & write stays in `main`. The tile cache is
+// the first buffer, so its heap offset is 0 and tile `t` is at `t*512`.
+//
+// Controls: Left/Right move, Up rotate, Down soft-drop, Space hard-drop, H hold,
+// F1 start/retry, F2 pause, F10 quit.
+//
+// Audio synthesis is host-owned (KOTO-0095): effects use `play_sfx`, while the
+// package-local KotoMML theme is started with `play_bgm_asset`. No PCM lives in the
+// VM heap and changing the score only rebuilds this app's assets.
+
+// --- RGB565 palette ---
+// Light "PicoCalc PDA" theme to match the reference shell: a cream page, a dark
+// navy playfield well, navy framed panels, and dark ink labels.
+const C_PAGE = 61275;  // cream page / panel background
+const C_WELL = 6406;   // dark navy playfield well
+const C_GRID = 10565;  // faint grid line inside the well
+const C_NAVY = 6506;   // panel frames and the title bar
+const C_NAVYHI = 10767;// 1px accent line on the title bar
+const C_LIGHT = 61310; // light text on navy
+const C_INK = 2113;    // near-black text on cream
+const C_DIM = 31829;   // muted text on cream
+const C_PANEL = 65535; // white box fill (NEXT/HOLD/stat boxes)
+const C_GREEN = 11593; // "実行中" running badge
+const C_AMBER = 60679; // "一時停止" paused badge
+const C_RED = 51460;   // strong red for the "ゲームオーバー" panel (high contrast on white)
+const C_GHOST = 21130; // ghost-piece outline (dim cyan)
+const C_DEAD = 25390;  // muted slate: locked cells, drawn flat under the game-over panel
+const C_SWEEP = 2113;  // near-black: the game-over board-sweep overlay descending the well
+const C_EDGEMASK = 31727; // 0x7BEF channel mask: halves a colour to its tile edge
+
+// Retained Game2D sprite layer (KOTO-0140): the active piece, ghost, the three
+// NEXT previews, and the HOLD piece are placed *sprites* (instances of a stamp)
+// instead of per-frame `blit_piece` calls. Stamp `i` reuses const CELLS entry `i`
+// (piece i/4, rotation i%4); a sprite supplies the tile drawn in every cell.
+const SP_GHOST = 0;   // drawn first (beneath the active piece)
+const SP_ACTIVE = 1;
+const SP_NEXT0 = 2;
+const SP_NEXT1 = 3;
+const SP_NEXT2 = 4;
+const SP_HOLD = 5;
+// Retained Game2D text layer (KOTO-0141): the per-frame status values render as
+// id-keyed retained text instead of immediate `draw_text`, so an unchanged value
+// costs nothing and the immediate list stays empty in normal play (no command-count
+// shift, KOTO-0143). Static labels (SCORE/LEVEL/LINES/NEXT/HOLD) stay in the static
+// layer; only the changing values are text items here.
+const T_BADGE = 0;   // run-state badge ("実行中" / "一時停止")
+const T_SCORE = 1;
+const T_LEVEL = 2;
+const T_LINES = 3;
+const T_HOLD = 4;    // "Hで交換" hint shown until HOLD is first used
+// Tile 7 (offset 7*512): a 1px C_GHOST border over a C_WELL interior, baked once
+// on the title->play transition so the ghost sprite is pixel-identical to the old
+// per-cell ghost outline (the well shows through a cell's interior either way).
+const GHOST_TILE = 3584;
+
+// The 28-entry u16 shape table (KOTO-0137), now a const heap image (KOTO-0139): the
+// runtime copies it straight into the heap at load, so there is no startup
+// `heap_set_u16` bake to run as VM code (which produced the frame=1 stall and the
+// startup tile 0<->1 code-window ping-pong). `shape()` reads it by name. Each entry is
+// the 4x4 occupancy mask for k = piece * 4 + rotation (bit = row*4 + col); the values
+// match the former `if`-chain exactly, so rendering is unchanged.
+data shapes = u16[
+    240, 17476, 3840, 8738,
+    102, 102, 102, 102,
+    114, 610, 624, 562,
+    54, 1122, 54, 1122,
+    99, 612, 99, 612,
+    113, 550, 1136, 802,
+    116, 1570, 368, 547
+];
+
+// The 28-entry u16 cell table (KOTO-0138), likewise a const heap image (KOTO-0139).
+// Each u16 packs the four occupied cell indices (row*4 + col, 0..15) of the matching
+// `shapes` mask as four nibbles, so `blit_piece` draws four cells with no mask scan.
+// Derived from the masks above, so rendering is byte-identical.
+data cells = u16[
+    30292, 60002, 47768, 55633,
+    25889, 25889, 25889, 25889,
+    25921, 38481, 38484, 38209,
+    21537, 42577, 21537, 42577,
+    25872, 38482, 25872, 38482,
+    25920, 38177, 42580, 38993,
+    25922, 43345, 34388, 38160
+];
+
+// Mid (face) RGB565 colour for each tetromino: 0=I 1=O 2=T 3=S 4=Z 5=J 6=L.
+fn pmid(t: int) -> int {
+    if t == 0 { return 1917; }   // I cyan
+    if t == 1 { return 61088; }  // O yellow
+    if t == 2 { return 45721; }  // T purple
+    if t == 3 { return 22058; }  // S green
+    if t == 4 { return 57832; }  // Z red
+    if t == 5 { return 17148; }  // J blue
+    return 60388;                // L orange
+}
+
+// 4x4 occupancy mask for shape index `k = piece * 4 + rotation` (bit = row*4 + col).
+// Callers pass the combined index so this stays a single-parameter table lookup
+// with no local of its own (local-slot budget, KOTO-0102).
+fn shape(k: int) -> int {
+    return heap_get_u16(shapes + k * 2);
+}
+
+// Blit piece `t` rotation `r` as 16x16 tiles, top-left cell at pixel (ox, oy). Tile
+// `t` lives at heap offset `t*512` (the tile cache is `main`'s first buffer). Cells
+// off the top of the surface clip away, so no transparency mask is needed.
+//
+// Every tetromino is exactly four cells, so this reads the four packed 4-bit cell
+// indices from the CELLS table and draws them straight-line — no `while`-loop scan of
+// the 16-bit occupancy mask (KOTO-0138). The loopless body is what keeps the inlined
+// HOLD/NEXT/active blits from re-crossing a PSRAM code-window tile boundary every
+// iteration; `c` is the packed entry and `p` the current cell index (one reused local).
+fn blit_piece(t: int, r: int, ox: int, oy: int) {
+    let c = heap_get_u16(cells + (t * 4 + r) * 2);
+    let p = c & 15;
+    draw_pixels(ox + (p & 3) * 16, oy + (p >> 2) * 16, 16, 16, t * 512, 512);
+    p = (c >> 4) & 15;
+    draw_pixels(ox + (p & 3) * 16, oy + (p >> 2) * 16, 16, 16, t * 512, 512);
+    p = (c >> 8) & 15;
+    draw_pixels(ox + (p & 3) * 16, oy + (p >> 2) * 16, 16, 16, t * 512, 512);
+    p = (c >> 12) & 15;
+    draw_pixels(ox + (p & 3) * 16, oy + (p >> 2) * 16, 16, 16, t * 512, 512);
+}
+
+fn sfx_move() { play_sfx_asset("audio/koto_blocks_move.kmml", 27); }
+fn sfx_rotate() { play_sfx_asset("audio/koto_blocks_rotate.kmml", 29); }
+fn sfx_lock() { play_sfx_asset("audio/koto_blocks_lock.kmml", 27); }
+fn sfx_clear() { play_sfx_asset("audio/koto_blocks_clear.kmml", 28); }
+fn sfx_over() { play_sfx_asset("audio/koto_blocks_over.kmml", 27); }
+fn sfx_tetris() { play_sfx_asset("audio/koto_blocks_tetris.kmml", 29); }
+
+fn main() {
+    buf tiles[4096]; // 7 tetromino tiles + 1 ghost outline tile, 16x16 RGB565 (8 * 16 * 16 * 2)
+    buf board[200];  // 10 x 20 grid; 0 empty, else colour index + 1
+    buf shown[200];  // last colour rendered into the Game2D tilemap, per cell, so
+                     // the per-frame walk `set_tile`s only what changed (KOTO-0135)
+    buf num[6];      // scratch for decimal score/level/lines
+    // The `shapes` and `cells` tables are now top-level `data` (const heap image,
+    // KOTO-0139): loaded once by the runtime, no startup bake here.
+
+    // Persistent game state.
+    let state = 0;   // 0 title, 1 play, 2 pause, 3 game over
+    let gen = 0;     // tiles baked so far (one per title frame, fuel-friendly)
+    let rng = 12345;
+    let px = 3;
+    let py = 0;
+    let rot = 0;
+    let ptype = 0;
+    let nx1 = 0;
+    let nx2 = 0;
+    let nx3 = 0;
+    let hold = 0;
+    let hashold = 0; // 1 once a piece is held
+    let huse = 0;    // 1 if hold already used for the current piece
+    let score = 0;
+    let lines = 0;
+    let level = 1;
+    let gtick = 0;
+    let dospawn = 0; // pull the next piece at the top of the next play frame
+    let flash = 0;   // >0: a line-clear flash is animating (cells marked 8); during
+                     // game over, reused as the 0..20 board-sweep frame counter
+    let dropy = 0;   // start row of a hard drop this frame (for the drop trail), -1 if none
+    let lvlup = 0;   // >0: "LEVEL UP!" banner frames remaining
+    let vy = 0;      // active piece's visual pixel-y, eased toward py*16 (smooth fall)
+    let fxhi = 0;    // >0: highlight the active piece (move/rotate/lock action flash)
+    let pop = 0;     // points awarded by the in-progress line clear (score popup)
+
+    // Reused scratch (declared once; the 45-slot local file is shared globally, so
+    // several names double as transient temporaries at non-overlapping times: `tx`
+    // also formats decimals / indexes tile bytes, `tr` also scans rows, `dx` also
+    // counts cleared lines).
+    let intent = 0;
+    let dx = 0;
+    let i = 0;
+    let bad = 0;
+    let m = 0;
+    let cx = 0;
+    let cy = 0;
+    let tx = 0;
+    let ty = 0;
+    let tr = 0;
+    let col = 0;
+    let full = 0;
+    let steps = 0;
+
+    // Seed the next-piece queue.
+    rng = rng * 75 + 74; rng = rng % 65537; nx1 = rng % 7;
+    rng = rng * 75 + 74; rng = rng % 65537; nx2 = rng % 7;
+    rng = rng * 75 + 74; rng = rng % 65537; nx3 = rng % 7;
+
+    loop {
+        intent = text_intent();
+
+        // ---- Title screen: bake one tile per frame, then wait for start. ----
+        if state == 0 {
+            // Bake the tile cache a few rows at a time: a full 16x16 fill is more
+            // than one frame's fuel budget, so the title screen spreads the seven
+            // tiles across several frames (8 rows/frame -> 14 frames). `steps` is the
+            // row cursor (idle until gameplay); `ty` is the row this frame stops at.
+            // The face colour is `m`; a 1px edge in the half-bright `tr` gives the
+            // bevelled block look. `tx` walks the byte cursor so the inner loop has
+            // no per-pixel multiply.
+            if gen < 7 {
+                m = pmid(gen);
+                tr = (m >> 1) & C_EDGEMASK;
+                // Hoist the face/edge bytes (col/dx = face lo/hi, bad/full = edge
+                // lo/hi) so the inner loop is two byte stores with no arithmetic.
+                col = m & 255;
+                dx = (m >> 8) & 255;
+                bad = tr & 255;
+                full = (tr >> 8) & 255;
+                ty = steps + 4;
+                if ty > 16 { ty = 16; }
+                cy = steps;
+                while cy < ty {
+                    cx = 0;
+                    tx = gen * 512 + cy * 32;
+                    while cx < 16 {
+                        if cx == 0 || cy == 0 || cx == 15 || cy == 15 {
+                            tiles[tx] = bad;
+                            tiles[tx + 1] = full;
+                        } else {
+                            tiles[tx] = col;
+                            tiles[tx + 1] = dx;
+                        }
+                        tx = tx + 2;
+                        cx = cx + 1;
+                    }
+                    cy = cy + 1;
+                }
+                steps = ty;
+                if steps >= 16 { steps = 0; gen = gen + 1; }
+            }
+
+            // Title screen: cream page with a navy title bar.
+            draw_rect(0, 0, 320, 320, C_PAGE);
+            draw_rect(0, 0, 320, 30, C_NAVY);
+            draw_rect(0, 30, 320, 2, C_NAVYHI);
+            draw_text_color(12, 9, "ブロック", 12, C_LIGHT);
+            if gen < 7 {
+                // Still baking the tile cache: show the palette filling up.
+                i = 0;
+                while i < gen {
+                    draw_pixels(70 + i * 26, 110, 16, 16, i * 512, 512);
+                    i = i + 1;
+                }
+                draw_text_color(150, 160, "...", 3, C_DIM);
+            } else {
+                // Showcase band: the seven tetrominoes on a dark playfield-style well.
+                draw_rect(16, 60, 288, 110, C_WELL);
+                draw_rect(16, 60, 288, 2, C_NAVY);
+                blit_piece(0, 0, 28, 74);
+                blit_piece(1, 0, 104, 74);
+                blit_piece(2, 0, 168, 74);
+                blit_piece(3, 0, 240, 74);
+                blit_piece(4, 0, 60, 126);
+                blit_piece(5, 0, 140, 126);
+                blit_piece(6, 0, 216, 126);
+                // Pulsing start button (reuse the now-idle bake cursor as a timer).
+                steps = steps + 1;
+                draw_rect(96, 198, 128, 32, C_NAVY);
+                draw_rect(96, 198, 128, 2, C_NAVYHI);
+                if (steps & 32) != 0 {
+                    draw_text_color(120, 206, "F1 スタート", 15, C_AMBER);
+                } else {
+                    draw_text_color(120, 206, "F1 スタート", 15, C_LIGHT);
+                }
+                // Controls hint.
+                draw_text_color(90, 262, "←→移動 ↑回転 H交換", 30, C_INK);
+                draw_text_color(82, 284, "↓ 落下  Space 一気落下", 31, C_INK);
+                if (intent & INTENT_IME_TOGGLE) != 0 { state = 1; dospawn = 1; play_bgm_asset("audio/koto_blocks_bgm.kmml", 26); }
+                if (intent & INTENT_NEWLINE) != 0 { state = 1; dospawn = 1; play_bgm_asset("audio/koto_blocks_bgm.kmml", 26); }
+            }
+            // On the title->play transition, build the retained Game2D static UI
+            // layer once (KOTO-0136). The page, the well frame/fill, the cell grid,
+            // the right-side panel frames, and every fixed label are identical on
+            // every gameplay frame (states 1/2/3) and survive game-over -> retry, so
+            // capturing them into the host's static layer means they cost no host
+            // call and no immediate draw command per frame -- only the board,
+            // piece, ghost, dynamic values, badge, and overlays stay immediate. The
+            // presenter composites this layer beneath the board tilemap and the
+            // immediate list, so z-order is unchanged. Built here (not in the render
+            // block) so it happens exactly once, using `cx`/`cy` as the grid loop
+            // cursors with no extra local.
+            if state == 1 {
+                game2d_static_begin();
+                draw_rect(0, 0, 320, 320, C_PAGE);
+                draw_rect(6, 0, 164, 320, C_NAVY);
+                draw_rect(8, 0, 160, 320, C_WELL);
+                cx = 0;
+                while cx <= 10 { draw_rect(8 + cx * 16, 0, 1, 320, C_GRID); cx = cx + 1; }
+                cy = 0;
+                while cy <= 20 { draw_rect(8, cy * 16, 160, 1, C_GRID); cy = cy + 1; }
+                draw_rect(176, 0, 144, 22, C_NAVY);
+                draw_rect(176, 22, 144, 2, C_NAVYHI);
+                draw_text_color(182, 5, "ブロック", 12, C_LIGHT);
+                draw_rect(180, 30, 136, 120, C_PANEL);
+                draw_rect(180, 30, 136, 1, C_NAVY);
+                draw_rect(180, 149, 136, 1, C_NAVY);
+                draw_rect(180, 30, 1, 120, C_NAVY);
+                draw_rect(315, 30, 1, 120, C_NAVY);
+                draw_text_color(186, 34, "NEXT", 4, C_INK);
+                draw_rect(180, 154, 136, 50, C_PANEL);
+                draw_rect(180, 154, 136, 1, C_NAVY);
+                draw_rect(180, 203, 136, 1, C_NAVY);
+                draw_rect(180, 154, 1, 50, C_NAVY);
+                draw_rect(315, 154, 1, 50, C_NAVY);
+                draw_text_color(186, 172, "HOLD", 4, C_INK);
+                draw_rect(180, 208, 136, 56, C_PANEL);
+                draw_rect(180, 208, 136, 1, C_NAVY);
+                draw_rect(180, 263, 136, 1, C_NAVY);
+                draw_rect(180, 208, 1, 56, C_NAVY);
+                draw_rect(315, 208, 1, 56, C_NAVY);
+                draw_text_color(186, 212, "SCORE", 5, C_DIM);
+                draw_text_color(186, 230, "LEVEL", 5, C_DIM);
+                draw_text_color(186, 248, "LINES", 5, C_DIM);
+                draw_rect(180, 268, 136, 50, C_PANEL);
+                draw_rect(180, 268, 136, 1, C_NAVY);
+                draw_rect(180, 268, 1, 50, C_NAVY);
+                draw_rect(315, 268, 1, 50, C_NAVY);
+                draw_text_color(186, 271, "操作方法", 12, C_INK);
+                draw_text_color(186, 283, "←→移動 ↑回転", 22, C_DIM);
+                draw_text_color(186, 295, "H交換 ↓落下", 17, C_DIM);
+                draw_text_color(186, 307, "Space 一気落下", 18, C_DIM);
+                game2d_static_end();
+
+                // Bake the ghost outline tile (tile 7) once: a 1px C_GHOST border
+                // over a C_WELL interior, byte-identical to the old per-cell ghost
+                // outline rects, so the ghost can be a retained sprite (KOTO-0140).
+                // Reuses the bake locals (col/dx = interior bytes, bad/full = border
+                // bytes) the title tile-cache loop set up above.
+                col = C_WELL & 255; dx = (C_WELL >> 8) & 255;
+                bad = C_GHOST & 255; full = (C_GHOST >> 8) & 255;
+                cy = 0;
+                while cy < 16 {
+                    cx = 0;
+                    tx = GHOST_TILE + cy * 32;
+                    while cx < 16 {
+                        if cx == 0 || cy == 0 || cx == 15 || cy == 15 {
+                            tiles[tx] = bad; tiles[tx + 1] = full;
+                        } else {
+                            tiles[tx] = col; tiles[tx + 1] = dx;
+                        }
+                        tx = tx + 2;
+                        cx = cx + 1;
+                    }
+                    cy = cy + 1;
+                }
+                // Register the 28 piece-orientation stamps once: stamp `i` is CELLS
+                // entry `i` (four packed (dcol,drow) nibbles). The active piece and
+                // ghost share a stamp (same orientation, different tile); NEXT/HOLD
+                // use the spawn-rotation stamps `t*4`.
+                i = 0;
+                while i < 28 { game2d_stamp_define(i, cells + i * 2, 4, 0); i = i + 1; }
+            }
+            if (intent & INTENT_EXIT) != 0 { exit(0); }
+            yield_frame();
+            continue;
+        }
+
+        if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
+
+        // ---- Play ----
+        if state == 1 {
+            if (intent & INTENT_SAVE) != 0 { state = 2; }
+
+            if state == 1 {
+                // A line-clear flash freezes gameplay while the full rows blink:
+                // count it down and, on the final frame, drop the marked rows and
+                // score them (recounted from the cells still marked 8).
+                if flash > 0 {
+                    flash = flash - 1;
+                    if flash == 0 {
+                        dx = 0;
+                        tr = 19;
+                        while tr >= 0 {
+                            i = 0; col = 1;
+                            while i < 10 { if board[tr * 10 + i] != 8 { col = 0; } i = i + 1; }
+                            if col != 0 {
+                                dx = dx + 1;
+                                cy = tr;
+                                while cy > 0 {
+                                    i = 0;
+                                    while i < 10 { board[cy * 10 + i] = board[(cy - 1) * 10 + i]; i = i + 1; }
+                                    cy = cy - 1;
+                                }
+                                i = 0;
+                                while i < 10 { board[i] = 0; i = i + 1; }
+                            } else {
+                                tr = tr - 1;
+                            }
+                        }
+                        if dx == 1 { score = score + 100 * level; }
+                        if dx == 2 { score = score + 300 * level; }
+                        if dx == 3 { score = score + 500 * level; }
+                        if dx >= 4 { score = score + 800 * level; }
+                        lines = lines + dx;
+                        // Recompute the level (reusing `tr`, free after the row scan);
+                        // a rise triggers the "LEVEL UP!" banner.
+                        tr = lines / 10 + 1;
+                        if tr > level { lvlup = 30; }
+                        level = tr;
+                        dospawn = 1;
+                    }
+                }
+
+                if flash == 0 {
+                dropy = -1;
+                // Spawn the next piece (also the topout / game-over test).
+                if dospawn != 0 {
+                    dospawn = 0;
+                    ptype = nx1;
+                    nx1 = nx2;
+                    nx2 = nx3;
+                    rng = rng * 75 + 74; rng = rng % 65537; nx3 = rng % 7;
+                    px = 3; py = 0; rot = 0; huse = 0; vy = 0; fxhi = 0;
+                    bad = 0; m = shape(ptype * 4 + rot);
+                    i = 0;
+                    while i < 16 {
+                        if (m & (1 << i)) != 0 {
+                            cx = px + (i & 3);
+                            cy = py + (i >> 2);
+                            if cy >= 0 {
+                                if board[cy * 10 + cx] != 0 { bad = 1; }
+                            }
+                        }
+                        i = i + 1;
+                    }
+                    if bad != 0 { state = 3; sfx_over(); stop_bgm(); }
+                }
+
+                if state == 1 {
+                    // Hold (swap current with the hold slot, once per piece). The
+                    // 'h'/Space codepoints are read inline so they need no local.
+                    if text_input() == 104 {
+                        if huse == 0 {
+                            huse = 1;
+                            if hashold == 0 {
+                                hold = ptype;
+                                hashold = 1;
+                                dospawn = 1;
+                            } else {
+                                col = hold; hold = ptype; ptype = col;
+                                px = 3; py = 0; rot = 0; vy = 0;
+                            }
+                        }
+                    }
+
+                    // Horizontal move.
+                    dx = 0;
+                    if (intent & INTENT_LEFT) != 0 { dx = -1; }
+                    if (intent & INTENT_RIGHT) != 0 { dx = 1; }
+                    if dx != 0 {
+                        tx = px + dx; ty = py; tr = rot;
+                        bad = 0; m = shape(ptype * 4 + tr);
+                        i = 0;
+                        while i < 16 {
+                            if (m & (1 << i)) != 0 {
+                                cx = tx + (i & 3);
+                                cy = ty + (i >> 2);
+                                if cx < 0 { bad = 1; } else {
+                                    if cx > 9 { bad = 1; } else {
+                                        if cy > 19 { bad = 1; } else {
+                                            if cy >= 0 {
+                                                if board[cy * 10 + cx] != 0 { bad = 1; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            i = i + 1;
+                        }
+                        if bad == 0 { px = tx; fxhi = 3; sfx_move(); }
+                    }
+
+                    // Rotate (clockwise).
+                    if (intent & INTENT_UP) != 0 {
+                        tx = px; ty = py; tr = rot + 1;
+                        if tr > 3 { tr = 0; }
+                        bad = 0; m = shape(ptype * 4 + tr);
+                        i = 0;
+                        while i < 16 {
+                            if (m & (1 << i)) != 0 {
+                                cx = tx + (i & 3);
+                                cy = ty + (i >> 2);
+                                if cx < 0 { bad = 1; } else {
+                                    if cx > 9 { bad = 1; } else {
+                                        if cy > 19 { bad = 1; } else {
+                                            if cy >= 0 {
+                                                if board[cy * 10 + cx] != 0 { bad = 1; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            i = i + 1;
+                        }
+                        if bad == 0 { rot = tr; fxhi = 3; sfx_rotate(); }
+                    }
+
+                    // Vertical: gravity, soft drop, and hard drop share one step.
+                    // Gravity interval (frames) falls with the level, floored at 4.
+                    full = 0;
+                    steps = 0;
+                    ty = 36 - level * 3;
+                    if ty < 4 { ty = 4; }
+                    gtick = gtick + 1;
+                    if gtick >= ty { steps = 1; gtick = 0; }
+                    if (intent & INTENT_DOWN) != 0 { steps = 1; }
+                    if text_input() == 32 { steps = 99; full = 1; dropy = py; }
+                    while steps > 0 {
+                        tx = px; ty = py + 1; tr = rot;
+                        bad = 0; m = shape(ptype * 4 + tr);
+                        i = 0;
+                        while i < 16 {
+                            if (m & (1 << i)) != 0 {
+                                cx = tx + (i & 3);
+                                cy = ty + (i >> 2);
+                                if cy > 19 { bad = 1; } else {
+                                    if cy >= 0 {
+                                        if board[cy * 10 + cx] != 0 { bad = 1; }
+                                    }
+                                }
+                            }
+                            i = i + 1;
+                        }
+                        if bad != 0 {
+                            // Blocked: lock here. (Hard drop already set full=1
+                            // before the loop, so this is unconditional.)
+                            full = 1;
+                            steps = 0;
+                        } else {
+                            py = py + 1; steps = steps - 1;
+                        }
+                    }
+
+                    // Lock the piece, clear full rows, and score.
+                    if full != 0 {
+                        // Snap the smooth-fall visual to the landed row so the
+                        // lock-frame highlight sits on the piece, not mid-fall (a
+                        // hard drop jumps py instantly while vy was still easing).
+                        vy = py * 16;
+                        bad = 0; m = shape(ptype * 4 + rot);
+                        i = 0;
+                        while i < 16 {
+                            if (m & (1 << i)) != 0 {
+                                cx = px + (i & 3);
+                                cy = py + (i >> 2);
+                                if cy < 0 { bad = 1; } else { board[cy * 10 + cx] = ptype + 1; }
+                            }
+                            i = i + 1;
+                        }
+
+                        // Mark full rows with the sentinel 8; the flash above then
+                        // blinks and removes them. `dx` counts rows marked this lock.
+                        dx = 0;
+                        tr = 19;
+                        while tr >= 0 {
+                            i = 0; col = 1;
+                            while i < 10 {
+                                if board[tr * 10 + i] == 0 { col = 0; }
+                                i = i + 1;
+                            }
+                            if col != 0 {
+                                dx = dx + 1;
+                                i = 0;
+                                while i < 10 { board[tr * 10 + i] = 8; i = i + 1; }
+                            }
+                            tr = tr - 1;
+                        }
+
+                        // Topout wins; otherwise start the line-clear flash (longer
+                        // for more rows) or, with nothing cleared, spawn the next. A
+                        // four-line clear is special-cased: a triumphant fanfare and a
+                        // long flash count. Since a three-line tops out at flash 12,
+                        // any flash above 12 means "tetris", so the high count doubles
+                        // as the "4 LINE!" banner timer in render -- no extra local.
+                        if bad != 0 {
+                            state = 3;
+                            sfx_over();
+                            stop_bgm();
+                        } else {
+                            // Score-popup value: the points this clear will award
+                            // (mirrors the collapse scoring below), shown by render
+                            // during the flash.
+                            pop = 0;
+                            if dx == 1 { pop = 100 * level; }
+                            if dx == 2 { pop = 300 * level; }
+                            if dx == 3 { pop = 500 * level; }
+                            if dx >= 4 { pop = 800 * level; }
+                            if dx >= 4 {
+                                sfx_tetris();
+                                flash = 24;
+                            } else {
+                                if dx > 0 {
+                                    sfx_clear();
+                                    flash = 6 + dx * 2;
+                                } else {
+                                    // No clear: a one-frame highlight on the locked
+                                    // piece (reuses the action-flash timer).
+                                    sfx_lock();
+                                    fxhi = 2;
+                                    dospawn = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                }
+            }
+        } else {
+            if state == 2 {
+                if (intent & INTENT_SAVE) != 0 { state = 1; }
+            }
+            if state == 3 {
+                // Advance the board-sweep animation (flash counts 0..20, one row of
+                // the well per frame) until the player retries.
+                if flash < 20 { flash = flash + 1; }
+                full = 0;
+                if (intent & INTENT_IME_TOGGLE) != 0 { full = 1; }
+                if (intent & INTENT_NEWLINE) != 0 { full = 1; }
+                if full != 0 {
+                    i = 0;
+                    while i < 200 { board[i] = 0; shown[i] = 0; i = i + 1; }
+                    game2d_clear_layer(0);
+                    score = 0; lines = 0; level = 1; gtick = 0;
+                    huse = 0; hashold = 0; hold = 0; flash = 0; dropy = -1; lvlup = 0;
+                    rng = rng * 75 + 74; rng = rng % 65537; nx1 = rng % 7;
+                    rng = rng * 75 + 74; rng = rng % 65537; nx2 = rng % 7;
+                    rng = rng * 75 + 74; rng = rng % 65537; nx3 = rng % 7;
+                    dospawn = 1; state = 1; play_bgm_asset("audio/koto_blocks_bgm.kmml", 26);
+                }
+            }
+        }
+
+        // ---- Render (states 1, 2, 3) ----
+        // The page background, the well frame/fill, the cell grid, the right-side
+        // panel frames, and the fixed labels are drawn once into the retained
+        // Game2D static layer on the title->play transition above (KOTO-0136); the
+        // host composites that layer beneath everything below, so this per-frame
+        // render emits only what changes: the board, piece, ghost, dynamic values,
+        // badge, and overlays.
+
+        // Locked board tiles via the retained Game2D tilemap (KOTO-0135). During
+        // play/pause the board is host-held: walk the grid and `set_tile` only the
+        // cells whose colour changed since last frame (shadow-diffed in `shown`),
+        // so a still board issues zero host calls and a lock/clear only a handful —
+        // instead of re-blitting every occupied cell every frame. `game2d_present`
+        // (below) then composites the tilemap over the well, beneath the piece and
+        // panels. Clearing cells (colour 8) blink white via an immediate rect while
+        // their tile is held empty. In game over the board is drawn as flat dim
+        // rects below the panel (the simulator composites rects before pixels, so a
+        // tile would paint over the panel), and the tilemap is cleared.
+        if state == 3 {
+            game2d_clear_layer(0);
+            // The board-sweep overlay (drawn later this frame) is an opaque C_SWEEP
+            // rect covering rows 0..flash, so any dim cell in those rows is hidden by
+            // it — drawing it is wasted immediate-rect work. Start the fill at row
+            // `flash`: as the sweep descends, fewer rows need filling, and once it
+            // rests (flash == 20) the whole well is covered and the fill is skipped
+            // entirely. The visible result is identical (the sweep paints on top).
+            cy = flash;
+            while cy < 20 {
+                cx = 0;
+                i = cy * 10;
+                while cx < 10 {
+                    if board[i] != 0 {
+                        draw_rect(8 + cx * 16, cy * 16, 16, 16, C_DEAD);
+                    }
+                    i = i + 1;
+                    cx = cx + 1;
+                }
+                cy = cy + 1;
+            }
+        } else {
+            cy = 0;
+            while cy < 20 {
+                cx = 0;
+                i = cy * 10;
+                while cx < 10 {
+                    col = board[i];
+                    if col == 8 {
+                        // Clearing cell: drop its retained tile (the blink band is
+                        // drawn per-row below, not per-cell here).
+                        if shown[i] != 8 { game2d_set_tile(0, cx, cy, -1); shown[i] = 8; }
+                    } else {
+                        if col != shown[i] {
+                            if col == 0 {
+                                game2d_set_tile(0, cx, cy, -1);
+                            } else {
+                                game2d_set_tile(0, cx, cy, (col - 1) * 512);
+                            }
+                            shown[i] = col;
+                        }
+                    }
+                    i = i + 1;
+                    cx = cx + 1;
+                }
+                cy = cy + 1;
+            }
+            // Line-clear blink: every fully-marked row is ten contiguous cells (a row
+            // is marked 8 only when complete), so draw each as one full-width band
+            // instead of ten per-cell rects — identical pixels at a tenth of the
+            // immediate-rect cost. Cold: skipped entirely outside a clear (flash == 0),
+            // so steady play pays only the single `flash > 0` test.
+            if flash > 0 {
+                if (flash & 1) == 0 {
+                    cy = 0;
+                    while cy < 20 {
+                        if board[cy * 10] == 8 {
+                            draw_rect(8, cy * 16, 160, 16, C_PANEL);
+                        }
+                        cy = cy + 1;
+                    }
+                }
+            }
+        }
+
+        // Hard-drop trail: a faint streak in the piece's columns from the drop's
+        // start row down to the landing, shown for the frame of the drop.
+        if dropy >= 0 {
+            if py > dropy {
+                m = shape(ptype * 4 + rot);
+                i = 0;
+                while i < 16 {
+                    if (m & (1 << i)) != 0 {
+                        cx = 8 + (px + (i & 3)) * 16;
+                        draw_rect(cx + 6, dropy * 16, 4, (py - dropy) * 16, C_GHOST);
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+
+        // Ghost piece: drop the active piece to its landing row and place a ghost
+        // sprite there (reuses `ty` as the landing row, `bad` as the blocked flag).
+        // The ghost is the active orientation's stamp drawn with the ghost outline
+        // tile, so it is pixel-identical to the old per-cell outline (KOTO-0140).
+        // Hidden when resting on the piece, outside play, or during a line-clear
+        // flash (the piece is already locked into the board).
+        if state == 1 && flash == 0 {
+            ty = py;
+            bad = 0;
+            m = shape(ptype * 4 + rot);
+            while bad == 0 {
+                i = 0;
+                while i < 16 {
+                    if (m & (1 << i)) != 0 {
+                        cx = px + (i & 3);
+                        cy = ty + 1 + (i >> 2);
+                        if cy > 19 { bad = 1; } else {
+                            if cy >= 0 {
+                                if board[cy * 10 + cx] != 0 { bad = 1; }
+                            }
+                        }
+                    }
+                    i = i + 1;
+                }
+                if bad == 0 { ty = ty + 1; }
+            }
+            if ty > py {
+                game2d_sprite_set(SP_GHOST, ptype * 4 + rot, 8 + px * 16, ty * 16, GHOST_TILE);
+            } else {
+                game2d_sprite_hide(SP_GHOST);
+            }
+        } else {
+            game2d_sprite_hide(SP_GHOST);
+        }
+
+        // Active piece (hidden in game over and while a line-clear flash plays). Its
+        // visual y eases toward the logical row (py*16) a few px per frame for a
+        // smooth fall; collision, ghost, and the board all stay on the tile grid.
+        if state != 3 && flash == 0 {
+            // Ease half the remaining gap per frame: smooth under gravity, never
+            // overshoots, and self-limiting under a fast soft drop.
+            vy = vy + (py * 16 - vy + 1) / 2;
+            game2d_sprite_set(SP_ACTIVE, ptype * 4 + rot, 8 + px * 16, vy, ptype * 512);
+            // Move/rotate action flash: a bright halo just outside the piece
+            // silhouette. Drawn 1px outside each cell so the rect-then-blit
+            // compositor hides interior edges (covered by neighbour tiles) and
+            // keeps only the outer outline.
+            if fxhi > 0 {
+                fxhi = fxhi - 1;
+                m = shape(ptype * 4 + rot);
+                i = 0;
+                while i < 16 {
+                    if (m & (1 << i)) != 0 {
+                        cx = 8 + (px + (i & 3)) * 16;
+                        cy = vy + (i >> 2) * 16;
+                        draw_rect(cx, cy - 1, 16, 1, C_PANEL);
+                        draw_rect(cx, cy + 16, 16, 1, C_PANEL);
+                        draw_rect(cx - 1, cy, 1, 16, C_PANEL);
+                        draw_rect(cx + 16, cy, 1, 16, C_PANEL);
+                    }
+                    i = i + 1;
+                }
+            }
+        } else {
+            game2d_sprite_hide(SP_ACTIVE);
+        }
+
+        // Side panel run-state badge over the static title bar (the bar frame and
+        // the "ブロック" title live in the static layer now). Retained text keyed by
+        // T_BADGE: set per state, hidden in game over so the play badge does not
+        // linger (retained items persist until hidden, unlike immediate draws).
+        if state == 1 { game2d_text_set(T_BADGE, 284, 5, "実行中", 9, C_GREEN); }
+        if state == 2 { game2d_text_set(T_BADGE, 272, 5, "一時停止", 12, C_AMBER); }
+        if state == 3 { game2d_text_hide(T_BADGE); }
+
+        // NEXT previews over the static NEXT box (frame + "NEXT" label are static),
+        // as retained spawn-orientation sprites (KOTO-0140). Three stacked previews;
+        // a spawn piece is up to two cells (32px) tall, so the slots are spaced to
+        // keep all three inside the box (bottom border at y=149).
+        game2d_sprite_set(SP_NEXT0, nx1 * 4, 212, 50, nx1 * 512);
+        game2d_sprite_set(SP_NEXT1, nx2 * 4, 212, 83, nx2 * 512);
+        game2d_sprite_set(SP_NEXT2, nx3 * 4, 212, 116, nx3 * 512);
+
+        // HOLD content over the static HOLD box (frame + "HOLD" label are static),
+        // a retained spawn-orientation sprite. Centered on the right so a two-cell-
+        // tall spawn shape clears the 50px frame.
+        if hashold != 0 {
+            game2d_sprite_set(SP_HOLD, hold * 4, 246, 163, hold * 512);
+            game2d_text_hide(T_HOLD);
+        } else {
+            // Empty until first used: hide the slot's sprite and spell out its use.
+            game2d_sprite_hide(SP_HOLD);
+            game2d_text_set(T_HOLD, 236, 172, "Hで交換", 10, C_DIM);
+        }
+
+        // Stats values over the static stats box (frame + SCORE/LEVEL/LINES labels
+        // are static); only the numbers change per frame.
+        tx = score; i = 5;
+        while i >= 0 { num[i] = 48 + tx % 10; tx = tx / 10; i = i - 1; }
+        game2d_text_set(T_SCORE, 250, 212, num, 6, C_INK);
+        tx = level; i = 5;
+        while i >= 0 { num[i] = 48 + tx % 10; tx = tx / 10; i = i - 1; }
+        game2d_text_set(T_LEVEL, 286, 230, num + 4, 2, C_INK);
+        tx = lines; i = 5;
+        while i >= 0 { num[i] = 48 + tx % 10; tx = tx / 10; i = i - 1; }
+        game2d_text_set(T_LINES, 280, 248, num + 3, 3, C_INK);
+
+        // (Controls box frame + labels live in the static layer.)
+
+        // Pause / game-over overlays over the well.
+        if state == 2 {
+            draw_rect(16, 142, 144, 36, C_PANEL);
+            draw_rect(16, 142, 144, 2, C_AMBER);
+            draw_text_color(44, 152, "一時停止", 12, C_INK);
+        }
+        if state == 3 {
+            // Board sweep: a dark overlay descends the well one row per frame
+            // (flash 0..20), sinking the board before the panel draws on top.
+            draw_rect(8, 0, 160, flash * 16, C_SWEEP);
+            draw_rect(8, 128, 160, 64, C_PANEL);
+            draw_rect(8, 128, 160, 2, C_RED);
+            draw_text_color(20, 140, "ゲームオーバー", 21, C_RED);
+            draw_text_color(36, 166, "F1で再挑戦", 14, C_INK);
+        }
+
+        // "4 LINE!" celebration banner over the well, during the line-clear flash.
+        // Only a four-line clear pushes flash above a three-line's 12 (see the lock
+        // logic), so the flash count doubles as the banner timer with no extra local.
+        // Gated to play so it never collides with the game-over sweep's flash reuse.
+        if state == 1 {
+            if flash > 0 {
+                // Score popup: the points this clear awards, over the well. `num` is
+                // formatted as for the SCORE box, then drawn from its first
+                // significant digit (cy) with a "+" prefix.
+                tx = pop; i = 5;
+                while i >= 0 { num[i] = 48 + tx % 10; tx = tx / 10; i = i - 1; }
+                cy = 5;
+                if pop >= 10 { cy = 4; }
+                if pop >= 100 { cy = 3; }
+                if pop >= 1000 { cy = 2; }
+                if pop >= 10000 { cy = 1; }
+                draw_rect(44, 150, 88, 22, C_NAVY);
+                draw_rect(44, 150, 88, 2, C_NAVYHI);
+                draw_text_color(52, 156, "+", 1, C_LIGHT);
+                draw_text_color(60, 156, num + cy, 6 - cy, C_LIGHT);
+            }
+            if flash > 12 {
+                draw_rect(20, 92, 136, 30, C_AMBER);
+                draw_rect(20, 92, 136, 2, C_NAVYHI);
+                draw_text_color(46, 100, "4 LINE!", 7, C_INK);
+            }
+        }
+
+        // "LEVEL UP!" banner: shown for `lvlup` frames after a level rise.
+        if lvlup > 0 {
+            lvlup = lvlup - 1;
+            draw_rect(20, 56, 136, 30, C_NAVY);
+            draw_rect(20, 56, 136, 2, C_GREEN);
+            draw_text_color(34, 64, "LEVEL UP!", 9, C_LIGHT);
+        }
+
+        // Composite the retained layers for this frame (KOTO-0140): the board
+        // tilemap and the sprite layer (active/ghost/NEXT/HOLD) set above. Called
+        // after every sprite_set so the simulator re-emits the final sprite state;
+        // the device composites the retained tables at a fixed z-order regardless.
+        game2d_present();
+
+        yield_frame();
+    }
+}

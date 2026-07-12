@@ -1,0 +1,23 @@
+; KotoAudio M13-005 practical experimental MML subset example.
+; Short falling-blocks style loop: melody, bass, and built-in drums.
+
+#TRACK melody
+T132 L8 O5 @0 V104
+[ c e g > c < b- g e c
+  d f a > d < c# a f d
+  e g b > e < d g b g
+  f a > c < a g4. r8 ]0
+
+#TRACK bass
+T132 L8 O2 @5 V96
+[ c r c > g < c r c > g
+  d r d > a < d r d > a
+  e r e > b < e r e > b
+  f r f > c < f r4. ]0
+
+#TRACK drums
+T132 L16 V118
+[ !bd !hh !sd !hh !bd !hh !s2 !oh
+  !bd !hh !sd !hh !bd !hh !cl !hh
+  !bd !hh !sd !hh !bd !hh !s2 !oh
+  !bd !hh !sd !hh !bd !hh !cy !hh ]0

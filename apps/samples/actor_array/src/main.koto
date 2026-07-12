@@ -1,0 +1,79 @@
+const ACTOR_COUNT = 9;
+const PLAYER = 0;
+const FIRST_NPC = 1;
+const SCREEN_W = 320;
+const SCREEN_H = 320;
+const SIZE = 10;
+
+fn main() {
+    let actors = actor_array_new(ACTOR_COUNT);
+    let i = 0;
+    while i < ACTOR_COUNT {
+        actor_set_pos(actors, i, 24 + i * 28, 40 + (i % 4) * 42);
+        actor_set_vel(actors, i, 1 + (i % 3), 1 + ((i + 1) % 2));
+        actor_set_state(actors, i, i % 4);
+        actor_set_frame(actors, i, 0);
+        actor_set_timer(actors, i, i * 11);
+        i = i + 1;
+    }
+    actor_set_pos(actors, PLAYER, 152, 152);
+    actor_set_vel(actors, PLAYER, 2, 1);
+    actor_set_state(actors, PLAYER, 9);
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            exit(0);
+        }
+
+        draw_rect(0, 0, SCREEN_W, SCREEN_H, 0);
+        draw_text(12, 10, "actor array", 11);
+
+        i = 0;
+        while i < ACTOR_COUNT {
+            let x = actor_x(actors, i);
+            let y = actor_y(actors, i);
+            let vx = actor_vx(actors, i);
+            let vy = actor_vy(actors, i);
+            let timer = actor_timer(actors, i) + 1;
+            let state = actor_state(actors, i);
+            let nx = x + vx;
+            let ny = y + vy;
+
+            if nx < 8 {
+                actor_set_vel(actors, i, 0 - vx, vy);
+                actor_set_pos(actors, i, 8, ny);
+            } else if nx > SCREEN_W - SIZE - 8 {
+                actor_set_vel(actors, i, 0 - vx, vy);
+                actor_set_pos(actors, i, SCREEN_W - SIZE - 8, ny);
+            } else if ny < 32 {
+                actor_set_vel(actors, i, vx, 0 - vy);
+                actor_set_pos(actors, i, nx, 32);
+            } else if ny > SCREEN_H - SIZE - 8 {
+                actor_set_vel(actors, i, vx, 0 - vy);
+                actor_set_pos(actors, i, nx, SCREEN_H - SIZE - 8);
+            } else {
+                actor_set_pos(actors, i, nx, ny);
+            }
+
+            actor_set_timer(actors, i, timer);
+            actor_set_frame(actors, i, timer & 3);
+
+            if i == PLAYER {
+                draw_rect(actor_x(actors, i), actor_y(actors, i), 14, 14, 65535);
+            } else if state == 0 {
+                draw_rect(actor_x(actors, i), actor_y(actors, i), SIZE, SIZE, 63488);
+            } else if state == 1 {
+                draw_rect(actor_x(actors, i), actor_y(actors, i), SIZE, SIZE, 2016);
+            } else if state == 2 {
+                draw_rect(actor_x(actors, i), actor_y(actors, i), SIZE, SIZE, 31);
+            } else {
+                draw_rect(actor_x(actors, i), actor_y(actors, i), SIZE, SIZE, 65504);
+            }
+
+            i = i + 1;
+        }
+
+        yield_frame();
+    }
+}

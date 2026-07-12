@@ -1,0 +1,50 @@
+# KotoShogi — 32 bars, T104, 4/4, about 74 seconds.
+# Moonlit-board strategy theme, extended version.
+
+#TRACK flute
+@5 T104 V8 O5 L8 [
+A C D E A E D C  A R C D E G E D  C D E G A G E D  C A R E A R E R
+A C D E A >C <A G  E D C A C D E G  A G E D C D E G  A R E G A E D C
+G A >C D C <A G E  F G A C A G E D  E G A >C <A G E C  D E G A G E D R
+A C D E G E D C  A >C D E D C <A G  E G A C A G E D  C D E G A R A R
+>C D E G E D C <A  G A >C D E D C <A  F A >C D C <A G F  E G B >D C <B A G
+A C E A G E D C  D F A >C <A F E D  C E G A G E D C  D E G B A G E R
+A C D E A E D C  A C E G A G E C  D F A C B A G E  E G B >C <B A G E
+F A >C <A G E D C  E G B G E D C A  D E G A G E D C  A R C D E G E A
+]
+
+#TRACK strings
+@1 T104 V5 O4 L8 [
+A R E R C R E R  A R E R G R E R  F R C R A R C R  E R B R E R B R
+A E C E A E C E  G D B D G D B D  F C A C F C A C  E B G B E B G B
+G D B D A D B D  F C A C G C A C  E B G B A E G E  D A F A E B G B
+A E C E G E C E  A E >C <E B E A E  E B G B A E G E  C G E G A E C E
+A E >C <E A E C E  G D B D G D A D  F C A C F C G C  E B G B E B A B
+A E C E A E G E  D A F A D A C A  C G E G C G A G  E B G B E B R B
+A E C E A E C E  A E C E G E C E  D A F A C A F A  E B G B >C <B G B
+F C A C E B G B  E B G B D A F A  D A F A E B G B  A E C E A4 R4
+]
+
+#TRACK bass
+@2 T104 V6 O2 L4 [
+A A E E  G G D D  F F C C  E E B B
+A A E E  G G D D  F F C C  E E B B
+G G D D  F F C C  E E B B  D D E E
+A A E E  A A C C  E E A A  C C E E
+A A E E  G G D D  F F C C  E E B B
+A A G G  D D A A  C C G G  E E B B
+A A E E  A A G G  D D F F  E E C C
+F F E E  E E D D  D D E E  A E A R
+]
+
+#TRACK wood
+@4 T104 V5 O2 L8 [
+C R R C R C R R  C R R C C R C R  C R C R R C R C  C R R C R C R R
+C R R C R C R R  C R C R C R R C  C R R C R C R C  C R R C C R C R
+C R C R R C R C  C R R C C R C R  C R C R R C R C  C C R C R C R R
+C R R C R C R R  C R C R C R R C  C R R C R C R C  C R R C C R C R
+C R C R R C R C  C R R C C R C R  C R C R C R R C  C C R C R C R R
+C R R C R C R R  C R C R C R R C  C R R C R C R C  C R R C C R C R
+C R R C R C R R  C R C R R C R C  C R R C C R C R  C R C R C R R C
+C R R C C R C R  C R C R R C R C  C4 R4 C4 R4  C R R C R C R R
+]

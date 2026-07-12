@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/koto-audio", "crates/koto-audio-tools"]
+resolver = "2"

@@ -1,0 +1,7 @@
+# Open the file dialog, move to the second file (note.txt), and open it.
+frame      # let the first frame load memo.txt
+open       # F4: open the file picker
+down       # highlight note.txt (memo.txt -> note.txt)
+commit     # confirm: load note.txt into the editor
+frame      # render the editor with the new document
+exit       # save + quit

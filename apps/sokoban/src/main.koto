@@ -1,0 +1,401 @@
+// dev.koto.games.sokoban — compact Sokoban sample for KotoOS.
+//
+// Controls:
+//   Arrow keys  Move / push
+//   U           Undo one move
+//   F1          Restart the current stage
+//   Enter       Continue after clearing a stage
+//   F10         Exit
+//
+// The board uses one byte per cell:
+//   0 void, 1 floor, 2 wall, 3 goal, 4 crate, 5 crate on goal.
+
+const C_BG = 8467;
+const C_TOP = 4258;
+const C_TOP_HI = 10895;
+const C_TEXT = 65503;
+const C_DIM = 44373;
+const C_FLOOR_A = 54804;
+const C_FLOOR_B = 52723;
+const C_FLOOR_EDGE = 40170;
+const C_WALL = 16904;
+const C_WALL_HI = 25324;
+const C_WALL_LO = 8452;
+const C_GOAL = 64486;
+const C_GOAL_HI = 65099;
+const C_CRATE = 51910;
+const C_CRATE_HI = 62513;
+const C_CRATE_LO = 35298;
+const C_PLAYER = 23455;
+const C_PLAYER_HI = 48607;
+const C_SHADOW = 4226;
+const C_CLEAR = 21163;
+const C_CONFETTI_A = 64520;
+const C_CONFETTI_B = 2047;
+const C_CONFETTI_C = 63519;
+
+// Rendering split (KOTO-0185): the device's immediate command list is capped at
+// MAX_APP_DRAW_COMMANDS (96) and silently drops the tail past it. Drawing the whole
+// 28x28 board immediately every frame was ~340 commands, so on hardware most of the
+// board — crates and the porter included — never reached the panel (the sim's
+// unbounded immediate list hid it). So the board's *non-moving* art (floor, walls,
+// empty-goal rings) now lives in the retained Game2D static layer, rebuilt once per
+// stage and composited beneath the per-frame immediate list; only the crates and the
+// smooth porter stay immediate, keeping each frame's list well under the cap.
+//
+// Retained Game2D text items carry the HUD values (id-keyed because they change
+// during play); the fixed labels are captured into the static layer with the chrome.
+const T_STAGE = 0;
+const T_STEPS = 1;
+const T_PUSHES = 2;
+
+fn sfx_move() { play_sfx_asset("audio/sokoban_move.kmml", 23); }
+fn sfx_rotate() { play_sfx_asset("audio/sokoban_rotate.kmml", 25); }
+fn sfx_lock() { play_sfx_asset("audio/sokoban_lock.kmml", 23); }
+fn sfx_clear() { play_sfx_asset("audio/sokoban_clear.kmml", 24); }
+
+// === BEGIN GENERATED STAGES (apps/sokoban/maps/*.txt) — do not edit by hand ===
+// Regenerate with: python harness/build_apps.py
+fn stage_count() -> int {
+    return 3;
+}
+
+fn stage_data(level: int) -> int {
+    if level == 1 { return "###########...#.o..##.O...o..##..##O#..##.O..o...##...@....##........###########"; }   // 01-switchback.txt
+    if level == 2 { return "###########.o....o.##.O....O.##..###...##.#.#.#..##.O..@O..##.o....o.###########"; }   // 02-cross-dock.txt
+    if level == 3 { return "###########.o....o.##..O.O...##..###...##.#.#.#..##.O..@O..##.o....o.###########"; }   // 03-last-mile.txt
+    return "###########...#.o..##.O...o..##..##O#..##.O..o...##...@....##........###########";
+}
+// === END GENERATED STAGES ===
+
+fn main() {
+    buf map[90];
+    buf undo[90];
+    buf num[3];
+
+    let state = 0;       // 0 load stage, 1 play, 2 clear celebration
+    let level = 1;
+    let steps = 0;
+    let pushes = 0;
+    let px = 0;
+    let py = 0;
+    let vx = 0;          // visual position in pixels
+    let vy = 0;
+    let undo_px = 0;
+    let undo_py = 0;
+    let undo_steps = 0;
+    let undo_pushes = 0;
+    let undo_ok = 0;
+    let fx = 0;          // push impact timer
+    let clear = 0;
+    let banner = 0;
+    let tick = 0;
+    let intent = 0;
+    let cp = 0;
+    let dx = 0;
+    let dy = 0;
+    let tx = 0;
+    let ty = 0;
+    let bx = 0;
+    let by = 0;
+    let ti = 0;
+    let bi = 0;
+    let v = 0;
+    let i = 0;
+    let x = 0;
+    let y = 0;
+    let sx = 0;
+    let sy = 0;
+    let shake = 0;
+    let open = 0;
+    let c = 0;
+    let sdat = 0;
+
+    loop {
+        intent = text_intent();
+        cp = text_input();
+        if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
+
+        // Build the selected stage by decoding its ASCII tilemap (10x8,
+        // row-major). The maps live in apps/sokoban/maps/*.txt and are embedded
+        // at build time as the generated stage_data() strings above; this keeps
+        // level data out of the program logic so stages are easy to add.
+        // Glyphs: '#' wall, '.' floor, 'o' goal, 'O' crate, '*' crate on goal,
+        // '@' porter start (floor underneath), space void.
+        if state == 0 {
+            i = 0;
+            while i < 90 { map[i] = 0; undo[i] = 0; i = i + 1; }
+
+            sdat = stage_data(level);
+            i = 0;
+            while i < 80 {
+                v = heap_get_u8(sdat + i);
+                c = 1;                                // '.' floor
+                if v == 35 { c = 2; }                 // '#' wall
+                if v == 111 { c = 3; }                // 'o' goal
+                if v == 79 { c = 4; }                 // 'O' crate
+                if v == 42 { c = 5; }                 // '*' crate on goal
+                if v == 32 { c = 0; }                 // ' ' void
+                if v == 64 { px = i % 10; py = i / 10; c = 1; }  // '@' porter
+                map[i] = c;
+                i = i + 1;
+            }
+
+            steps = 0; pushes = 0; undo_ok = 0; fx = 0; clear = 0;
+            vx = 20 + px * 28; vy = 39 + py * 28;
+            banner = 42;
+            state = 1;
+            play_bgm_asset("audio/sokoban_bgm.kmml", 22);
+
+            // Rebuild the retained static layer for this stage: fixed chrome plus the
+            // board's non-moving art. Captured once per load (crates/porter are the
+            // only things that move), so the per-frame immediate list stays small
+            // enough for the device cap (see the header note). A full per-cell
+            // checkerboard + 4-rect 3D walls (~300 commands) blows the 80-command
+            // static cap, so the texture is done cheaply: flat floor + tile seams, and
+            // walls two-toned by parity. Busiest stage lands ~74 of the 80 budget.
+            game2d_static_begin();
+            draw_rect(0, 0, 320, 320, C_BG);
+            draw_rect(0, 0, 320, 31, C_TOP);
+            draw_rect(0, 31, 320, 2, C_TOP_HI);
+            draw_text_color(12, 8, "倉庫番", 9, C_TEXT);
+            draw_text_color(224, 8, "STAGE", 5, C_DIM);
+            draw_rect(0, 270, 320, 50, C_TOP);
+            draw_rect(0, 270, 320, 2, C_TOP_HI);
+            draw_text_color(12, 280, "歩数", 6, C_DIM);
+            draw_text_color(104, 280, "押す", 6, C_DIM);
+            draw_text_color(202, 280, "U 戻す", 8, C_DIM);
+            draw_text_color(12, 301, "矢印 移動  F1 やり直し  F10 終了", 42, C_DIM);
+
+            // Floor: flat fill plus 1px tile seams so it reads as a tiled warehouse
+            // floor, not one flat colour. Fixed 16-command cost (9 vertical + 7
+            // horizontal) regardless of how many floor cells a stage has; the seams
+            // sit under the walls, which are drawn on top next.
+            draw_rect(20, 39, 280, 224, C_FLOOR_A);
+            x = 1;
+            while x < 10 { draw_rect(20 + x * 28, 39, 1, 224, C_FLOOR_EDGE); x = x + 1; }
+            y = 1;
+            while y < 8 { draw_rect(20, 39 + y * 28, 280, 1, C_FLOOR_EDGE); y = y + 1; }
+
+            // Walls (two-toned by cell parity for a block/brick texture — one rect each,
+            // since the old 4-rect 3D shading blew both caps) and empty-goal rings
+            // (static now, so they no longer pulse). Crate-on-goal cells still get their
+            // ring here; the moving crate is drawn immediate on top.
+            y = 0;
+            while y < 8 {
+                x = 0;
+                while x < 10 {
+                    i = y * 10 + x;
+                    v = map[i];
+                    sx = 20 + x * 28;
+                    sy = 39 + y * 28;
+                    if v == 2 {
+                        if ((x + y) & 1) == 0 { draw_rect(sx, sy, 28, 28, C_WALL); }
+                        else { draw_rect(sx, sy, 28, 28, C_WALL_LO); }
+                    }
+                    if v == 3 || v == 5 {
+                        draw_rect(sx + 7, sy + 7, 14, 14, C_GOAL);
+                        draw_rect(sx + 10, sy + 10, 8, 8, C_FLOOR_A);
+                    }
+                    x = x + 1;
+                }
+                y = y + 1;
+            }
+            game2d_static_end();
+        }
+
+        // F1 restarts. On the clear screen Enter advances; F1 still restarts.
+        if (intent & INTENT_IME_TOGGLE) != 0 {
+            state = 0;
+            sfx_rotate();
+        }
+
+        if state == 2 {
+            clear = clear + 1;
+            if (intent & INTENT_NEWLINE) != 0 {
+                level = level + 1;
+                if level > stage_count() { level = 1; }
+                state = 0;
+            }
+        }
+
+        if state == 1 {
+            // One-level undo. It restores the complete board and counters.
+            if cp == 117 || cp == 85 {
+                if undo_ok != 0 {
+                    i = 0;
+                    while i < 90 { map[i] = undo[i]; i = i + 1; }
+                    px = undo_px; py = undo_py;
+                    steps = undo_steps; pushes = undo_pushes;
+                    undo_ok = 0; fx = 0;
+                    sfx_rotate();
+                }
+            }
+
+            dx = 0; dy = 0;
+            if (intent & INTENT_LEFT) != 0 { dx = -1; }
+            if (intent & INTENT_RIGHT) != 0 { dx = 1; }
+            if (intent & INTENT_UP) != 0 { dy = -1; }
+            if (intent & INTENT_DOWN) != 0 { dy = 1; }
+
+            if dx != 0 || dy != 0 {
+                tx = px + dx; ty = py + dy;
+                ti = ty * 10 + tx;
+                v = map[ti];
+
+                if v == 1 || v == 3 {
+                    i = 0;
+                    while i < 90 { undo[i] = map[i]; i = i + 1; }
+                    undo_px = px; undo_py = py;
+                    undo_steps = steps; undo_pushes = pushes; undo_ok = 1;
+                    px = tx; py = ty; steps = steps + 1;
+                    sfx_move();
+                } else {
+                    if v == 4 || v == 5 {
+                        bx = tx + dx; by = ty + dy;
+                        bi = by * 10 + bx;
+                        if map[bi] == 1 || map[bi] == 3 {
+                            i = 0;
+                            while i < 90 { undo[i] = map[i]; i = i + 1; }
+                            undo_px = px; undo_py = py;
+                            undo_steps = steps; undo_pushes = pushes; undo_ok = 1;
+
+                            if v == 4 { map[ti] = 1; } else { map[ti] = 3; }
+                            if map[bi] == 1 { map[bi] = 4; } else { map[bi] = 5; }
+                            px = tx; py = ty;
+                            steps = steps + 1; pushes = pushes + 1;
+                            fx = 8;
+                            sfx_lock();
+
+                            // A stage is complete when no crate remains off-goal.
+                            open = 0; i = 0;
+                            while i < 90 {
+                                if map[i] == 4 { open = open + 1; }
+                                i = i + 1;
+                            }
+                            if open == 0 {
+                                state = 2; clear = 0;
+                                sfx_clear();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tick = tick + 1;
+        if banner > 0 { banner = banner - 1; }
+        if fx > 0 { fx = fx - 1; }
+
+        // Smoothly chase the logical grid position.
+        vx = vx + (20 + px * 28 - vx + 1) / 2;
+        vy = vy + (39 + py * 28 - vy + 1) / 2;
+        shake = 0;
+        if fx > 4 {
+            if (fx & 1) == 0 { shake = -2; } else { shake = 2; }
+        }
+
+        // --- Render ---
+        num[0] = 48 + level;
+        game2d_text_set(T_STAGE, 298, 8, num, 1, C_TEXT);
+
+        // Board pieces that move: only the crates (and the crate-on-goal marker).
+        // Floor, walls, and empty-goal rings are in the retained static layer, so
+        // this per-frame pass is at most ~7 rects per crate — a handful of immediate
+        // commands instead of the whole board (KOTO-0185). Crates ride `shake` with
+        // the porter on a push; the static board stays put.
+        y = 0;
+        while y < 8 {
+            x = 0;
+            while x < 10 {
+                i = y * 10 + x;
+                v = map[i];
+                sx = 20 + x * 28 + shake;
+                sy = 39 + y * 28;
+
+                if v == 4 || v == 5 {
+                    draw_rect(sx + 4, sy + 5, 22, 22, C_SHADOW);
+                    draw_rect(sx + 2, sy + 2, 22, 22, C_CRATE_LO);
+                    draw_rect(sx + 4, sy + 4, 18, 18, C_CRATE);
+                    draw_rect(sx + 4, sy + 4, 18, 3, C_CRATE_HI);
+                    draw_rect(sx + 7, sy + 9, 12, 2, C_CRATE_LO);
+                    draw_rect(sx + 7, sy + 15, 12, 2, C_CRATE_LO);
+                    if v == 5 {
+                        draw_rect(sx + 10, sy + 10, 6, 6, C_GOAL_HI);
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+
+        // Push sparks radiate from the player for a few frames.
+        if fx > 0 {
+            draw_rect(vx - fx + shake, vy + 12, 4, 4, C_CONFETTI_A);
+            draw_rect(vx + 24 + fx + shake, vy + 8, 3, 3, C_CONFETTI_B);
+            draw_rect(vx + 10 + shake, vy - fx, 3, 3, C_CONFETTI_C);
+        }
+
+        // Porter: soft shadow, body, cap, face, and walking feet.
+        draw_rect(vx + 5 + shake, vy + 22, 20, 5, C_SHADOW);
+        draw_rect(vx + 6 + shake, vy + 8, 17, 16, C_PLAYER);
+        draw_rect(vx + 4 + shake, vy + 5, 21, 6, C_PLAYER_HI);
+        draw_rect(vx + 8 + shake, vy + 2, 13, 5, C_PLAYER);
+        draw_rect(vx + 9 + shake, vy + 13, 3, 3, C_TEXT);
+        draw_rect(vx + 18 + shake, vy + 13, 3, 3, C_TEXT);
+        if (tick & 4) == 0 {
+            draw_rect(vx + 7 + shake, vy + 23, 6, 4, C_PLAYER_HI);
+        } else {
+            draw_rect(vx + 17 + shake, vy + 23, 6, 4, C_PLAYER_HI);
+        }
+
+        // Bottom HUD values. The frame, labels, and control hint live in the
+        // retained static layer; only counters are retained text items here.
+        num[0] = 48 + (steps / 100) % 10;
+        num[1] = 48 + (steps / 10) % 10;
+        num[2] = 48 + steps % 10;
+        game2d_text_set(T_STEPS, 54, 280, num, 3, C_TEXT);
+        num[0] = 48 + (pushes / 100) % 10;
+        num[1] = 48 + (pushes / 10) % 10;
+        num[2] = 48 + pushes % 10;
+        game2d_text_set(T_PUSHES, 146, 280, num, 3, C_TEXT);
+
+        // Stage-intro ribbon slides away after loading.
+        if banner > 0 {
+            sx = 52;
+            if banner > 32 { sx = 52 + (banner - 32) * 10; }
+            draw_rect(sx, 126, 216, 52, C_TOP);
+            draw_rect(sx, 126, 216, 3, C_TOP_HI);
+            draw_text_color(sx + 22, 137, "STAGE", 5, C_DIM);
+            num[0] = 48 + level;
+            draw_text_color(sx + 118, 137, num, 1, C_TEXT);
+            draw_text_color(sx + 22, 157, "すべての箱を印へ", 24, C_TEXT);
+        }
+
+        // Completion overlay and deterministic confetti.
+        if state == 2 {
+            i = 0;
+            while i < 18 {
+                sx = (i * 47 + clear * (2 + (i % 3))) % 320;
+                sy = (i * 29 + clear * (3 + (i & 1))) % 270;
+                if i % 3 == 0 { draw_rect(sx, sy, 5, 8, C_CONFETTI_A); }
+                if i % 3 == 1 { draw_rect(sx, sy, 7, 4, C_CONFETTI_B); }
+                if i % 3 == 2 { draw_rect(sx, sy, 5, 5, C_CONFETTI_C); }
+                i = i + 1;
+            }
+            draw_rect(45, 105, 230, 90, C_TOP);
+            draw_rect(45, 105, 230, 4, C_CLEAR);
+            draw_text_color(93, 124, "お届け完了！", 18, C_TEXT);
+            if (tick & 16) == 0 {
+                draw_text_color(91, 164, "Enter 次のステージ", 24, C_GOAL_HI);
+            } else {
+                draw_text_color(91, 164, "Enter 次のステージ", 24, C_TEXT);
+            }
+        }
+
+        // Composite retained static chrome + HUD values with the immediate board,
+        // porter, sparks, and overlays.
+        game2d_present();
+        yield_frame();
+    }
+}

@@ -1,0 +1,13 @@
+# Leave the app running on a settled gameplay frame for screenshots.
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame

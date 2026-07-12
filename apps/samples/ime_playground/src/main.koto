@@ -1,0 +1,41 @@
+// IME sample: route typed keys and convert/commit/cancel intents to the host IME.
+
+fn main() {
+    buf line[96];
+
+    loop {
+        let cp = text_input();
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            exit(0);
+        }
+
+        if (intent & INTENT_SHIFT) != 0 {
+            ime_feed_key(IME_SHIFT, 0);
+        }
+        if (intent & INTENT_IME_TOGGLE) != 0 {
+            ime_feed_key(IME_TOGGLE, 0);
+        }
+        if cp != 0 {
+            ime_feed_key(IME_CHARACTER, cp);
+        }
+        if (intent & INTENT_CONVERT) != 0 {
+            ime_convert();
+        }
+        if (intent & INTENT_COMMIT) != 0 {
+            ime_feed_key(IME_COMMIT, 0);
+        }
+        if (intent & INTENT_CANCEL) != 0 {
+            ime_feed_key(IME_CANCEL, 0);
+        }
+        if (intent & INTENT_BACKSPACE) != 0 {
+            ime_feed_key(IME_BACKSPACE, 0);
+        }
+
+        draw_rect(0, 0, 320, 320, 0);
+        draw_text(16, 24, "IME display:", 12);
+        let len = ime_display(line, 96);
+        draw_text(16, 44, line, len);
+        yield_frame();
+    }
+}

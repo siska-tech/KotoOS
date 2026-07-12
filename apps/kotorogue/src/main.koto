@@ -1,0 +1,554 @@
+// dev.koto.games.kotorogue — a compact turn-based roguelike for KotoOS.
+//
+// Controls:
+//   Arrow keys   Move / bump-attack
+//   Q            Quaff a potion (heal)
+//   Enter        Start / restart (title & result screens)
+//   F1           Restart the current run
+//   F10          Exit
+//
+// Descend the dungeon by stepping onto the stairs to reach the bottom and win.
+//
+// Entities and tiles are drawn as chunky pixel-art sprites composed from
+// rectangles (no per-cell glyphs). Game-feel effects — attack impact sparks,
+// damage shake + a red hurt vignette, pickup sparkles, a flickering torch, and
+// a descend jolt — are driven by frame timers in `stats` and animate every frame
+// even though the world is strictly turn-based.
+//
+// State lives in heap buffers, not VM locals, so `main` stays well under the
+// 45 user-slot budget while the helpers below do the heavy per-turn work:
+//   map[MAP_W*MAP_H]  one byte per cell: bits0-2 type, bit3 explored, bit4 lit
+//   rooms[ROOM_MAX*4] room rectangles (rx, ry, rw, rh) for room-light visibility
+//   stats[32]         the run + effect timers (see ST_* offsets)
+//   actors            an ActorArray of monsters (x,y, state=HP, frame=type, timer=alive)
+
+const MAP_W = 20;
+const MAP_H = 15;
+const TILE = 16;
+const ROOM_MAX = 6;
+const MON_MAX = 10;
+const GOAL_DEPTH = 8;
+const START_HP = 20;
+const START_ATK = 4;
+const POTION_HEAL = 10;
+
+// Tile types (low 3 bits of a cell byte).
+const T_WALL = 0;
+const T_FLOOR = 1;
+const T_STAIRS = 2;
+const T_GOLD = 3;
+const T_POTION = 4;
+
+// stats[] field offsets.
+const ST_PX = 0;
+const ST_PY = 1;
+const ST_HP = 2;
+const ST_MAXHP = 3;
+const ST_ATK = 4;
+const ST_DEPTH = 5;
+const ST_POTIONS = 6;
+const ST_MSG = 7;
+const ST_STATE = 8;
+const ST_KILLS = 9;
+const ST_MSGVAL = 10;
+const ST_GOLD = 12;
+const ST_SEED = 14;
+// Effect / animation timers.
+const ST_SHAKE = 16;
+const ST_FLASH = 17;
+const ST_SPX = 18;
+const ST_SPY = 19;
+const ST_SPT = 20;
+const ST_SPC = 21;
+const ST_ANIM = 22;
+const ST_MSGT = 23;
+// Player slide offset in pixels (signed i16), decays to 0 — smooth tile movement
+// and the attack jab. Monsters reuse their ActorArray vx/vy for the same purpose.
+const ST_POFFX = 24;
+const ST_POFFY = 26;
+
+// Lit-area bounding box (written by reveal, read by the per-frame render so it
+// scans ~a room's worth of cells instead of the whole 300-cell map).
+const ST_LITX0 = 28;
+const ST_LITY0 = 29;
+const ST_LITX1 = 30;
+const ST_LITY1 = 31;
+
+// Movement interpolation.
+const SLIDE_STEP = 4;   // pixels per frame the slide offset decays (TILE / 4 frames)
+const LUNGE = 6;        // attack jab distance toward the target, in pixels
+
+// Game states.
+const S_TITLE = 0;
+const S_PLAY = 1;
+const S_DEAD = 2;
+const S_WIN = 3;
+
+// Palette (RGB565). Tile/entity art lives in the package image asset; these are
+// the colours used by the HUD, fog-of-war fills, and frame-timer effects.
+const C_BG = 2114;
+const C_WALLD = 10532;     // explored-but-dark wall
+const C_FLOORD = 4226;     // explored-but-dark floor
+const C_PLAYER = 65526;    // title wordmark
+const C_STAIRS = 65535;    // "descended" message
+const C_GOLD = 65152;
+const C_POTION = 62105;
+const C_PANEL = 4259;
+const C_PANELHI = 16971;
+const C_TEXT = 65535;
+const C_DIM = 31696;
+const C_BARBG = 10566;
+const C_HP = 1994;
+const C_HPLOW = 63488;
+const C_SPARK = 65497;
+const C_FLASH = 55621;     // hurt vignette
+const C_HEAL = 32756;
+
+fn gs(stats: int, f: int) -> int { return heap_get_u8(stats + f); }
+fn ss(stats: int, f: int, v: int) { heap_set_u8(stats + f, v); }
+
+fn play_bgm()   { play_bgm_asset("audio/kotorogue_bgm.kmml", 24); }
+fn sfx_step()   { play_sfx_asset("audio/kotorogue_step.kmml", 25); }
+fn sfx_hit()    { play_sfx_asset("audio/kotorogue_hit.kmml", 24); }
+fn sfx_kill()   { play_sfx_asset("audio/kotorogue_kill.kmml", 25); }
+fn sfx_gold()   { play_sfx_asset("audio/kotorogue_gold.kmml", 25); }
+fn sfx_potion() { play_sfx_asset("audio/kotorogue_potion.kmml", 27); }
+fn sfx_stairs() { play_sfx_asset("audio/kotorogue_stairs.kmml", 27); }
+fn sfx_hurt()   { play_sfx_asset("audio/kotorogue_hurt.kmml", 25); }
+fn sfx_over()   { play_sfx_asset("audio/kotorogue_over.kmml", 25); }
+fn sfx_win()    { play_sfx_asset("audio/kotorogue_win.kmml", 24); }
+
+// Linear-congruential RNG; advances and stores the seed in stats. Returns 0..m-1.
+fn rng(stats: int, m: int) -> int {
+    let s = heap_get_u16(stats + ST_SEED);
+    s = (s * 75 + 74) % 65537;
+    heap_set_u16(stats + ST_SEED, s);
+    return s % m;
+}
+
+fn iabs(v: int) -> int {
+    if v < 0 { return 0 - v; }
+    return v;
+}
+
+// Set the status message and arm its on-screen display timer.
+fn setmsg(stats: int, code: int) {
+    ss(stats, ST_MSG, code);
+    ss(stats, ST_MSGT, 90);
+}
+
+// Trigger an impact spark at cell (x,y); colour: 0 white, 1 gold, 2 heal.
+fn spark(stats: int, x: int, y: int, c: int) {
+    ss(stats, ST_SPX, x);
+    ss(stats, ST_SPY, y);
+    ss(stats, ST_SPT, 6);
+    ss(stats, ST_SPC, c);
+}
+
+// Advance the per-frame effect/animation timers (runs every frame).
+fn tick_fx(stats: int) {
+    ss(stats, ST_ANIM, (gs(stats, ST_ANIM) + 1) & 255);
+    if gs(stats, ST_SHAKE) > 0 { ss(stats, ST_SHAKE, gs(stats, ST_SHAKE) - 1); }
+    if gs(stats, ST_FLASH) > 0 { ss(stats, ST_FLASH, gs(stats, ST_FLASH) - 1); }
+    if gs(stats, ST_SPT) > 0 { ss(stats, ST_SPT, gs(stats, ST_SPT) - 1); }
+    if gs(stats, ST_MSGT) > 0 {
+        ss(stats, ST_MSGT, gs(stats, ST_MSGT) - 1);
+        if gs(stats, ST_MSGT) == 0 { ss(stats, ST_MSG, 0); }
+    }
+}
+
+// Move a signed slide offset one step toward 0 (without overshooting).
+fn decay(v: int, step: int) -> int {
+    if v > 0 { v = v - step; if v < 0 { v = 0; } }
+    else if v < 0 { v = v + step; if v > 0 { v = 0; } }
+    return v;
+}
+
+// Advance every entity's movement-interpolation offset toward its resting tile.
+// Offsets are 0 on every frame except the few after a step, so the common idle
+// frame only reads — the decay writes are skipped when already at rest.
+fn tick_slide(actors: int, n: int, stats: int) {
+    let v = heap_get_i16(stats + ST_POFFX);
+    if v != 0 { heap_set_i16(stats + ST_POFFX, decay(v, SLIDE_STEP)); }
+    v = heap_get_i16(stats + ST_POFFY);
+    if v != 0 { heap_set_i16(stats + ST_POFFY, decay(v, SLIDE_STEP)); }
+    let i = 0;
+    while i < n {
+        if actor_timer(actors, i) != 0 {
+            if actor_vx(actors, i) != 0 || actor_vy(actors, i) != 0 {
+                actor_set_vel(actors, i, decay(actor_vx(actors, i), SLIDE_STEP), decay(actor_vy(actors, i), SLIDE_STEP));
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Is (x,y) on the map and not a wall?
+fn walkable(map: int, x: int, y: int) -> int {
+    if x < 0 || x >= MAP_W || y < 0 || y >= MAP_H { return 0; }
+    if (heap_get_u8(map + y * MAP_W + x) & 7) == 0 { return 0; }
+    return 1;
+}
+
+// Index of a living monster at (x,y), or -1.
+fn monster_at(actors: int, n: int, x: int, y: int) -> int {
+    let i = 0;
+    while i < n {
+        if actor_timer(actors, i) != 0 {
+            if actor_x(actors, i) == x && actor_y(actors, i) == y { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// May a monster step onto (x,y)? Floor, not the player, not another monster.
+fn canstep(map: int, actors: int, n: int, px: int, py: int, x: int, y: int) -> int {
+    if walkable(map, x, y) == 0 { return 0; }
+    if x == px && y == py { return 0; }
+    if monster_at(actors, n, x, y) >= 0 { return 0; }
+    return 1;
+}
+
+fn mon_hp(t: int) -> int {
+    if t == 0 { return 3; }
+    if t == 1 { return 3; }
+    if t == 2 { return 5; }
+    if t == 3 { return 7; }
+    if t == 4 { return 10; }
+    return 16;
+}
+
+fn mon_atk(t: int) -> int {
+    if t == 0 { return 1; }
+    if t == 1 { return 2; }
+    if t == 2 { return 2; }
+    if t == 3 { return 3; }
+    if t == 4 { return 4; }
+    return 5;
+}
+
+// ---- Tile sprites loaded from the package image asset ----
+//
+// `sprites/kotorogue_tiles.kim` is a KIM1 strip of nineteen 16x16 RGB565 tiles
+// (8-byte header, then `tile * 512` bytes each). It is loaded once into `sheet`
+// at startup and blitted with `draw_pixels`. Tiles are opaque; entity/item tiles
+// carry the floor colour as their background, and are only drawn on lit floor.
+//
+// Five static tiles, then the player and six monsters as two animation frames
+// each (frame A / frame B), toggled by the free-running `ST_ANIM` counter so the
+// dungeon stays alive (player breath + torch, bat flap, troll arms, ...).
+
+const KIM_HDR = 8;
+const SHEET_BYTES = 9736;       // 8 + 19 * 512
+const IMG_FLOOR = 0;
+const IMG_WALL = 1;
+const IMG_STAIRS = 2;
+const IMG_GOLD = 3;
+const IMG_POTION = 4;
+const IMG_PLAYER = 5;           // frame A at 5, frame B at 6
+const IMG_MON0 = 7;             // monster tile = IMG_MON0 + type * 2 + frame
+
+fn blit(sheet: int, dx: int, dy: int, tile: int) {
+    draw_pixels(dx, dy, TILE, TILE, sheet + KIM_HDR + tile * 512, 512);
+}
+
+fn spr_spark(dx: int, dy: int, t: int, c: int) {
+    let col = C_SPARK;
+    if c == 1 { col = C_GOLD; }
+    else if c == 2 { col = C_HEAL; }
+    let r = 8 - t;
+    if r < 2 { r = 2; }
+    let cx = dx + 8;
+    let cy = dy + 8;
+    draw_rect(cx - r, cy - 1, r * 2, 2, col);
+    draw_rect(cx - 1, cy - r, 2, r * 2, col);
+    draw_rect(cx - 2, cy - 2, 4, 4, C_SPARK);
+}
+
+include "dungeon.koto";
+
+include "render.koto";
+
+// Reset the run and generate the first level.
+fn start_new(map: int, rooms: int, actors: int, stats: int, num: int) {
+    ss(stats, ST_DEPTH, 1);
+    ss(stats, ST_HP, START_HP);
+    ss(stats, ST_MAXHP, START_HP);
+    ss(stats, ST_ATK, START_ATK);
+    ss(stats, ST_POTIONS, 1);
+    ss(stats, ST_KILLS, 0);
+    ss(stats, ST_MSG, 0);
+    ss(stats, ST_MSGT, 0);
+    ss(stats, ST_MSGVAL, 0);
+    ss(stats, ST_SHAKE, 0);
+    ss(stats, ST_FLASH, 0);
+    ss(stats, ST_SPT, 0);
+    heap_set_i16(stats + ST_POFFX, 0);
+    heap_set_i16(stats + ST_POFFY, 0);
+    heap_set_u16(stats + ST_GOLD, 0);
+    ss(stats, ST_STATE, S_PLAY);
+    gen_level(map, rooms, actors, stats, 1);
+    reveal(map, rooms, ROOM_MAX, gs(stats, ST_PX), gs(stats, ST_PY), stats, 1);
+    play_bgm();
+}
+
+fn main() {
+    buf map[300];
+    buf rooms[24];
+    buf stats[32];
+    buf num[8];
+    buf sheet[9736];
+
+    let actors = actor_array_new(MON_MAX);
+    let sdirty = 0;   // rebuild the retained static layer before this render
+    let hudup = 0;    // refresh the retained HUD text items before this render
+    let proom = 0 - 2; // room index the player occupied after the last turn
+    // Load the pixel-art tile sheet from the package once; blitted every frame.
+    asset_load("sprites/kotorogue_tiles.kim", 27, sheet, SHEET_BYTES);
+    heap_set_u16(stats + ST_SEED, 7919);
+    ss(stats, ST_STATE, S_TITLE);
+    ss(stats, ST_ANIM, 0);
+
+    loop {
+        let intent = text_intent();
+        let cp = text_input();
+        if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
+
+        let st = gs(stats, ST_STATE);
+
+        if st == S_TITLE {
+            ss(stats, ST_ANIM, (gs(stats, ST_ANIM) + 1) & 255);
+            if (intent & INTENT_NEWLINE) != 0 {
+                start_new(map, rooms, actors, stats, num);
+                sdirty = 1; hudup = 1; proom = 0;   // gen_level starts the player in room 0
+            }
+            render_title(stats, sheet);
+            yield_frame();
+            continue;
+        }
+
+        if st == S_DEAD || st == S_WIN {
+            if (intent & INTENT_NEWLINE) != 0 {
+                start_new(map, rooms, actors, stats, num);
+                sdirty = 1; hudup = 1; proom = 0;   // gen_level starts the player in room 0
+            }
+            render_over(stats, num, st == S_WIN);
+            yield_frame();
+            continue;
+        }
+
+        // Playing.
+        tick_fx(stats);
+        tick_slide(actors, MON_MAX, stats);
+
+        if (intent & INTENT_IME_TOGGLE) != 0 {
+            // Restart falls through to the normal render path, which rebuilds
+            // the static layer and draws the fresh level this same frame.
+            start_new(map, rooms, actors, stats, num);
+            sdirty = 1; hudup = 1; proom = 0;   // gen_level starts the player in room 0
+        }
+
+        let acted = 0;
+        let moved = 0;
+
+        // Quaff a potion.
+        if cp == 113 || cp == 81 {
+            let pot = gs(stats, ST_POTIONS);
+            let hp = gs(stats, ST_HP);
+            let mhp = gs(stats, ST_MAXHP);
+            if pot > 0 && hp < mhp {
+                hp = hp + POTION_HEAL;
+                if hp > mhp { hp = mhp; }
+                ss(stats, ST_HP, hp);
+                ss(stats, ST_POTIONS, pot - 1);
+                setmsg(stats, 5);
+                spark(stats, gs(stats, ST_PX), gs(stats, ST_PY), 2);
+                sfx_potion();
+                acted = 1;
+            }
+        }
+
+        let dx = 0;
+        let dy = 0;
+        if (intent & INTENT_LEFT) != 0 { dx = 0 - 1; }
+        else if (intent & INTENT_RIGHT) != 0 { dx = 1; }
+        else if (intent & INTENT_UP) != 0 { dy = 0 - 1; }
+        else if (intent & INTENT_DOWN) != 0 { dy = 1; }
+
+        if dx != 0 || dy != 0 {
+            let px = gs(stats, ST_PX);
+            let py = gs(stats, ST_PY);
+            let tx = px + dx;
+            let ty = py + dy;
+            let mi = monster_at(actors, MON_MAX, tx, ty);
+            if mi >= 0 {
+                let left = actor_state(actors, mi) - gs(stats, ST_ATK);
+                // Jab toward the struck enemy, then ease back.
+                heap_set_i16(stats + ST_POFFX, dx * LUNGE);
+                heap_set_i16(stats + ST_POFFY, dy * LUNGE);
+                spark(stats, tx, ty, 0);
+                if left <= 0 {
+                    actor_set_timer(actors, mi, 0);
+                    ss(stats, ST_KILLS, gs(stats, ST_KILLS) + 1);
+                    setmsg(stats, 2);
+                    sfx_kill();
+                } else {
+                    actor_set_state(actors, mi, left);
+                    setmsg(stats, 1);
+                    sfx_hit();
+                }
+                acted = 1;
+            } else if walkable(map, tx, ty) == 1 {
+                let a = map + ty * MAP_W + tx;
+                let typ = heap_get_u8(a) & 7;
+                if typ == T_STAIRS {
+                    let d = gs(stats, ST_DEPTH);
+                    if d >= GOAL_DEPTH {
+                        ss(stats, ST_STATE, S_WIN);
+                        // The result scene owns the screen: empty the retained
+                        // layers so no fog/HUD can composite over its fill.
+                        game2d_static_begin();
+                        game2d_static_end();
+                        game2d_text_clear_all();
+                        stop_bgm();
+                        sfx_win();
+                    } else {
+                        ss(stats, ST_DEPTH, d + 1);
+                        let mhp = gs(stats, ST_MAXHP) + 2;
+                        ss(stats, ST_MAXHP, mhp);
+                        ss(stats, ST_HP, mhp);
+                        gen_level(map, rooms, actors, stats, d + 1);
+                        proom = reveal(map, rooms, ROOM_MAX, gs(stats, ST_PX), gs(stats, ST_PY), stats, 1);
+                        hudup = 1;
+                        heap_set_i16(stats + ST_POFFX, 0);
+                        heap_set_i16(stats + ST_POFFY, 0);
+                        setmsg(stats, 7);
+                        ss(stats, ST_SHAKE, 4);
+                        sdirty = 1;
+                        sfx_stairs();
+                    }
+                } else {
+                    if typ == T_GOLD {
+                        heap_set_u16(stats + ST_GOLD, heap_get_u16(stats + ST_GOLD) + 5 + rng(stats, 16));
+                        heap_set_u8(a, (heap_get_u8(a) & 248) | T_FLOOR);
+                        setmsg(stats, 3);
+                        spark(stats, tx, ty, 1);
+                        sfx_gold();
+                    } else if typ == T_POTION {
+                        ss(stats, ST_POTIONS, gs(stats, ST_POTIONS) + 1);
+                        heap_set_u8(a, (heap_get_u8(a) & 248) | T_FLOOR);
+                        setmsg(stats, 4);
+                        spark(stats, tx, ty, 2);
+                        sfx_potion();
+                    } else {
+                        sfx_step();
+                    }
+                    ss(stats, ST_PX, tx);
+                    ss(stats, ST_PY, ty);
+                    // Slide in from the old tile: start one tile back, ease to 0.
+                    heap_set_i16(stats + ST_POFFX, 0 - dx * TILE);
+                    heap_set_i16(stats + ST_POFFY, 0 - dy * TILE);
+                    acted = 1;
+                    moved = 1;
+                }
+            }
+        }
+
+        if acted == 1 && gs(stats, ST_STATE) == S_PLAY {
+            let dmg = monsters_act(map, actors, MON_MAX, stats);
+            if dmg > 0 {
+                let hp = gs(stats, ST_HP) - dmg;
+                ss(stats, ST_MSGVAL, dmg);
+                setmsg(stats, 6);
+                ss(stats, ST_SHAKE, 8);
+                ss(stats, ST_FLASH, 7);
+                if hp <= 0 {
+                    ss(stats, ST_HP, 0);
+                    ss(stats, ST_STATE, S_DEAD);
+                    ss(stats, ST_SHAKE, 12);
+                    ss(stats, ST_FLASH, 12);
+                    // Empty the retained layers for the result scene; the
+                    // death frame's lit room + full vignette carry the impact.
+                    game2d_static_begin();
+                    game2d_static_end();
+                    game2d_text_clear_all();
+                    stop_bgm();
+                    sfx_over();
+                } else {
+                    ss(stats, ST_HP, hp);
+                    sfx_hurt();
+                }
+            }
+            // Visibility bookkeeping, cheapest-first. In-place turns (attack,
+            // quaff) and steps inside the same lit room cannot change the lit
+            // set, so they skip reveal entirely. The static fog is rebuilt (a
+            // forced ~full repaint on the device) only when the room index
+            // changes — corridor steps just extend the dark trail in the map,
+            // and that trail becomes visible at the next room entry/exit
+            // instead of paying a repaint per step.
+            if moved != 0 {
+                let px2 = gs(stats, ST_PX);
+                let py2 = gs(stats, ST_PY);
+                let same = 0;
+                if proom >= 0 {
+                    let rx2 = heap_get_u8(rooms + proom * 4);
+                    let ry2 = heap_get_u8(rooms + proom * 4 + 1);
+                    if px2 >= rx2 && px2 < rx2 + heap_get_u8(rooms + proom * 4 + 2) {
+                        if py2 >= ry2 && py2 < ry2 + heap_get_u8(rooms + proom * 4 + 3) {
+                            same = 1;
+                        }
+                    }
+                }
+                if same == 0 {
+                    let ridx = 0;
+                    if proom < 0 {
+                        // Coming from a corridor the old lit set is just the
+                        // 3x3 halo around the previous cell: delta-clear it
+                        // and skip reveal's whole-window clear pass.
+                        let hy = py2 - dy - 1;
+                        while hy <= py2 - dy + 1 {
+                            let hx = px2 - dx - 1;
+                            while hx <= px2 - dx + 1 {
+                                if hx >= 0 && hx < MAP_W && hy >= 0 && hy < MAP_H {
+                                    let ha = map + hy * MAP_W + hx;
+                                    heap_set_u8(ha, heap_get_u8(ha) & 239);
+                                }
+                                hx = hx + 1;
+                            }
+                            hy = hy + 1;
+                        }
+                        ridx = reveal(map, rooms, ROOM_MAX, px2, py2, stats, 0);
+                    } else {
+                        ridx = reveal(map, rooms, ROOM_MAX, px2, py2, stats, 1);
+                    }
+                    if ridx != proom { sdirty = 1; }
+                    proom = ridx;
+                }
+            }
+            if gs(stats, ST_STATE) == S_PLAY {
+                hudup = 1;
+            } else {
+                sdirty = 0;   // died this turn: retained layers already emptied
+            }
+        }
+
+        let cur = gs(stats, ST_STATE);
+        if cur == S_WIN { continue; }   // re-dispatch: the result renders this frame
+
+        // Retained updates in the same frame as the turn that changed them.
+        // `sdirty` clears only after the build completes: if a heavy turn ever
+        // exhausts the frame fuel mid-build, the rebuild retries next frame
+        // instead of leaving a truncated static layer on screen.
+        if hudup != 0 {
+            hudup = 0;
+            hud_texts(stats, num);
+        }
+        if sdirty != 0 {
+            build_static(map, stats, num);
+            sdirty = 0;
+        }
+        render_play(map, actors, stats, num, sheet);
+        yield_frame();
+    }
+}
