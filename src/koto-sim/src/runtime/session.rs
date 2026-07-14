@@ -44,12 +44,21 @@ impl BytecodeAppSession {
         audio: Arc<Mutex<SimAudio>>,
     ) -> Result<Self, SimError> {
         let root = root.as_ref();
-        let launch = load_launch_manifest(root, app_id)?;
+        let (launch, archive) = load_launch_archive(root, app_id)?;
         if launch.runtime() != KOTORUNTIME_BYTECODE {
             return Err(SimError::InvalidRuntime);
         }
-        let mut fs = HostFs::mounted(root).map_err(|_| SimError::Io)?;
-        let bytecode = read_bytes(&mut fs, launch.entry())?;
+        let bytecode = if let Some(archive) = &archive {
+            KpaReader::new(archive.as_slice())
+                .map_err(|_| SimError::InvalidManifest)?
+                .payload_for(launch.entry())
+                .map_err(|_| SimError::InvalidManifest)?
+                .ok_or(SimError::Io)?
+                .to_vec()
+        } else {
+            let mut fs = HostFs::mounted(root).map_err(|_| SimError::Io)?;
+            read_bytes(&mut fs, launch.entry())?
+        };
         let session = BytecodeSession::new(
             &bytecode,
             RuntimeLimits::simulator_default(),
@@ -67,12 +76,21 @@ impl BytecodeAppSession {
                 return Err(SimError::AppExceedsMemoryBudget);
             }
         }
-        let host = SimRuntimeHost::with_audio_and_assets(
-            HostFs::mounted(root).map_err(|_| SimError::Io)?,
-            launch.package.app_id(),
-            Arc::clone(&audio),
-            launch.asset_paths().to_vec(),
-        )?;
+        let host = if let Some(archive) = archive {
+            SimRuntimeHost::with_audio_and_package(
+                HostFs::mounted(root).map_err(|_| SimError::Io)?,
+                launch.package.app_id(),
+                Arc::clone(&audio),
+                archive,
+            )
+        } else {
+            SimRuntimeHost::with_audio_and_assets(
+                HostFs::mounted(root).map_err(|_| SimError::Io)?,
+                launch.package.app_id(),
+                Arc::clone(&audio),
+                launch.asset_paths().to_vec(),
+            )
+        }?;
         // Initialize the heap with the const heap image (KOTO-0139): rodata becomes
         // heap[0..rodata_size]; the rest stays zeroed. The verifier has bounded
         // rodata_size <= max_heap_bytes, so this copy is in range.
@@ -176,6 +194,10 @@ impl BytecodeAppSession {
     /// `(x, y, w, h, little-endian RGB565 bytes)`.
     pub fn draw_pixels(&self) -> &[(i32, i32, i32, i32, Vec<u8>)] {
         &self.host.draw_pixels
+    }
+
+    pub fn persistent_pixels(&self) -> &[u8] {
+        &self.host.persistent_pixels
     }
 
     /// Audio actions the VM issued during the last frame (sfx/bgm/submit), for

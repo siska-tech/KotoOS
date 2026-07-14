@@ -143,11 +143,10 @@ pub static ILI9488_SPI: LcdProfile = LcdProfile {
     y_offset: 0,
     reset_low_us: 10_000,
     reset_high_us: 200_000,
-    // 62.5 MHz is the RP2040 SPI ceiling (clk_peri 125 MHz / 2). KOTO-0120 needs
-    // it to bring same-page selection redraws under the 33 ms target, since at
-    // 20 MHz raw RGB666 transfer alone was ~1.2 us/px. If the panel shows tearing
-    // or corruption at this rate, step down to 40_000_000 (still ~37 ms).
-    spi_hz: 62_500_000,
+    // RP2040 keeps its hardware-validated 62.5 MHz rate. RP2350A begins at a
+    // conservative, exactly-derived 37.5 MHz until KOTO-0205 device captures
+    // establish the panel/DMA ceiling for that MCU.
+    spi_hz: crate::board::LCD_SPI_HZ,
     madctl: 0x48,
     colmod: 0x66,
     init_commands: ILI9488_INIT,

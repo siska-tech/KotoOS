@@ -118,8 +118,9 @@ diagnostics:
   `.debug_file` entries and codegen could emit remapped `.loc`s through the
   same `SourceMap` — deliberately not done here because it would change
   committed bytecode and forfeit the byte-identical proving case.
-- **`maps` generated-stage markers:** `build_apps.py` still rewrites whatever
-  file the `maps.source` field names; that file can be an included one.
+- **`maps` assets:** `build_apps.py` validates `.map` files under `maps.dir` and
+  packages them as read-only data. It does not rewrite the entry source or any
+  included file.
 
 ## Implementation map
 

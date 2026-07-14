@@ -1,0 +1,19 @@
+{
+  "app_id": "dev.koto.samples.file-note",
+  "kind": "koto",
+  "package": "sample_file_note",
+  "name": "SDK File Note",
+  "description": "Reads and writes a note file.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

@@ -1,0 +1,25 @@
+/target/
+docs/References/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local env / logs
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Generated firmware / binaries
+*.uf2
+*.elf
+*.bin
+*.hex
+*.map
+
+# Local agent scratch
+.agents/

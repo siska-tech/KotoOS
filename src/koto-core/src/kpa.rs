@@ -120,6 +120,17 @@ impl<'a> KpaReader<'a> {
         self.header.entry_count
     }
 
+    /// Canonical JSON metadata embedded in the archive.
+    pub fn metadata(&self) -> &'a [u8] {
+        // Header validation in `new` already proved this range.
+        read_range(
+            self.bytes,
+            self.header.metadata_offset,
+            self.header.metadata_size as usize,
+        )
+        .unwrap_or(&[])
+    }
+
     pub fn entry(&self, index: u32) -> Result<KpaEntry<'a>, KpaError> {
         if index >= self.header.entry_count {
             return Err(KpaError::InvalidEntry);
@@ -176,6 +187,18 @@ impl<'a> KpaReader<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// Returns an entry payload after validating it belongs to this archive.
+    pub fn payload(&self, entry: KpaEntry<'_>) -> Result<&'a [u8], KpaError> {
+        read_range(self.bytes, entry.data_offset, entry.data_size as usize)
+    }
+
+    /// Finds and returns a package-local asset payload.
+    pub fn payload_for(&self, path: &str) -> Result<Option<&'a [u8]>, KpaError> {
+        self.find_entry(path)?
+            .map(|entry| self.payload(entry))
+            .transpose()
     }
 
     pub fn preload_window_for(

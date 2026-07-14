@@ -245,17 +245,20 @@ success shape leaks the operand stack on failure.
 | 0x16 | `game2d_present`     | none                     | none                    | Composites the retained tilemap for this frame; the device transfers only changed cells, the simulator re-emits set cells as pixel blits. |
 | 0x20 | `input_snapshot`     | none                     | `bits pressed_bits`     | Returns the frame-stable normalized button state.                         |
 | 0x21 | `text_input`         | none                     | `codepoint intent_bits` | Frame-stable typed character (`0` if none) and edit-intent flags.         |
+| 0x22 | `game2d_configure_tilemap` | `layer columns rows origin_x origin_y` | none | Clears and configures retained tilemap layer 0; active dimensions are 1..20 cells and origin is a signed pixel position (KOTO-0199). |
+| 0x23 | `draw_pixels_persistent_rgb565` | `x y w h ptr len` | none | Host ABI minor 17. Commits an RGB565 block to persistent LCD GRAM; removing the command on a later frame does not erase those pixels. |
 | 0x30 | `audio_submit_i16`   | `ptr frames channels`    | `frames_written`        | Nonblocking; may accept fewer frames. `ptr` is `frames*channels*2` LE i16 bytes. |
 | 0x31 | `play_sfx`           | `id`                     | none                    | Triggers a host-owned one-shot sound effect by id (`audio_id`).           |
 | 0x32 | `play_bgm`           | `id`                     | none                    | Legacy reserved music-id call; app BGM should use `play_bgm_asset`.        |
 | 0x33 | `stop_bgm`           | none                     | none                    | Stops the host-owned background-music track.                              |
-| 0x34 | `play_bgm_asset`     | `path_ptr path_len`      | none                    | Starts looping KotoMML from a package `audio/*.kmml` asset.               |
-| 0x35 | `play_sfx_asset`     | `path_ptr path_len`      | none                    | Plays one-shot KotoMML from a package `audio/*.kmml` asset.               |
+| 0x34 | `play_bgm_asset`     | `path_ptr path_len`      | none                    | Starts package BGM from looping KotoMML or a whole-clip infinite-loop PCM16/SLD4 KACL; large KACL payloads stream through bounded host buffers. |
+| 0x35 | `play_sfx_asset`     | `path_ptr path_len`      | none                    | Plays a one-shot Native cue (`.kmml`/KAQ1) or PCM16/SLD4 KACL clip from the app KPA; large clips stream through bounded host buffers. |
 | 0x40 | `file_open`          | `path_ptr path_len mode` | `handle`                | Path is app-virtual and resolved through sandbox identity.                |
 | 0x41 | `file_read`          | `handle dst_ptr max_len` | `bytes_read`            | Reads into app heap.                                                      |
 | 0x42 | `file_write`         | `handle src_ptr len`     | `bytes_written`         | Fails if package permissions disallow writes.                             |
 | 0x43 | `file_close`         | `handle`                 | none                    | Invalid handles fail.                                                     |
 | 0x44 | `asset_load`         | `path_ptr path_len dst_ptr dst_max` | `bytes_read`  | Copies a read-only, manifest-declared package asset into the app heap in one shot. |
+| 0x45 | `asset_load_range`   | `path_ptr path_len offset dst_ptr dst_max` | `bytes_read` | Host ABI minor 17. Copies a range of a read-only package asset into the app heap. |
 | 0x60 | `ime_feed_key`       | `kind codepoint`         | none                    | Feeds one key into the host IME+editor. `kind` is an `ime_key` value.     |
 | 0x61 | `ime_convert`        | none                     | none                    | Runs dictionary conversion on the current reading.                        |
 | 0x62 | `ime_query_line`     | `ptr max_len`            | `bytes_written`         | Serializes the IME composition line into the app heap.                    |
@@ -324,7 +327,9 @@ band, so the line being edited is never hidden under the panel.
 
 Host ABI minor version `10` adds `play_bgm_asset` (id `0x34`). App-specific
 KotoMML is shipped in the package and can be changed by rebuilding only the app
-and its assets; it is no longer compiled into the host music-id bank.
+and its assets; it is no longer compiled into the host music-id bank. The same
+call also accepts whole-clip infinite-loop PCM16/SLD4 KACL assets; oversized
+payloads are decoded through the host's bounded package-streaming path.
 
 Host ABI minor version `11` adds `play_sfx_asset` (id `0x35`). Game-specific
 effects now ship with each app; only system-shell cues remain host-owned.
@@ -340,6 +345,12 @@ proportional to what changed rather than to board fill. Tile art stays in the ap
 heap, referenced by `tile_ref` byte offset (reusing the `draw_pixels_rgb565` heap
 re-read). IDs `0x17`–`0x1F` stay reserved for the follow-up sprite/tile-define
 calls (see [GAME2D_ABI.md](GAME2D_ABI.md)).
+
+Host ABI minor versions `14` and `15` add the retained sprite/stamp and text
+layers described in [GAME2D_ABI.md](GAME2D_ABI.md). Host ABI minor version `16`
+adds `game2d_configure_tilemap` (id `0x22`, KOTO-0199): layer 0 has allocation-free
+20x20 maximum storage, while each app selects active columns/rows and a signed
+pixel origin. Apps that do not configure it keep the legacy 10x20 `(8, 0)` shape.
 
 ### Input Snapshot Fields
 

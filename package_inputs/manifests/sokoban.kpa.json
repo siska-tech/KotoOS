@@ -1,0 +1,80 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.games.sokoban",
+  "name": "倉庫番",
+  "entry": "bytecode/sokoban.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sokoban.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#EEE0B8",
+    "primary": "#344452",
+    "secondary": "#D68434",
+    "accent": "#DA3A42",
+    "highlight": "#268ABE",
+    "shadow": "#7E461E"
+  },
+  "description": "箱を印まで運ぶ定番パズル。3ステージと演出付き。",
+  "category": "ゲーム",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "assets": [
+    {
+      "path": "bytecode/sokoban.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sokoban.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "maps/01-switchback.map",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "maps/02-cross-dock.map",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "maps/03-last-mile.map",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "audio/sokoban_bgm.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/sokoban_move.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/sokoban_rotate.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/sokoban_lock.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/sokoban_clear.kmml",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

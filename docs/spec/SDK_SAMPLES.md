@@ -23,6 +23,7 @@ Use F10 or an app script containing `exit` to leave the sample.
 | IME Playground | `dev.koto.samples.ime-playground` | Typed characters and convert/commit/cancel intents routed through the host IME. | `text_input`, `text_intent`, `ime_feed_key`, `ime_convert`, `ime_display`, `draw_rect`, `draw_text`, `yield_frame`, `exit` |
 | Dirty Rects | `dev.koto.samples.dirty-rects` | A narrow redraw band plus moving rectangle for dirty-rectangle inspection. | `text_intent`, `draw_rect`, `draw_text`, `yield_frame`, `exit` |
 | Actor Array | `dev.koto.samples.actor-array` | Heap-backed actor state for a player plus NPC actors without growing user-local slots. | `actor_array_new`, `actor_set_pos`, `actor_set_vel`, `actor_x`, `actor_y`, `draw_rect`, `yield_frame`, `exit` |
+| Full Color Image Gallery | `dev.koto.samples.full-color-tile-image` | Direct conversion of four 320x320 PNGs to row-major RGB565 images, streamed up to 23 scanlines at a time with dissolve and wipe transitions. | `asset_load_range`, `draw_pixels_persistent`, `play_bgm_asset`, `yield_frame`, `exit` |
 
 The harness check:
 

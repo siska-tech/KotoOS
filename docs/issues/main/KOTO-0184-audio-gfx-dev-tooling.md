@@ -1,11 +1,16 @@
 # KOTO-0184: developer support tooling for KotoAudio / KotoGFX app work
 
-- Status: todo
+- Status: todo — design note landed (2026-07-13): the KotoIDE roadmap
+  (`docs/planning/KOTOIDE_ROADMAP.md`) ranks the candidates below and splits
+  the top ones into KOTO-0187 (sprite PNG converter/previewer), KOTO-0188
+  (`.kmml` preview player), KOTO-0189 (`.kwt` fallback made visible via
+  PCM16 bake), and KOTO-0191 (live-reload loop). **Remaining scope of this
+  issue**: the cue-table dry-run and the retained-layer inspector.
 - Type: feature
 - Priority: P2
 - Related: KOTO-0054 (asset development pipeline), KOTO-0049 (sim app dev
   experience), KOTO-0029 (KotoMML), GFX series (retained layers the tooling
-  must teach).
+  must teach), KotoIDE roadmap (`docs/planning/KOTOIDE_ROADMAP.md`).
 
 ## Goal
 

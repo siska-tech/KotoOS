@@ -146,8 +146,10 @@ The CYW43 PIO wiring and GPIO-0 LED path follow Embassy's official Pico W
 - Fast SPI attempt: 12 MHz
 - Compatibility fallback: 1 MHz after reinitializing the card
 - Filesystem: FAT16/FAT32 through `embedded-sdmmc`
-- Procedure: list `apps/` with long filenames, select the first
-  `*.kpa.json`, and stream it in 128-byte chunks over USB CDC
+- Procedure: list `apps/` with long filenames, select the first current
+  `*.kpa` package or legacy `*.kpa.json` manifest, and read it in 128-byte
+  chunks. UART0 (GP0, 115200 8N1) is always active; USB CDC is optional. Binary
+  packages report byte count and FNV-1a checksum instead of dumping binary data.
 - Expected USB identity: `KotoOS SD read probe`, serial `KOTO-0068`
 - Card model: TOSHIBA 8GB SDHC Memory Card
 - Observed capacity: 7,822,376,960 bytes

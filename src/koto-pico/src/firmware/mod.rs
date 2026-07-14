@@ -21,8 +21,6 @@ pub mod app_render;
 pub mod app_runtime;
 pub mod audio;
 pub mod audio_cues;
-#[rustfmt::skip]
-pub mod audio_cues_generated;
 pub mod config;
 pub mod diag;
 pub mod display_service;

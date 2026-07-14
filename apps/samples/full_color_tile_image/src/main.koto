@@ -1,0 +1,106 @@
+// Full-resolution RGB565 image transition gallery.
+//
+// Every source PNG remains a normal 320x320 row-major image. Eight scanlines
+// are streamed from the package at a time so audio can be serviced between
+// short SD reads while persistent blits accumulate directly in LCD GRAM.
+
+const MAP_W = 20;
+const MAP_H = 20;
+const TILE_BYTES = 512;
+const KIM_HEADER = 8;
+const BAND_H = 8;
+const BAND_BYTES = 5120;
+const IMAGE_BANDS = 40;
+const SCENE_COUNT = 4;
+const HOLD_FRAMES = 120;
+
+fn load_band(scene: int, band: int, pixels: int) -> int {
+    let offset = KIM_HEADER + band * BAND_BYTES;
+    if scene == 0 {
+        return asset_load_range("images/landscape.kim", 20, offset, pixels, BAND_BYTES);
+    }
+    if scene == 1 {
+        return asset_load_range("images/city.kim", 15, offset, pixels, BAND_BYTES);
+    }
+    if scene == 2 {
+        return asset_load_range("images/autumn.kim", 17, offset, pixels, BAND_BYTES);
+    }
+    return asset_load_range("images/space.kim", 16, offset, pixels, BAND_BYTES);
+}
+
+fn draw_image_band(scene: int, band: int, pixels: int) -> int {
+    let height = BAND_H;
+    if band == IMAGE_BANDS - 1 { height = 320 - band * BAND_H; }
+    let bytes = height * 320 * 2;
+    if load_band(scene, band, pixels) != bytes { return -1; }
+    draw_pixels_persistent(0, band * BAND_H, 320, height, pixels, bytes);
+    return 0;
+}
+
+fn clear_column(column: int, black: int) {
+    let row = 0;
+    while row < MAP_H {
+        draw_pixels_persistent(column * 16, row * 16, 16, 16, black, TILE_BYTES);
+        row = row + 1;
+    }
+}
+
+// Twenty frames of ordered dissolve. Each frame clears exactly one cell in
+// every row; multiplier 7 visits every column once before repeating.
+fn fade_step(step: int, black: int) {
+    let row = 0;
+    while row < MAP_H {
+        let column = (step * 7 + row * 3) % MAP_W;
+        draw_pixels_persistent(column * 16, row * 16, 16, 16, black, TILE_BYTES);
+        row = row + 1;
+    }
+}
+
+fn main() {
+    buf band_pixels[5120];
+    buf black_tile[512];
+
+    let scene = 0;
+    let phase = 2; // 0 hold, 1 fade/wipe out, 2 row wipe in
+    let timer = 0;
+    let step = 0;
+    let intent = 0;
+
+    play_bgm_asset("audio/gallery_music_sld4.kacl", 29);
+
+    loop {
+        intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            stop_bgm();
+            exit(0);
+        }
+
+        if phase == 0 {
+            timer = timer + 1;
+            if timer >= HOLD_FRAMES {
+                phase = 1;
+                step = 0;
+            }
+        }
+        else if phase == 1 {
+            if scene % 2 == 0 { fade_step(step, black_tile); }
+            else { clear_column(step, black_tile); }
+            step = step + 1;
+            if step >= MAP_W {
+                scene = (scene + 1) % SCENE_COUNT;
+                phase = 2;
+                step = 0;
+            }
+        }
+        else {
+            if draw_image_band(scene, step, band_pixels) < 0 { exit(2); }
+            step = step + 1;
+            if step >= IMAGE_BANDS {
+                phase = 0;
+                timer = 0;
+            }
+        }
+
+        yield_frame();
+    }
+}

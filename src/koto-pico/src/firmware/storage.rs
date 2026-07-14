@@ -5,25 +5,27 @@ use core::fmt::Write;
 use embassy_embedded_hal::SetConfig;
 use embassy_rp::spi::Config as SpiConfig;
 use embassy_rp::uart::UartTx;
-use embassy_time::Delay;
+use embassy_time::{block_for, Delay, Duration, Instant};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{
-    BlockDevice, LfnBuffer, Mode, SdCard, ShortFileName, VolumeIdx, VolumeManager,
+    Block, BlockDevice, BlockIdx, LfnBuffer, Mode, SdCard, ShortFileName, VolumeIdx, VolumeManager,
 };
 use koto_core::shell::StorageStatus;
-use koto_core::{PackageIcon, PackageInfo, PackageList, MAX_ICON_PATH_LEN, MAX_PACKAGES};
+use koto_core::{PackageIcon, PackageInfo, PackageList, MAX_PACKAGES};
 
 use crate::dashboard::LineBuffer;
 use crate::firmware::config::{
-    FirmwareClock, KICON_BYTES, MANIFEST_LFN_BYTES, MAX_MANIFEST_BYTES, SD_FALLBACK_SPI_HZ,
-    SD_FAST_SPI_HZ,
+    FirmwareClock, KICON_BYTES, MANIFEST_LFN_BYTES, MAX_MANIFEST_BYTES, SD_ACQUIRE_ATTEMPTS,
+    SD_ACQUIRE_SPI_HZ, SD_ACQUIRE_TIMEOUT_MS, SD_FALLBACK_SPI_HZ, SD_IDLE_CLOCK_BYTES,
+    SD_POWER_UP_DELAY_MS, SD_TRANSFER_SPI_HZ,
 };
 use crate::firmware::diag::{uart_log, uart_write_line};
 use crate::firmware::parse_package_summary;
 
-/// Initialize the SD card using the hardware-validated fast/fallback clock
-/// sequence. The card remains owned by the caller so its `VolumeManager` can
-/// stay alive for catalog reads and later preference writes.
+/// Acquire the SD card at the SPI-mode initialization clock, then select the
+/// fastest data clock that can still read the card's CSD. The card remains
+/// owned by the caller so its `VolumeManager` can stay alive for catalog reads
+/// and later preference writes.
 pub fn initialize_sd_card<SPI, CS>(
     sdcard: &SdCard<ExclusiveDevice<SPI, CS, Delay>, Delay>,
     uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
@@ -32,37 +34,144 @@ where
     SPI: embedded_hal::spi::SpiBus<u8> + SetConfig<Config = SpiConfig>,
     CS: embedded_hal::digital::OutputPin,
 {
-    uart_log(uart, "phase=131 sd-card-init-start clock=12000000\r\n");
-    let active_hz = match sdcard.num_bytes() {
-        Ok(_) => SD_FAST_SPI_HZ,
-        Err(_) => {
-            uart_log(uart, "phase=181 sd-fast-init-failed fallback=1000000\r\n");
-            let mut fallback = SpiConfig::default();
-            fallback.frequency = SD_FALLBACK_SPI_HZ;
-            sdcard.spi(|device| {
-                let _ = device.bus_mut().set_config(&fallback);
-            });
+    let mut line = LineBuffer::new();
+    let _ = write!(
+        line,
+        "phase=131 sd-card-init-start acquire_clock={}\r\n",
+        SD_ACQUIRE_SPI_HZ
+    );
+    uart_write_line(uart, &line);
+
+    // Make the power-up allowance local and explicit instead of relying on
+    // splash/probe delays that happen to precede this call.
+    block_for(Duration::from_millis(SD_POWER_UP_DELAY_MS));
+
+    // SD Physical Layer SPI mode requires at least 74 clocks with CS high
+    // before CMD0. Use 160 clocks for margin. ExclusiveDevice leaves CS high
+    // between transactions, so bypass its transaction wrapper for the bytes.
+    let idle = [0xff; SD_IDLE_CLOCK_BYTES];
+    let mut acquire_at = |clock: u32| -> bool {
+        let mut config = SpiConfig::default();
+        config.frequency = clock;
+        if !sdcard.spi(|device| device.bus_mut().set_config(&config).is_ok()) {
+            return false;
+        }
+        let deadline_started = Instant::now();
+        for attempt in 1..=SD_ACQUIRE_ATTEMPTS {
+            if attempt > 1 {
+                block_for(Duration::from_millis(5));
+            }
             sdcard.mark_card_uninit();
+            if !sdcard.spi(|device| device.bus_mut().write(&idle).is_ok()) {
+                return false;
+            }
             match sdcard.num_bytes() {
-                Ok(_) => SD_FALLBACK_SPI_HZ,
-                Err(_) => {
-                    uart_log(uart, "phase=191 sd-card-init-error\r\n");
-                    return None;
+                Ok(_) => {
+                    line.clear();
+                    let _ = write!(
+                        line,
+                        "phase=183 sd-acquire-ok clock={} attempt={} elapsed_ms={}\r\n",
+                        clock,
+                        attempt,
+                        deadline_started.elapsed().as_millis()
+                    );
+                    uart_write_line(uart, &line);
+                    return true;
+                }
+                Err(error) => {
+                    line.clear();
+                    let _ = write!(
+                        line,
+                        "phase=181 sd-acquire-attempt-failed clock={} attempt={} elapsed_ms={} error={:?}\r\n",
+                        clock,
+                        attempt,
+                        deadline_started.elapsed().as_millis(),
+                        error
+                    );
+                    uart_write_line(uart, &line);
                 }
             }
+            if deadline_started.elapsed() >= Duration::from_millis(SD_ACQUIRE_TIMEOUT_MS) {
+                line.clear();
+                let _ = write!(
+                    line,
+                    "phase=181 sd-acquire-timeout clock={} limit_ms={}\r\n",
+                    clock, SD_ACQUIRE_TIMEOUT_MS
+                );
+                uart_write_line(uart, &line);
+                break;
+            }
         }
+        false
     };
-    let mut line = LineBuffer::new();
-    let _ = write!(line, "phase=132 sd-card-init-ok clock={}\r\n", active_hz);
+
+    let mut acquire_hz = SD_ACQUIRE_SPI_HZ;
+    let acquired = acquire_at(SD_ACQUIRE_SPI_HZ);
+    if !acquired {
+        // The on-hand PicoCalc SD path has historically acquired reliably at
+        // 1 MHz even when 400 kHz and pre-acquisition 12 MHz both report
+        // CardNotFound. Keep that compatibility acquisition, then promote the
+        // already initialized card to a fast data clock below.
+        if !acquire_at(SD_FALLBACK_SPI_HZ) {
+            uart_log(
+                uart,
+                "phase=191 sd-card-init-error stage=compat-acquire\r\n",
+            );
+            return None;
+        }
+        acquire_hz = SD_FALLBACK_SPI_HZ;
+    }
+
+    let mut active_hz = acquire_hz;
+    let mut validation_block = [Block::new()];
+    for candidate in SD_TRANSFER_SPI_HZ {
+        let mut config = SpiConfig::default();
+        config.frequency = candidate;
+        let configured = sdcard.spi(|device| device.bus_mut().set_config(&config).is_ok());
+        let csd_ok = configured && sdcard.num_bytes().is_ok();
+        // A short CSD response can pass on a marginal clock that corrupts a
+        // full data sector. SdCard's default CRC checking makes this 512-byte
+        // boot-sector read the acceptance gate for the selected clock.
+        let sector_ok = csd_ok && sdcard.read(&mut validation_block, BlockIdx(0)).is_ok();
+        if sector_ok {
+            active_hz = candidate;
+            break;
+        }
+        line.clear();
+        let _ = write!(
+            line,
+            "phase=181 sd-transfer-clock-rejected clock={}\r\n",
+            candidate
+        );
+        uart_write_line(uart, &line);
+    }
+
+    // If every promoted clock failed, restore and validate the acquisition
+    // clock so the compatibility path remains usable.
+    if active_hz == acquire_hz {
+        let mut config = SpiConfig::default();
+        config.frequency = acquire_hz;
+        let restored = sdcard.spi(|device| device.bus_mut().set_config(&config).is_ok());
+        if !restored || sdcard.num_bytes().is_err() {
+            uart_log(uart, "phase=191 sd-card-transfer-error\r\n");
+            return None;
+        }
+    }
+    line.clear();
+    let _ = write!(
+        line,
+        "phase=132 sd-card-init-ok acquire_clock={} transfer_clock={}\r\n",
+        acquire_hz, active_hz
+    );
     uart_write_line(uart, &line);
     Some(active_hz)
 }
 
-/// Scan `APPS/*.kpa.json` into `packages`, returning the storage status. The
+/// Scan binary `APPS/*.kpa` archives into `packages`, returning the storage status. The
 /// caller owns `packages` and the scan scratch buffers (`names`, `manifest`,
 /// `lfn_storage`, `kicon`), all of which live in static or owned storage so this
 /// loader runs in a small call frame (KOTO-0121). After the manifest pass it
-/// attaches `ICONS/*.kicon` assets to the matching packages (KOTO-0122). Every
+/// reads each archive's embedded manifest and icon entries in place. Every
 /// failure mode — card absent, mount/root/APPS error, list error, malformed
 /// manifests, missing/invalid icons, or an empty catalog — leaves a usable shell
 /// state and emits a UART diagnostic.
@@ -105,7 +214,7 @@ where
         .iterate_dir_lfn(&mut lfn, |entry, long_name| {
             if name_count < names.len()
                 && !entry.attributes.is_directory()
-                && long_name.is_some_and(is_manifest_name)
+                && is_package_name(long_name, &entry.name)
             {
                 names[name_count] = Some(entry.name.clone());
                 name_count += 1;
@@ -118,9 +227,10 @@ where
         return StorageStatus::Unknown;
     }
     let mut line = LineBuffer::new();
-    let _ = write!(line, "phase=137 apps-list-ok manifests={}\r\n", name_count);
+    let _ = write!(line, "phase=137 apps-list-ok packages={}\r\n", name_count);
     uart_write_line(uart, &line);
 
+    let mut icon_count = 0usize;
     for (index, name) in names[..name_count].iter().flatten().enumerate() {
         line.clear();
         let _ = write!(line, "phase=138 manifest-read-start index={}\r\n", index);
@@ -128,12 +238,27 @@ where
         let Ok(file) = apps.open_file_in_dir(name, Mode::ReadOnly) else {
             continue;
         };
-        if file.length() as usize > MAX_MANIFEST_BYTES {
+        let mut header = [0u8; 64];
+        let mut header_len = 0usize;
+        while header_len < header.len() {
+            match file.read(&mut header[header_len..]) {
+                Ok(0) => break,
+                Ok(count) => header_len += count,
+                Err(_) => break,
+            }
+        }
+        if header_len != header.len() || &header[..4] != b"KPA1" {
+            continue;
+        }
+        let metadata_offset = u32::from_le_bytes(header[32..36].try_into().unwrap_or([0; 4]));
+        let metadata_size =
+            u32::from_le_bytes(header[36..40].try_into().unwrap_or([0; 4])) as usize;
+        if metadata_size > MAX_MANIFEST_BYTES || file.seek_from_start(metadata_offset).is_err() {
             continue;
         }
         let mut length = 0usize;
-        while !file.is_eof() && length < manifest.len() {
-            match file.read(&mut manifest[length..]) {
+        while length < metadata_size {
+            match file.read(&mut manifest[length..metadata_size]) {
                 Ok(0) => break,
                 Ok(count) => length += count,
                 Err(_) => {
@@ -142,7 +267,79 @@ where
                 }
             }
         }
-        if let Some(package) = parse_package_summary(&manifest[..length]) {
+        if let Some(mut package) = parse_package_summary(&manifest[..length]) {
+            if let Some(icon_path) = package.icon_path() {
+                let entry_count = u32::from_le_bytes(header[16..20].try_into().unwrap_or([0; 4]));
+                let table_offset = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0; 4]));
+                let strings_offset =
+                    u32::from_le_bytes(header[24..28].try_into().unwrap_or([0; 4]));
+                let mut record = [0u8; 64];
+                let mut icon_range = None;
+                for entry_index in 0..entry_count {
+                    if file
+                        .seek_from_start(
+                            table_offset.saturating_add(entry_index.saturating_mul(64)),
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let mut got = 0usize;
+                    while got < record.len() {
+                        match file.read(&mut record[got..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => got += count,
+                        }
+                    }
+                    if got != record.len() {
+                        break;
+                    }
+                    let path_offset = u32::from_le_bytes(record[0..4].try_into().unwrap_or([0; 4]));
+                    let path_len =
+                        u32::from_le_bytes(record[4..8].try_into().unwrap_or([0; 4])) as usize;
+                    if path_len > lfn_storage.len() {
+                        continue;
+                    }
+                    if file
+                        .seek_from_start(strings_offset.saturating_add(path_offset))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let mut path_got = 0usize;
+                    while path_got < path_len {
+                        match file.read(&mut lfn_storage[path_got..path_len]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => path_got += count,
+                        }
+                    }
+                    if path_got == path_len && lfn_storage[..path_len] == *icon_path.as_bytes() {
+                        icon_range = Some((
+                            u32::from_le_bytes(record[16..20].try_into().unwrap_or([0; 4])),
+                            u32::from_le_bytes(record[20..24].try_into().unwrap_or([0; 4]))
+                                as usize,
+                        ));
+                        break;
+                    }
+                }
+                if let Some((offset, size)) = icon_range.filter(|(_, size)| *size <= kicon.len()) {
+                    if file.seek_from_start(offset).is_ok() {
+                        let mut got = 0usize;
+                        while got < size {
+                            match file.read(&mut kicon[got..size]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => got += count,
+                            }
+                        }
+                        if got == size {
+                            if let Ok(icon) = PackageIcon::from_kicon_text(&kicon[..size]) {
+                                package.set_icon(icon);
+                                icon_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
             packages.push(package);
         }
     }
@@ -154,71 +351,6 @@ where
     );
     uart_write_line(uart, &line);
 
-    // Attach ICONS/*.kicon assets to the discovered packages (KOTO-0122). Reads
-    // are bounded and sequential into the shared `kicon` scratch; the icon theme
-    // already rode in on the manifest summary. A missing or invalid asset keeps
-    // the deterministic fallback icon from the portable shell.
-    let mut icon_count = 0usize;
-    if let Ok(icons_dir) = root.open_dir("ICONS") {
-        for index in 0..packages.len() {
-            // Copy the icon path out so the list can be re-borrowed mutably.
-            let mut path_buf = [0u8; MAX_ICON_PATH_LEN];
-            let Some(path_len) = packages
-                .get(index)
-                .and_then(PackageInfo::icon_path)
-                .map(|path| {
-                    let bytes = path.as_bytes();
-                    path_buf[..bytes.len()].copy_from_slice(bytes);
-                    bytes.len()
-                })
-            else {
-                continue;
-            };
-            let Ok(file_name) = core::str::from_utf8(&path_buf[..path_len]) else {
-                continue;
-            };
-            let file_name = file_name.rsplit('/').next().unwrap_or(file_name);
-
-            // Match the asset's long name to its 8.3 short name, then read it.
-            let mut short: Option<ShortFileName> = None;
-            let mut icon_lfn = LfnBuffer::new(lfn_storage);
-            let _ = icons_dir.iterate_dir_lfn(&mut icon_lfn, |entry, long_name| {
-                if short.is_none()
-                    && !entry.attributes.is_directory()
-                    && long_name.is_some_and(|name| name.eq_ignore_ascii_case(file_name))
-                {
-                    short = Some(entry.name.clone());
-                }
-            });
-            let Some(short) = short else {
-                continue;
-            };
-            let Ok(file) = icons_dir.open_file_in_dir(&short, Mode::ReadOnly) else {
-                continue;
-            };
-            if file.length() as usize > KICON_BYTES {
-                continue;
-            }
-            let mut length = 0usize;
-            while !file.is_eof() && length < kicon.len() {
-                match file.read(&mut kicon[length..]) {
-                    Ok(0) => break,
-                    Ok(count) => length += count,
-                    Err(_) => {
-                        length = 0;
-                        break;
-                    }
-                }
-            }
-            drop(file);
-            if let Ok(icon) = PackageIcon::from_kicon_text(&kicon[..length]) {
-                if let Some(package) = packages.get_mut(index) {
-                    package.set_icon(icon);
-                    icon_count += 1;
-                }
-            }
-        }
-    }
     line.clear();
     let _ = write!(line, "phase=140 icons-loaded count={}\r\n", icon_count);
     uart_write_line(uart, &line);
@@ -237,11 +369,15 @@ pub fn fill_fallback(packages: &mut PackageList, app_id: &str, name: &str) {
 }
 
 fn is_manifest_name(name: &str) -> bool {
-    const SUFFIX: &[u8] = b".kpa.json";
+    const SUFFIX: &[u8] = b".kpa";
     let bytes = name.as_bytes();
     bytes.len() >= SUFFIX.len()
         && bytes[bytes.len() - SUFFIX.len()..]
             .iter()
             .zip(SUFFIX)
             .all(|(actual, expected)| actual.to_ascii_lowercase() == *expected)
+}
+
+fn is_package_name(long_name: Option<&str>, short_name: &ShortFileName) -> bool {
+    long_name.is_some_and(is_manifest_name) || short_name.extension().eq_ignore_ascii_case(b"KPA")
 }

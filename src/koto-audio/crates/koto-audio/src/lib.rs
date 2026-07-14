@@ -28,10 +28,13 @@ mod decoder;
 mod event;
 mod hostcall;
 mod mixer;
+mod owned_clip;
 mod policy;
+mod runtime_cue;
 mod sequence;
 mod service;
 mod source;
+mod streaming_clip;
 
 pub use asset::{
     parse_clip_asset, AssetPlacement, ClipAssetError, ClipAssetHeader, CodecId,
@@ -58,16 +61,21 @@ pub use hostcall::{
     HostcallScope, NormalHostcallAdapter, SystemHostcallAdapter,
 };
 pub use mixer::{MixerBlock, MixerVolume, DEFAULT_MIXER_BLOCK_FRAMES};
+pub use owned_clip::OwnedClipPlayer;
 pub use policy::{AudioLimits, AudioPolicy, DropPolicy};
+pub use runtime_cue::{
+    runtime_cue_max_encoded_len, RuntimeCue, RuntimeCueError, RuntimeCueTrack, RUNTIME_CUE_MAGIC,
+    RUNTIME_CUE_VERSION,
+};
 pub use sequence::{
     validate_compact_sequence, CompactEvent, CompactInstrument, CompactSequence,
     CompactSequenceError, CompactTempo, CompactTrack, PolyphonicSequence, PolyphonicSequenceVoice,
-    Sequence, SequenceDrum, SequenceEvent, SequenceInstrument, SequenceInstrumentKind,
-    SequencePitch, SequenceTempo, SequenceWaveform, BUILTIN_INSTRUMENT_BASS_DRUM,
-    BUILTIN_INSTRUMENT_CLAP, BUILTIN_INSTRUMENT_CLOSED_HI_HAT, BUILTIN_INSTRUMENT_CRASH_CYMBAL,
-    BUILTIN_INSTRUMENT_OPEN_HI_HAT, BUILTIN_INSTRUMENT_SAW, BUILTIN_INSTRUMENT_SAW_FAST,
-    BUILTIN_INSTRUMENT_SNARE_DRUM_1, BUILTIN_INSTRUMENT_SNARE_DRUM_2, BUILTIN_INSTRUMENT_SQUARE,
-    BUILTIN_INSTRUMENT_SQUARE_FAST, BUILTIN_INSTRUMENT_SYNTH_TOM_HIGH,
+    RuntimeCuePlayer, Sequence, SequenceDrum, SequenceEvent, SequenceInstrument,
+    SequenceInstrumentKind, SequencePitch, SequenceTempo, SequenceWaveform,
+    BUILTIN_INSTRUMENT_BASS_DRUM, BUILTIN_INSTRUMENT_CLAP, BUILTIN_INSTRUMENT_CLOSED_HI_HAT,
+    BUILTIN_INSTRUMENT_CRASH_CYMBAL, BUILTIN_INSTRUMENT_OPEN_HI_HAT, BUILTIN_INSTRUMENT_SAW,
+    BUILTIN_INSTRUMENT_SAW_FAST, BUILTIN_INSTRUMENT_SNARE_DRUM_1, BUILTIN_INSTRUMENT_SNARE_DRUM_2,
+    BUILTIN_INSTRUMENT_SQUARE, BUILTIN_INSTRUMENT_SQUARE_FAST, BUILTIN_INSTRUMENT_SYNTH_TOM_HIGH,
     BUILTIN_INSTRUMENT_SYNTH_TOM_LOW, BUILTIN_INSTRUMENT_SYNTH_TOM_MID,
     BUILTIN_INSTRUMENT_TRIANGLE, BUILTIN_INSTRUMENT_TRIANGLE_FAST, BUILTIN_SEQUENCE_INSTRUMENTS,
     MAX_SEQUENCE_VOICES, SEQUENCE_REPEAT_INFINITE,
@@ -77,6 +85,7 @@ pub use service::{
     DEFAULT_SERVICE_SOURCE_QUEUE, DEFAULT_SERVICE_SOURCE_RECORDS,
 };
 pub use source::{SourceGeneration, SourceId, SourceOwner};
+pub use streaming_clip::StreamingClipDecoder;
 
 /// Result type used by public KotoAudio operations.
 pub type AudioResult<T> = core::result::Result<T, AudioError>;

@@ -1,8 +1,8 @@
 # Sokoban stage maps
 
-Each `*.txt` file is one stage, authored as a 10x8 ASCII tilemap (10 columns,
+Each `*.map` file is one stage, authored as a 10x8 ASCII tilemap (10 columns,
 8 rows). Stages load in filename order, so the numeric prefix sets the level
-number (`01-*.txt` is stage 1).
+number (`01-*.map` is stage 1).
 
 Glyphs:
 
@@ -18,10 +18,10 @@ Glyphs:
 
 Each map must be exactly 10 columns x 8 rows and contain exactly one `@`.
 
-These files are the single source of truth. The build step embeds them into
-`src/main.koto` (the generated `stage_data()` block) and decodes them at
-runtime, so **adding a stage is just dropping a new `NN-name.txt` here and
-running**:
+These files are the single source of truth. The build validates and stores them
+as read-only KPA data assets; the app selects a package path, loads it with
+`asset_load`, and decodes LF/CRLF-separated rows at runtime. Add the new path to
+`load_stage`, update `stage_count`, then run:
 
 ```
 python harness/build_apps.py

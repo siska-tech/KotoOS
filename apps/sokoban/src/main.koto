@@ -54,21 +54,16 @@ fn sfx_rotate() { play_sfx_asset("audio/sokoban_rotate.kmml", 25); }
 fn sfx_lock() { play_sfx_asset("audio/sokoban_lock.kmml", 23); }
 fn sfx_clear() { play_sfx_asset("audio/sokoban_clear.kmml", 24); }
 
-// === BEGIN GENERATED STAGES (apps/sokoban/maps/*.txt) — do not edit by hand ===
-// Regenerate with: python harness/build_apps.py
-fn stage_count() -> int {
-    return 3;
-}
+fn stage_count() -> int { return 3; }
 
-fn stage_data(level: int) -> int {
-    if level == 1 { return "###########...#.o..##.O...o..##..##O#..##.O..o...##...@....##........###########"; }   // 01-switchback.txt
-    if level == 2 { return "###########.o....o.##.O....O.##..###...##.#.#.#..##.O..@O..##.o....o.###########"; }   // 02-cross-dock.txt
-    if level == 3 { return "###########.o....o.##..O.O...##..###...##.#.#.#..##.O..@O..##.o....o.###########"; }   // 03-last-mile.txt
-    return "###########...#.o..##.O...o..##..##O#..##.O..o...##...@....##........###########";
+fn load_stage(level: int, raw: int, max: int) -> int {
+    if level == 2 { return asset_load("maps/02-cross-dock.map", 22, raw, max); }
+    if level == 3 { return asset_load("maps/03-last-mile.map", 21, raw, max); }
+    return asset_load("maps/01-switchback.map", 22, raw, max);
 }
-// === END GENERATED STAGES ===
 
 fn main() {
+    buf raw_map[96];
     buf map[90];
     buf undo[90];
     buf num[3];
@@ -109,27 +104,30 @@ fn main() {
     let shake = 0;
     let open = 0;
     let c = 0;
-    let sdat = 0;
+    let loaded = 0;
+    let raw_i = 0;
 
     loop {
         intent = text_intent();
         cp = text_input();
         if (intent & INTENT_EXIT) != 0 { stop_bgm(); exit(0); }
 
-        // Build the selected stage by decoding its ASCII tilemap (10x8,
-        // row-major). The maps live in apps/sokoban/maps/*.txt and are embedded
-        // at build time as the generated stage_data() strings above; this keeps
-        // level data out of the program logic so stages are easy to add.
+        // Load the selected package-authored ASCII tilemap (10x8, row-major).
+        // Both LF and CRLF row separators are accepted and skipped.
         // Glyphs: '#' wall, '.' floor, 'o' goal, 'O' crate, '*' crate on goal,
         // '@' porter start (floor underneath), space void.
         if state == 0 {
             i = 0;
             while i < 90 { map[i] = 0; undo[i] = 0; i = i + 1; }
 
-            sdat = stage_data(level);
+            loaded = load_stage(level, raw_map, 96);
+            if loaded < 0 { exit(2); }
             i = 0;
-            while i < 80 {
-                v = heap_get_u8(sdat + i);
+            raw_i = 0;
+            while raw_i < loaded && i < 80 {
+                v = heap_get_u8(raw_map + raw_i);
+                raw_i = raw_i + 1;
+                if v == 10 || v == 13 { continue; }
                 c = 1;                                // '.' floor
                 if v == 35 { c = 2; }                 // '#' wall
                 if v == 111 { c = 3; }                // 'o' goal
@@ -140,6 +138,7 @@ fn main() {
                 map[i] = c;
                 i = i + 1;
             }
+            if i != 80 { exit(2); }
 
             steps = 0; pushes = 0; undo_ok = 0; fx = 0; clear = 0;
             vx = 20 + px * 28; vy = 39 + py * 28;

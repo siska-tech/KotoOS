@@ -38,7 +38,7 @@ with the immediate list on top:
 ```
 base clear
   → static/BG layer     (KOTO-0136, retained command list; chrome/grid/fixed labels)
-  → tile layer(s)       (KOTO-0135 board generalized; grid of 16×16 cells)
+  → tile layer          (KOTO-0199: configurable grid of 16×16 cells, max 20×20)
   → sprite layer        (NEW, KOTO-0140; placed instances of stamps)
   → text layer          (NEW, KOTO-0141; retained strings, dirty-on-change)
   → immediate list      (debug / overlay / transition / fallback only)
@@ -50,7 +50,7 @@ and the Shell all map onto it without any Tetris- or app-specific host API:
 | App element | Layer | Primitive |
 | :-- | :-- | :-- |
 | background / well / grid / panel frame / fixed labels | static | `game2d_static_begin/end` (existing) |
-| board / map / floor / locked cells | tile | `tile_set` / `tile_fill` / `tile_clear` |
+| board / map / floor / locked cells | tile | `configure_tilemap` / `tile_set` / `tile_clear` |
 | active piece / ghost / cursor / actor / icon / highlight / effect | sprite | `sprite_set` / `sprite_hide` |
 | score / level / lines / menu / status / memo status | text | `text_set` / `text_hide` |
 | transitions, debug overlays, one-off custom pixels | immediate | `draw_rect` / `draw_text` / `draw_pixels_rgb565` |

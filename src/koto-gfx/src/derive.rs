@@ -15,8 +15,7 @@
 //! in [`crate::FullRepaintPolicy`] — this module only *collects* dirty rects.
 
 use crate::layer::{
-    AppDrawCommand, Game2dSprite, Game2dStampDef, Game2dText, GAME2D_ORIGIN_X, GAME2D_ORIGIN_Y,
-    GAME2D_TILE_PX,
+    AppDrawCommand, Game2dSprite, Game2dStampDef, Game2dText, Game2dTilemap, GAME2D_TILE_PX,
 };
 use crate::{coalesce_rects, FullRepaintPolicy, Rect, TileBand};
 
@@ -87,12 +86,98 @@ pub fn command_dirty_rect(
     surf_w: i32,
     surf_h: i32,
 ) -> Option<Rect> {
+    if crate::is_persistent_pixels(old) {
+        return command_rect(new, surf_w, surf_h);
+    }
     union_or_either(
         command_rect(old, surf_w, surf_h),
         command_rect(new, surf_w, surf_h),
         surf_w,
         surf_h,
     )
+}
+
+/// Whether a scene contains any retained content that must be composited on its
+/// first present. Immediate commands are deliberately excluded: a no-base app
+/// that only uses the legacy immediate list keeps its direct per-command first
+/// present path, while any retained layer opts into whole-stack composition.
+pub fn has_retained_scene_content(
+    static_commands: &[AppDrawCommand],
+    board: &Game2dTilemap,
+    sprites: &[Game2dSprite],
+    text_items: &[Game2dText],
+) -> bool {
+    !static_commands.is_empty()
+        || (0..usize::from(board.rows)).any(|row| {
+            (0..usize::from(board.columns))
+                .any(|column| board.cells[Game2dTilemap::cell_index(column, row)] >= 0)
+        })
+        || sprites.iter().any(|sprite| sprite.visible)
+        || text_items.iter().any(|item| item.visible)
+}
+
+/// Collect every on-screen footprint that must be composed when a retained
+/// scene is first presented over the host-owned empty (black) app surface.
+///
+/// This is an explicit empty-scene-to-current-scene derivation: static and
+/// immediate commands contribute their current footprint, populated board
+/// cells contribute one tile rect, and visible sprites/text contribute their
+/// resolved footprint. The caller owns capacity, coalescing, and repaint policy;
+/// overflow is surfaced rather than silently dropping any initial pixels.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_initial_scene_dirty(
+    static_commands: &[AppDrawCommand],
+    board: &Game2dTilemap,
+    sprites: &[Game2dSprite],
+    stamps: &[Game2dStampDef],
+    text_items: &[Game2dText],
+    immediate_commands: &[AppDrawCommand],
+    heap: &[u8],
+    surf_w: i32,
+    surf_h: i32,
+    dirty: &mut [Rect],
+    len: &mut usize,
+    area: &mut u32,
+    overflow: &mut bool,
+) {
+    for command in static_commands
+        .iter()
+        .chain(immediate_commands.iter())
+        .copied()
+    {
+        if let Some(rect) = command_dirty_rect(AppDrawCommand::Empty, command, surf_w, surf_h) {
+            push_dirty(dirty, len, area, overflow, rect);
+        }
+    }
+
+    for row in 0..usize::from(board.rows) {
+        for column in 0..usize::from(board.columns) {
+            if board.cells[Game2dTilemap::cell_index(column, row)] < 0 {
+                continue;
+            }
+            if let Some(rect) = Rect::clip(
+                i32::from(board.origin_x) + column as i32 * GAME2D_TILE_PX,
+                i32::from(board.origin_y) + row as i32 * GAME2D_TILE_PX,
+                GAME2D_TILE_PX,
+                GAME2D_TILE_PX,
+                surf_w,
+                surf_h,
+            ) {
+                push_dirty(dirty, len, area, overflow, rect);
+            }
+        }
+    }
+
+    for sprite in sprites {
+        if let Some(rect) = sprite_footprint_rect(sprite, stamps, heap, surf_w, surf_h) {
+            push_dirty(dirty, len, area, overflow, rect);
+        }
+    }
+    for item in text_items {
+        if let Some(rect) = text_footprint_rect(item, surf_w, surf_h) {
+            push_dirty(dirty, len, area, overflow, rect);
+        }
+    }
 }
 
 /// Cap on the aligned immediate-diff edit region (GFX-0008). A length shift whose
@@ -380,12 +465,29 @@ pub fn collect_immediate_dirty(
 /// Pixel rect of a coalesced board band on the app surface, or `None` if it falls
 /// fully off-screen (KOTO-0135/0143). The band is in cell units; scale by the tile
 /// size and offset by the board origin, then clip.
-pub fn board_band_rect(band: TileBand, surf_w: i32, surf_h: i32) -> Option<Rect> {
+pub fn board_band_rect(
+    band: TileBand,
+    tilemap: &Game2dTilemap,
+    surf_w: i32,
+    surf_h: i32,
+) -> Option<Rect> {
     Rect::clip(
-        GAME2D_ORIGIN_X + band.col as i32 * GAME2D_TILE_PX,
-        GAME2D_ORIGIN_Y + band.row as i32 * GAME2D_TILE_PX,
+        i32::from(tilemap.origin_x) + band.col as i32 * GAME2D_TILE_PX,
+        i32::from(tilemap.origin_y) + band.row as i32 * GAME2D_TILE_PX,
         band.w as i32 * GAME2D_TILE_PX,
         band.h as i32 * GAME2D_TILE_PX,
+        surf_w,
+        surf_h,
+    )
+}
+
+/// Pixel bounds of the active tilemap rectangle, clipped to the surface.
+pub fn tilemap_bounds_rect(tilemap: &Game2dTilemap, surf_w: i32, surf_h: i32) -> Option<Rect> {
+    Rect::clip(
+        i32::from(tilemap.origin_x),
+        i32::from(tilemap.origin_y),
+        i32::from(tilemap.columns) * GAME2D_TILE_PX,
+        i32::from(tilemap.rows) * GAME2D_TILE_PX,
         surf_w,
         surf_h,
     )
@@ -672,7 +774,128 @@ mod tests {
     }
 
     #[test]
+    fn immediate_only_scene_does_not_opt_into_retained_first_present() {
+        let board = Game2dTilemap::legacy();
+        assert!(!has_retained_scene_content(&[], &board, &[], &[]));
+
+        let immediate = [AppDrawCommand::Rect {
+            x: 1,
+            y: 2,
+            w: 3,
+            h: 4,
+            rgb565: 0x1234,
+        }];
+        // Immediate commands are intentionally not an input: their legacy
+        // no-base first-present path remains selected when retained state is empty.
+        assert!(!has_retained_scene_content(&[], &board, &[], &[]));
+        assert_eq!(immediate.len(), 1);
+    }
+
+    #[test]
+    fn initial_scene_collects_staged_board_and_every_layer_class() {
+        let mut board = Game2dTilemap::legacy();
+        board.columns = 20;
+        board.rows = 20;
+        board.origin_x = 0;
+        board.origin_y = 0;
+        for index in 0..50 {
+            let row = index / 20;
+            let column = index % 20;
+            board.cells[Game2dTilemap::cell_index(column, row)] = 0;
+        }
+
+        let static_commands = [AppDrawCommand::Rect {
+            x: 200,
+            y: 200,
+            w: 8,
+            h: 8,
+            rgb565: 1,
+        }];
+        let immediate = [AppDrawCommand::Rect {
+            x: 220,
+            y: 220,
+            w: 8,
+            h: 8,
+            rgb565: 2,
+        }];
+        let heap = single_cell_heap();
+        let stamps = [stamp(0, 1)];
+        let sprites = [sprite(0, 160, 160, true)];
+        let text_items = [text(0, 180, true)];
+        assert!(has_retained_scene_content(
+            &static_commands,
+            &board,
+            &sprites,
+            &text_items
+        ));
+
+        let mut dirty = [Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        }; 64];
+        let (mut len, mut area, mut overflow) = (0usize, 0u32, false);
+        collect_initial_scene_dirty(
+            &static_commands,
+            &board,
+            &sprites,
+            &stamps,
+            &text_items,
+            &immediate,
+            &heap,
+            SURF,
+            SURF,
+            &mut dirty,
+            &mut len,
+            &mut area,
+            &mut overflow,
+        );
+
+        assert_eq!(len, 54); // 50 board + static + sprite + text + immediate
+        assert!(!overflow);
+        assert_eq!(area, 50 * 16 * 16 + 8 * 8 + 16 * 16 + 320 * 17 + 8 * 8);
+        assert!(dirty[..len].contains(&Rect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16
+        }));
+        assert!(dirty[..len].contains(&Rect {
+            x: 144,
+            y: 32,
+            w: 16,
+            h: 16
+        }));
+        assert!(dirty[..len].contains(&Rect {
+            x: 160,
+            y: 160,
+            w: 16,
+            h: 16
+        }));
+        assert!(dirty[..len].contains(&Rect {
+            x: 0,
+            y: 180,
+            w: 320,
+            h: 17
+        }));
+        assert!(dirty[..len].contains(&Rect {
+            x: 200,
+            y: 200,
+            w: 8,
+            h: 8
+        }));
+        assert!(dirty[..len].contains(&Rect {
+            x: 220,
+            y: 220,
+            w: 8,
+            h: 8
+        }));
+    }
+
+    #[test]
     fn board_band_rect_scales_and_offsets() {
+        let tilemap = Game2dTilemap::legacy();
         let band = TileBand {
             col: 1,
             row: 2,
@@ -681,7 +904,7 @@ mod tests {
         };
         // origin (8,0) + (16,32), size (48,64).
         assert_eq!(
-            board_band_rect(band, SURF, SURF),
+            board_band_rect(band, &tilemap, SURF, SURF),
             Some(Rect {
                 x: 24,
                 y: 32,
@@ -696,7 +919,44 @@ mod tests {
             w: 1,
             h: 1,
         };
-        assert_eq!(board_band_rect(off, SURF, SURF), None);
+        assert_eq!(board_band_rect(off, &tilemap, SURF, SURF), None);
+    }
+
+    #[test]
+    fn tilemap_rects_use_configured_shape_and_origin() {
+        let mut tilemap = Game2dTilemap::legacy();
+        tilemap.columns = 20;
+        tilemap.rows = 12;
+        tilemap.origin_x = -16;
+        tilemap.origin_y = 24;
+        assert_eq!(
+            tilemap_bounds_rect(&tilemap, SURF, SURF),
+            Some(Rect {
+                x: 0,
+                y: 24,
+                w: 304,
+                h: 192
+            })
+        );
+        assert_eq!(
+            board_band_rect(
+                TileBand {
+                    col: 2,
+                    row: 3,
+                    w: 4,
+                    h: 2
+                },
+                &tilemap,
+                SURF,
+                SURF,
+            ),
+            Some(Rect {
+                x: 16,
+                y: 72,
+                w: 64,
+                h: 32
+            })
+        );
     }
 
     #[test]

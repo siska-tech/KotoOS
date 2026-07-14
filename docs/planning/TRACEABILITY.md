@@ -15,6 +15,8 @@ This document maps research findings into requirement areas so design drift is v
 | Battery through STM32 | FR-SHELL-5, FR-SDK-7, NFR-REL-4 | Must degrade cleanly when unavailable; hardware validation is tracked by [KOTO-0115](../issues/main/KOTO-0115-pico-probe-battery-power-status.md). |
 | Rust implementation policy | FR-SIM-5, NFR-PORT-1, NFR-PORT-5, NFR-DEV-4 | Rust is the primary language; C/C++ use is isolated behind FFI. |
 | RP2040 HAL backend choice | NFR-PORT-3, NFR-PORT-5, NFR-DEV-1, NFR-DEV-2 | `embassy-rp` first backend; bring-up probes in [RP2040_BRINGUP.md](../hardware/RP2040_BRINGUP.md). |
+| RP2350 / Pico 2 module compatibility | FR-SDK-8, NFR-PORT-4, NFR-PORT-6, NFR-DEV-5 | Active compatibility work is split into build profiles and device parity in [RP2350_SUPPORT_ROADMAP.md](RP2350_SUPPORT_ROADMAP.md). |
+| Pico Plus 2(W) onboard QMI PSRAM | FR-RT-6, NFR-MEM-6, NFR-PORT-6 | Prefer module PSRAM behind the existing bounded HAL contract, with PicoCalc PSRAM fallback; tracked by [KOTO-0206](../issues/main/KOTO-0206-pico-plus-2-onboard-psram.md). |
 | P/ECE and DOS/VGA influence | FR-DOS-1, FR-DOS-2, NFR-DRAW-3 | Treated as app/runtime modes, not full emulation goals. |
 | Scanline sprite composition | FR-PM-1, FR-PM-2, HC-1, NFR-DRAW-1 | PicoMings uses scanline tile and sprite composition as defined in [PICOMINGS_SPRITE_MODEL.md](../spec/PICOMINGS_SPRITE_MODEL.md). |
 | TiPO/BTRON influence | FR-IME-3, FR-FS-2 | Fixed IME line and data containment influence UI and FS. |

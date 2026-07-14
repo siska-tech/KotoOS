@@ -283,8 +283,8 @@ mod tests {
     fn light_frame_is_fully_admitted_with_no_pressure() {
         // A handful of actors, some text, a backdrop — well under the cap.
         let mut commands = vec![rect(240, 4)]; // CoreGameplay backdrop
-        commands.extend(core::iter::repeat(rect(14, 14)).take(8)); // Actors
-        commands.extend(core::iter::repeat(text()).take(3)); // CriticalUi
+        commands.extend(core::iter::repeat_n(rect(14, 14), 8)); // Actors
+        commands.extend(core::iter::repeat_n(text(), 3)); // CriticalUi
         let obs = BudgetObservation::observe(&APP_DRAW_BUDGET, commands.iter());
 
         assert_eq!(obs.total(), 12);
@@ -309,7 +309,7 @@ mod tests {
     fn overload_shows_pressure_but_never_admits_past_cap() {
         // A flood of tiny particle squares: they share a floored pool, so the budget
         // would degrade/reject the tail well before the hard cap.
-        let commands: Vec<AppDrawCommand> = core::iter::repeat(rect(4, 4)).take(200).collect();
+        let commands: Vec<AppDrawCommand> = core::iter::repeat_n(rect(4, 4), 200).collect();
         let obs = BudgetObservation::observe(&APP_DRAW_BUDGET, commands.iter());
 
         assert_eq!(obs.total(), 200);
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn observation_is_deterministic() {
-        let commands = vec![rect(240, 4), rect(14, 14), rect(4, 4), text()];
+        let commands = [rect(240, 4), rect(14, 14), rect(4, 4), text()];
         let a = BudgetObservation::observe(&APP_DRAW_BUDGET, commands.iter());
         let b = BudgetObservation::observe(&APP_DRAW_BUDGET, commands.iter());
         assert_eq!(a.total(), b.total());

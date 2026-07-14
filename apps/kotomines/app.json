@@ -1,0 +1,59 @@
+{
+  "app_id": "dev.koto.games.kotomines",
+  "kind": "koto",
+  "package": "kotomines",
+  "name": "KotoMines",
+  "description": "9×9と16×16で遊べる、旗とタイマー付きマインスイーパー。",
+  "category": "ゲーム",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#F7F1DE",
+    "primary": "#344452",
+    "secondary": "#9CB4A6",
+    "accent": "#E34A4A",
+    "highlight": "#F6C236",
+    "shadow": "#17222B"
+  },
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "codegen": {
+    "comment": "KOTO-0156 model (applied after the KotoShogi refill fix): the size menu ends in `continue` so outline_cold_blocks relocates it to the tail, and relocate_preamble pulls the steady play loop toward word 0 so its walk stays a short monotone tile sequence.",
+    "relocate_preamble": true,
+    "outline_cold_blocks": true
+  },
+  "audio": [
+    {
+      "source": "audio/bgm.kmml",
+      "output": "audio/kotomines_bgm.kmml"
+    },
+    {
+      "source": "audio/move.kmml",
+      "output": "audio/kotomines_move.kmml"
+    },
+    {
+      "source": "audio/rotate.kmml",
+      "output": "audio/kotomines_rotate.kmml"
+    },
+    {
+      "source": "audio/lock.kmml",
+      "output": "audio/kotomines_lock.kmml"
+    },
+    {
+      "source": "audio/clear.kmml",
+      "output": "audio/kotomines_clear.kmml"
+    },
+    {
+      "source": "audio/over.kmml",
+      "output": "audio/kotomines_over.kmml"
+    }
+  ]
+}

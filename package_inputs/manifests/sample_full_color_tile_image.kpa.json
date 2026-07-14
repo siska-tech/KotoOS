@@ -1,0 +1,56 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.samples.full-color-tile-image",
+  "name": "SDK Full Color Image Gallery",
+  "entry": "bytecode/sample_full_color_tile_image.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample_full_color_tile_image.kicon",
+  "description": "Streams four full-resolution 320x320 RGB565 images with dissolve and wipe transitions.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_full_color_tile_image.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample_full_color_tile_image.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "images/landscape.kim",
+      "type": "image",
+      "sequential": true
+    },
+    {
+      "path": "images/city.kim",
+      "type": "image",
+      "sequential": true
+    },
+    {
+      "path": "images/autumn.kim",
+      "type": "image",
+      "sequential": true
+    },
+    {
+      "path": "images/space.kim",
+      "type": "image",
+      "sequential": true
+    },
+    {
+      "path": "audio/gallery_music_sld4.kacl",
+      "type": "audio",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

@@ -131,7 +131,7 @@ impl<H: PsramHal> PsramBlocks<H> {
 /// runs from cache again. An app whose whole code fits one tile loads on the
 /// first miss and never refills, matching pre-PSRAM behavior for small apps.
 ///
-/// Two cache shapes share this type (KOTO-0173):
+/// Multiple cache shapes share this type (KOTO-0173):
 ///
 /// - [`Self::new`] — one tile spanning the whole `window` buffer (the historical
 ///   single-tile shape; the host/sim/test call sites keep it).
@@ -141,6 +141,9 @@ impl<H: PsramHal> PsramBlocks<H> {
 ///   instead of refilling on every crossing. Sequential fetches still check the
 ///   MRU slot first, so the straight-line hot path costs the same compares as
 ///   the single-tile shape.
+/// - [`Self::new_with_slots`] — the buffer split into a board-selected number
+///   of equal resident tiles (up to [`MAX_CODE_WINDOW_SLOTS`]) with LRU
+///   replacement. RP2350A uses three 16-KiB slots while RP2040 retains two.
 ///
 /// History: the first 2-tile attempt (KOTO-0131) coincided with a KotoBlocks
 /// launch hang and was reverted (KOTO-0134). KOTO-0170/0172 later measured the
@@ -152,18 +155,18 @@ pub struct PsramCodeWindow<'a, H> {
     window: &'a mut [u8],
     base_addr: u32,
     code_words: u32,
-    /// Tile size in code words: the whole `window` for [`Self::new`], half of it
-    /// for [`Self::new_two_tile`]. Tile indices in the diagnostics are
-    /// `base_word / tile_words`.
+    /// Tile size in code words: `window / slots`. Tile indices in diagnostics
+    /// are `base_word / tile_words`.
     tile_words: u32,
-    /// Resident tile slots actually in use (1 or 2). Slot 1 stays permanently
-    /// empty in the single-tile shape, so the lookup path needs no branch on it.
+    /// Resident tile slots actually in use.
     slots: usize,
     /// Per-slot first cached code word.
-    slot_base_word: [u32; 2],
+    slot_base_word: [u32; MAX_CODE_WINDOW_SLOTS],
     /// Per-slot valid word count (`0` = empty/invalidated).
-    slot_len_words: [u32; 2],
-    /// Most-recently-used slot; the other slot is the refill victim (LRU).
+    slot_len_words: [u32; MAX_CODE_WINDOW_SLOTS],
+    /// Slots ordered MRU first and LRU last. Entries beyond `slots` are unused.
+    slot_order: [usize; MAX_CODE_WINDOW_SLOTS],
+    /// Most-recently-used slot, cached for the fetch hot path and diagnostics.
     mru_slot: usize,
     /// Window refills since the last [`CodeSource::reset_fetch_metrics`] — the
     /// per-frame code-fetch thrash counter (KOTO-0134).
@@ -216,6 +219,9 @@ const CODE_TILE_BUCKETS: usize = 32;
 /// dominant pairs, so a small table captures it; a many-tile walk overflows it
 /// (visible as low, even per-bucket counts in the histogram instead).
 const CODE_TRANS_SLOTS: usize = 8;
+/// Maximum bounded resident CodeWindow slots. Four keeps lookup/storage costs
+/// fixed and covers the RP2350A three-tile working set with one growth slot.
+pub const MAX_CODE_WINDOW_SLOTS: usize = 4;
 
 impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
     /// Wrap a PSRAM-resident code segment of `code_words` words based at
@@ -245,6 +251,19 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
         Self::with_slots(psram, window, base_addr, code_words, 2)
     }
 
+    /// Wrap the code segment with `slots` equal resident tiles and LRU
+    /// replacement. The bounded implementation supports 1 through
+    /// [`MAX_CODE_WINDOW_SLOTS`]; values outside that range are clamped.
+    pub fn new_with_slots(
+        psram: &'a mut PsramBlocks<H>,
+        window: &'a mut [u8],
+        base_addr: u32,
+        code_words: u32,
+        slots: usize,
+    ) -> Self {
+        Self::with_slots(psram, window, base_addr, code_words, slots)
+    }
+
     fn with_slots(
         psram: &'a mut PsramBlocks<H>,
         window: &'a mut [u8],
@@ -252,6 +271,7 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
         code_words: u32,
         slots: usize,
     ) -> Self {
+        let slots = slots.clamp(1, MAX_CODE_WINDOW_SLOTS);
         let tile_words = ((window.len() / 4) / slots) as u32;
         Self {
             psram,
@@ -260,8 +280,9 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
             code_words,
             tile_words,
             slots,
-            slot_base_word: [0; 2],
-            slot_len_words: [0; 2],
+            slot_base_word: [0; MAX_CODE_WINDOW_SLOTS],
+            slot_len_words: [0; MAX_CODE_WINDOW_SLOTS],
+            slot_order: [0, 1, 2, 3],
             mru_slot: 0,
             refills: 0,
             tiles_touched: 0,
@@ -319,6 +340,21 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
         slot * (self.tile_words as usize) * 4
     }
 
+    /// Promote `slot` to MRU while preserving relative recency of other slots.
+    #[inline(always)]
+    fn promote(&mut self, slot: usize) {
+        let mut position = 0;
+        while position < self.slots && self.slot_order[position] != slot {
+            position += 1;
+        }
+        while position > 0 {
+            self.slot_order[position] = self.slot_order[position - 1];
+            position -= 1;
+        }
+        self.slot_order[0] = slot;
+        self.mru_slot = slot;
+    }
+
     /// Snapshot current window addressing state for launch/read diagnostics.
     /// Reports the most-recently-used tile; capacity is the tile size (equal to
     /// the whole buffer in the single-tile shape).
@@ -345,6 +381,21 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
         self.psram
     }
 
+    /// Capacity of the shared copy-only PSRAM backing code and runtime assets.
+    pub fn psram_capacity(&self) -> u32 {
+        self.psram.capacity()
+    }
+
+    /// Reads a non-code runtime asset from PSRAM without exposing a pointer.
+    pub fn psram_read(&mut self, address: u32, dst: &mut [u8]) -> Result<(), PsramError> {
+        self.psram.read(address, dst)
+    }
+
+    /// Writes a pointer-free runtime asset beside the staged app code.
+    pub fn psram_write(&mut self, address: u32, src: &[u8]) -> Result<(), PsramError> {
+        self.psram.write(address, src)
+    }
+
     /// Refill the LRU slot with the tile containing `index` and make it the MRU
     /// slot. Returns `false` if the PSRAM transfer fails (only the victim slot
     /// is invalidated — the other resident tile stays servable) or the window
@@ -358,11 +409,9 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
         let count = tile_words.min(self.code_words - base_word);
         let byte_len = (count as usize) * 4;
         let addr = self.base_addr + base_word * 4;
-        let victim = if self.slots == 2 {
-            1 - self.mru_slot
-        } else {
-            0
-        };
+        let victim = (0..self.slots)
+            .find(|slot| self.slot_len_words[*slot] == 0)
+            .unwrap_or(self.slot_order[self.slots - 1]);
         let dst_start = self.slot_byte_offset(victim);
         // Bracket the synchronous PSRAM transfer with the installed clock (KOTO-0132
         // phase 1): on the device this is the single blocking refill cost the VM pays
@@ -382,7 +431,7 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
         self.cw_refill_bytes = self.cw_refill_bytes.saturating_add(byte_len as u32);
         self.slot_base_word[victim] = base_word;
         self.slot_len_words[victim] = count;
-        self.mru_slot = victim;
+        self.promote(victim);
         // Account the refill for the per-frame thrash diagnostic (KOTO-0134): one
         // tile transfer, and which tile, so a `main`<->helper ping-pong shows many
         // refills across few distinct tiles.
@@ -404,10 +453,14 @@ impl<'a, H: PsramHal> PsramCodeWindow<'a, H> {
         if self.slot_hit(self.mru_slot, index) {
             return Some(self.mru_slot);
         }
-        let other = 1 - self.mru_slot;
-        if self.slot_hit(other, index) {
-            self.mru_slot = other;
-            return Some(other);
+        let mut position = 1;
+        while position < self.slots {
+            let slot = self.slot_order[position];
+            if self.slot_hit(slot, index) {
+                self.promote(slot);
+                return Some(slot);
+            }
+            position += 1;
         }
         if self.refill(index) {
             Some(self.mru_slot)
@@ -720,6 +773,33 @@ mod tests {
             assert_eq!(code.word(i), Some(word_bytes(i)));
         }
         assert_eq!(code.word(code_words), None);
+    }
+
+    #[test]
+    fn three_tile_cache_keeps_three_region_cycle_resident() {
+        // 16 words split across four logical 4-word tiles. A three-region
+        // 0->1->2 cycle fills exactly three slots, then remains refill-free.
+        let code_words = 16u32;
+        let mut psram = staged_code(code_words);
+        let mut window = [0u8; 48];
+        let mut code = PsramCodeWindow::new_with_slots(&mut psram, &mut window, 0, code_words, 3);
+
+        for _ in 0..8 {
+            assert_eq!(code.word(0), Some(word_bytes(0)));
+            assert_eq!(code.word(4), Some(word_bytes(4)));
+            assert_eq!(code.word(8), Some(word_bytes(8)));
+        }
+        assert_eq!(code.fetch_refills(), 3);
+        assert_eq!(code.fetch_distinct_tiles(), 3);
+
+        // A fourth tile evicts only the LRU slot; the two newer tiles stay hot.
+        assert_eq!(code.word(12), Some(word_bytes(12)));
+        assert_eq!(code.fetch_refills(), 4);
+        assert_eq!(code.word(4), Some(word_bytes(4)));
+        assert_eq!(code.word(8), Some(word_bytes(8)));
+        assert_eq!(code.fetch_refills(), 4);
+        assert_eq!(code.word(0), Some(word_bytes(0)));
+        assert_eq!(code.fetch_refills(), 5);
     }
 
     #[test]

@@ -12,3 +12,4 @@ serde_json = "1"
 [dev-dependencies]
 koto-compiler = { path = "../koto-compiler" }
 koto-sim = { path = "../../src/koto-sim" }
+kpa-packer = { path = "../kpa-packer" }

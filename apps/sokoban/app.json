@@ -1,0 +1,56 @@
+{
+  "app_id": "dev.koto.games.sokoban",
+  "kind": "koto",
+  "package": "sokoban",
+  "name": "倉庫番",
+  "description": "箱を印まで運ぶ定番パズル。3ステージと演出付き。",
+  "category": "ゲーム",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#EEE0B8",
+    "primary": "#344452",
+    "secondary": "#D68434",
+    "accent": "#DA3A42",
+    "highlight": "#268ABE",
+    "shadow": "#7E461E"
+  },
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "maps": {
+    "dir": "maps",
+    "width": 10,
+    "height": 8,
+    "glyphs": "#.oO*@ "
+  },
+  "audio": [
+    {
+      "source": "audio/bgm.kmml",
+      "output": "audio/sokoban_bgm.kmml"
+    },
+    {
+      "source": "audio/move.kmml",
+      "output": "audio/sokoban_move.kmml"
+    },
+    {
+      "source": "audio/rotate.kmml",
+      "output": "audio/sokoban_rotate.kmml"
+    },
+    {
+      "source": "audio/lock.kmml",
+      "output": "audio/sokoban_lock.kmml"
+    },
+    {
+      "source": "audio/clear.kmml",
+      "output": "audio/sokoban_clear.kmml"
+    }
+  ]
+}

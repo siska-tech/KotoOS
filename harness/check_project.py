@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import struct
 import sys
 from pathlib import Path
 from urllib.parse import unquote
@@ -17,7 +18,11 @@ FIXTURE_LAYOUT = ROOT / "harness" / "fixtures" / "sample_app.layout.csv"
 NON_MONOTONIC_LAYOUT = ROOT / "harness" / "fixtures" / "non_monotonic.layout.csv"
 ASSET_PIPELINE_FIXTURE = ROOT / "harness" / "fixtures" / "asset_pipeline"
 SDCARD_APPS = ROOT / "sdcard_mock" / "apps"
+PACKAGE_MANIFESTS = ROOT / "package_inputs" / "manifests"
+PACKAGE_INPUTS = ROOT / "package_inputs"
 CARGO_ROOT = ROOT / "Cargo.toml"
+KOTO_PICO_SRC = ROOT / "src" / "koto-pico" / "src"
+BOARD_SRC = KOTO_PICO_SRC / "board"
 KPA_REQUIRED_KEYS = ["format", "version", "app_id", "name", "entry", "runtime", "assets", "permissions"]
 
 REQ_ID_RE = re.compile(r"\b(?:HC-\d+|FR-[A-Z]+-\d+|NFR-[A-Z]+-\d+)\b")
@@ -206,6 +211,7 @@ def validate_kpa_manifest(
     manifest: dict[str, object],
     asset_root: Path,
     errors: list[str],
+    app_dir: Path | None = None,
 ) -> None:
     rel = manifest_path.relative_to(ROOT)
     for key in KPA_REQUIRED_KEYS:
@@ -235,8 +241,17 @@ def validate_kpa_manifest(
         if Path(path).is_absolute() or ".." in Path(path).parts:
             errors.append(f"{rel} asset {index} path must stay under sdcard_mock: {path}")
             continue
+        if path in asset_paths:
+            errors.append(f"{rel} contains duplicate asset path: {path}")
         asset_paths.add(path)
         asset_file = asset_root / path
+        if (
+            not asset_file.exists()
+            and app_dir is not None
+            and asset.get("type") == "data"
+            and path.endswith(".map")
+        ):
+            asset_file = app_dir / path
         if not asset_file.exists():
             errors.append(f"{rel} references missing asset: {path}")
             continue
@@ -382,10 +397,20 @@ def check_sdcard_mock(errors: list[str]) -> None:
         errors.append(f"missing simulator app directory: {SDCARD_APPS.relative_to(ROOT)}")
         return
 
-    manifests = sorted(SDCARD_APPS.glob("*.kpa.json"))
+    manifests = sorted(PACKAGE_MANIFESTS.glob("*.kpa.json"))
     if not manifests:
-        errors.append(f"no simulator manifests in {SDCARD_APPS.relative_to(ROOT)}")
+        errors.append(f"no package manifests in {PACKAGE_MANIFESTS.relative_to(ROOT)}")
         return
+
+    app_dirs: dict[str, Path] = {}
+    for descriptor_path in sorted((ROOT / "apps").glob("**/app.json")):
+        try:
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        package = descriptor.get("package")
+        if isinstance(package, str):
+            app_dirs[package] = descriptor_path.parent
 
     for manifest_path in manifests:
         try:
@@ -393,7 +418,31 @@ def check_sdcard_mock(errors: list[str]) -> None:
         except json.JSONDecodeError as exc:
             errors.append(f"invalid JSON in {manifest_path.relative_to(ROOT)}: {exc}")
             continue
-        validate_kpa_manifest(manifest_path, manifest, SDCARD_APPS.parent, errors)
+        package_stem = manifest_path.name.removesuffix(".kpa.json")
+        app_dir = app_dirs.get(package_stem)
+        validate_kpa_manifest(manifest_path, manifest, PACKAGE_INPUTS, errors, app_dir)
+        package_path = SDCARD_APPS / f"{package_stem}.kpa"
+        if app_dir is not None and package_path.exists():
+            try:
+                payloads = read_kpa_payloads(package_path)
+                for asset in manifest.get("assets", []):
+                    if (
+                        isinstance(asset, dict)
+                        and asset.get("type") == "data"
+                        and isinstance(asset.get("path"), str)
+                        and asset["path"].endswith(".map")
+                    ):
+                        source = app_dir / asset["path"]
+                        if payloads.get(asset["path"]) != source.read_bytes():
+                            errors.append(
+                                f"{package_path.relative_to(ROOT)} map payload differs from "
+                                f"{source.relative_to(ROOT)}"
+                            )
+            except (OSError, ValueError, struct.error) as exc:
+                errors.append(f"invalid KPA map payloads in {package_path.relative_to(ROOT)}: {exc}")
+    packages = sorted(SDCARD_APPS.glob("*.kpa"))
+    if len(packages) != len(manifests) - int((PACKAGE_MANIFESTS / "sample_app.kpa.json").exists()):
+        errors.append("binary KPA count does not match registered package manifests")
         if manifest.get("app_id") == "dev.koto.memo":
             if manifest.get("runtime") != "kotoruntime-bytecode":
                 errors.append(f"{manifest_path.relative_to(ROOT)} must use kotoruntime-bytecode")
@@ -402,6 +451,31 @@ def check_sdcard_mock(errors: list[str]) -> None:
             permissions = manifest.get("permissions")
             if not isinstance(permissions, dict) or permissions.get("fs") != "sandbox":
                 errors.append(f"{manifest_path.relative_to(ROOT)} must request sandbox fs permission")
+
+
+def read_kpa_payloads(path: Path) -> dict[str, bytes]:
+    """Read package path->payload pairs for app-source parity checks."""
+    data = path.read_bytes()
+    if len(data) < 64 or data[:4] != b"KPA1":
+        raise ValueError("bad KPA1 header")
+    entry_count, table_offset, string_offset, string_size = struct.unpack_from("<IIII", data, 16)
+    if string_offset + string_size > len(data):
+        raise ValueError("string table outside package")
+    payloads: dict[str, bytes] = {}
+    for index in range(entry_count):
+        entry = table_offset + index * 64
+        if entry + 64 > len(data):
+            raise ValueError("entry table outside package")
+        path_offset, path_len = struct.unpack_from("<II", data, entry)
+        data_offset, data_size = struct.unpack_from("<II", data, entry + 16)
+        start = string_offset + path_offset
+        end = start + path_len
+        payload_end = data_offset + data_size
+        if end > string_offset + string_size or payload_end > len(data):
+            raise ValueError("entry range outside package")
+        package_path = data[start:end].decode("utf-8")
+        payloads[package_path] = data[data_offset:payload_end]
+    return payloads
 
 
 def check_rust_workspace(errors: list[str]) -> None:
@@ -427,6 +501,22 @@ def check_rust_workspace(errors: list[str]) -> None:
                 errors.append(f"Cargo workspace missing member {member}")
 
 
+def check_board_boundary(errors: list[str]) -> None:
+    """Keep physical GPIO type names inside the selected board adapter."""
+    if not BOARD_SRC.exists():
+        errors.append(f"missing board profile directory: {BOARD_SRC.relative_to(ROOT)}")
+        return
+    pin_type = re.compile(r"\bPIN_\d+\b")
+    for path in sorted(KOTO_PICO_SRC.rglob("*.rs")):
+        if BOARD_SRC in path.parents:
+            continue
+        if pin_type.search(path.read_text(encoding="utf-8")):
+            errors.append(
+                "board GPIO type escaped src/koto-pico/src/board: "
+                f"{path.relative_to(ROOT)}"
+            )
+
+
 def main() -> int:
     # Windows consoles may default to a legacy code page (e.g. cp932) that
     # cannot encode characters quoted from the docs; never let that mask the
@@ -442,6 +532,7 @@ def main() -> int:
     check_asset_pipeline(errors)
     check_sdcard_mock(errors)
     check_rust_workspace(errors)
+    check_board_boundary(errors)
 
     if errors:
         print("KotoOS harness: FAIL")
@@ -461,6 +552,7 @@ def main() -> int:
     print(f"- checked {ASSET_PIPELINE_FIXTURE.relative_to(ROOT)}")
     print(f"- checked {SDCARD_APPS.relative_to(ROOT)}")
     print(f"- checked {CARGO_ROOT.relative_to(ROOT)}")
+    print("- checked koto-pico board/GPIO boundary")
     return 0
 
 

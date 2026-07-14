@@ -4,12 +4,16 @@ members = [
     "src/koto-gfx",
     "src/koto-game2d",
     "src/koto-pico",
+    "src/koto-psram",
     "src/koto-sim",
     "src/koto-vm",
     "tools/kbc-asm",
     "tools/koto-audio-gen",
     "tools/koto-compiler",
     "tools/koto-app-scaffold",
+    "tools/koto-img",
+    "tools/koto-lsp",
+    "tools/koto-mml",
     "tools/kpa-packer",
 ]
 # KOTO-0180: koto-audio is vendored from its sibling repo (subtree merge under
@@ -31,6 +35,9 @@ default-members = [
     "tools/koto-audio-gen",
     "tools/koto-compiler",
     "tools/koto-app-scaffold",
+    "tools/koto-img",
+    "tools/koto-lsp",
+    "tools/koto-mml",
     "tools/kpa-packer",
 ]
 resolver = "2"
@@ -38,7 +45,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.1.0"
+version = "0.2.0"
 
 # KOTO-0176: deterministic release code layout. At the default
 # codegen-units=16 with no LTO, firmware function layout reshuffles per build

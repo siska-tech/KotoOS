@@ -30,12 +30,26 @@ pub const KEYBOARD_REGISTER_SETTLE_US: u64 = 250;
 pub const BATTERY_REGISTER_SETTLE_US: u64 = 16_000;
 pub const POWER_POLL_MS: u64 = 5_000;
 pub const MAX_EVENTS_PER_FRAME: usize = 4;
-// Validated SD init strategy (KOTO-0068 sd-read probe): attempt the fast clock,
-// then reconfigure the bus and retry once at the conservative fallback clock.
-// Reproducing both stages — not a single fixed clock — is what reliably mounts
-// the physical PicoCalc card.
-pub const SD_FAST_SPI_HZ: u32 = 12_000_000;
+// SD SPI mode requires card acquisition at no more than 400 kHz. Once acquired,
+// validate progressively slower data clocks without resetting the card back
+// into its acquisition sequence (KOTO-0207).
+pub const SD_ACQUIRE_SPI_HZ: u32 = 400_000;
+pub const SD_POWER_UP_DELAY_MS: u64 = 20;
+pub const SD_ACQUIRE_TIMEOUT_MS: u64 = 500;
+pub const SD_ACQUIRE_ATTEMPTS: u32 = 2;
+pub const SD_IDLE_CLOCK_BYTES: usize = 20;
 pub const SD_FALLBACK_SPI_HZ: u32 = 1_000_000;
+/// Post-acquisition SPI clocks, fastest first. 25 MHz is the normal-speed SD
+/// SPI ceiling; every candidate is validated with a CRC-checked sector read.
+pub const SD_TRANSFER_SPI_HZ: [u32; 7] = [
+    25_000_000,
+    20_000_000,
+    16_000_000,
+    12_000_000,
+    8_000_000,
+    4_000_000,
+    SD_FALLBACK_SPI_HZ,
+];
 pub const MAX_MANIFEST_BYTES: usize = 2304;
 // Keep the async task state modest while reducing the first build's 20 passes.
 pub const RASTER_STRIP_LINES: usize = 16;
@@ -104,11 +118,13 @@ pub const MAX_SHELL_PREFS_BYTES: usize = MAX_MANIFEST_BYTES;
 // this buffer as a plain slice, so apps with code up to
 // `CODE_WINDOW_TOTAL_BYTES` now launch without PSRAM.
 pub const CODE_WINDOW_BYTES: usize = 16 * 1024;
-// Resident tile-cache slots (KOTO-0173). 2 breaks the two-region ping-pong; more
-// slots would pay lookup cost on the fetch hot path for a pattern no current app
-// exhibits. Raising this is a deliberate-budget change (+16 KiB `.bss` each).
-pub const CODE_WINDOW_TILES: usize = 2;
+// Resident tile-cache slots (KOTO-0173). The board profile owns this memory/
+// performance tradeoff: RP2040 retains 2; RP2350A uses 3 after its measured
+// KotoRogue working set cycled across three tiles. Each slot costs 16 KiB `.bss`.
+pub const CODE_WINDOW_TILES: usize = crate::board::CODE_WINDOW_TILES;
 pub const CODE_WINDOW_TOTAL_BYTES: usize = CODE_WINDOW_BYTES * CODE_WINDOW_TILES;
+const _: () = assert!(CODE_WINDOW_TILES > 0);
+const _: () = assert!(CODE_WINDOW_TILES <= koto_core::psram::MAX_CODE_WINDOW_SLOTS);
 pub const DEVICE_CODE_CEILING: usize = 128 * 1024;
 // App heap ceiling. Each app is given a heap sized to its own KBC header request
 // (per-app profile, KOTO-0096); this static is the deliberate device ceiling that
@@ -151,15 +167,15 @@ pub const DEVICE_VM_CALL_DEPTH: usize = 4;
 // (96), so the command-list sizing and every diagnostic are unchanged; the budget
 // model itself is not yet consulted on the draw path.
 pub const MAX_APP_DRAW_COMMANDS: usize = koto_gfx::APP_DRAW_BUDGET.total_commands();
-// KOTO-0135 Game2D board tilemap layer geometry: 10x20 cells of 16x16 px at the
-// KotoBlocks well origin (8, 0). The host retains this layer across frames (it
+// KOTO-0199 Game2D tilemap capacity: 20x20 cells of 16x16 px. Each app configures
+// its active dimensions and origin; legacy apps default to 10x20 at (8, 0). The host
 // lives in `DeviceRuntimeHost`, so the two-list delta diffs it); apps write only
 // the cells that change. A cell holds the app-heap byte offset of a 16x16 RGB565
-// tile, or `-1` for empty. SRAM cost is GAME2D_BOARD_CELLS * 4 B per list = 800 B
-// (1.6 KiB across the current + previous lists), within the stack headroom note.
+// tile, or `-1` for empty. SRAM cost is 400 * 4 B per list = 1.6 KiB
+// (3.2 KiB across the current + previous lists), within the retained-layer budget.
 // The board geometry and shape now live with the retained layer data model in
 // koto-gfx (GFX-0002); re-exported here so firmware call sites are unchanged.
-pub use koto_gfx::{GAME2D_BOARD_CELLS, GAME2D_BOARD_COLS, GAME2D_BOARD_ROWS};
+pub use koto_gfx::{GAME2D_TILEMAP_MAX_CELLS, GAME2D_TILEMAP_MAX_COLS, GAME2D_TILEMAP_MAX_ROWS};
 // KOTO-0136 Game2D static/background command layer: a bounded retained list of
 // `AppDrawCommand`s the app builds once (between `game2d_static_begin`/`_end`) for
 // its page/well/grid/panel/label chrome, so that static UI no longer costs a host
@@ -211,7 +227,7 @@ pub use koto_gfx::GAME2D_TEXT_BYTES;
 // derivation in koto-gfx (GFX-0003); the tile-byte size joined them with the
 // compositor move (GFX-0004). Re-exported here so firmware call sites and
 // `GAME2D_TILE_BYTES` are unchanged.
-pub use koto_gfx::{GAME2D_ORIGIN_X, GAME2D_ORIGIN_Y, GAME2D_TILE_BYTES, GAME2D_TILE_PX};
+pub use koto_gfx::{GAME2D_TILE_BYTES, GAME2D_TILE_PX};
 // The immediate-command UTF-8 cap now lives with `AppDrawCommand` in koto-gfx
 // (GFX-0002); re-exported here.
 pub use koto_gfx::MAX_APP_TEXT_BYTES;

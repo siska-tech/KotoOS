@@ -12,9 +12,16 @@ specialized converters without changing the package contract.
 | 40x40 ASCII PBM `P1` icon | `harness/asset_pipeline.py convert-icon` | `KICON1` text bitmap | `icons/*.kicon` | `image` | KotoShell launcher icon. |
 | M+ BDF bitmap font source | `harness/mplus_to_kfont.py` | `KFNT` fixed-cell bitmap font | `fonts/*.kfont` | `font` | Text renderer, IME, KotoVN text. |
 | Existing `.kfont` blob | `harness/asset_pipeline.py font-preview` | UTF-8 text preview report | `previews/*.txt` or harness-only | `data` when packaged | Host validation of metrics and Japanese sample rendering. |
-| KotoMML source | future `kotomml` compiler | compact score/event stream | `audio/*.kmml` or `audio/*.kaud` | `audio` | Audio mixer playback. |
+| `.map` text tilemap | `harness/build_apps.py` validation | Packaged source bytes | `maps/*.map` | `data` | App-local LF/CRLF map loaded with `asset_load`; never embedded in bytecode. |
+| Native KotoMML source | `harness/build_apps.py` | unchanged KMML on SD; runtime `KAQ1` image in PSRAM | `audio/*.kmml` | `audio` | SIM reads the mounted file; Pico compiles SD text into the owned Native KotoAudio path. |
+| Native KotoMML phrase | `koto-mml bake` | PCM16 mono `KACL` clip | `audio/*.kacl` | `audio` | Pre-rendered KotoAudio clip playback. |
+| WAV clip | `koto-audio-convert --codec pcm16\|experimental-sldpcm4` | PCM16 or SLD4 `KACL` clip | `audio/*.kacl` | `audio` | Short clips use bounded owned storage; larger clips stream incrementally from the KPA. |
 | KotoVN image source | future image codec converter | RLE/indexed image payload | `assets/*.rle` | `image` or image-specific subtype | Sequential scene image streaming. |
 | `.kspr` ASCII sprite sheet | `harness/build_apps.py` (`images` block) | `KIM1` RGB565 tile strip | `sprites/*.kim` | `image` | App `asset_load` + `draw_pixels` tile blits. |
+| PNG pixel art (any paint tool) | `koto-img png2kspr` | `.kspr` ASCII source | (source, not packaged) | — | Import path into the `.kspr` loop above. |
+| `.kspr` / `.kim` sprite sheet | `koto-img kspr2png` / `kim2png` | PNG preview | harness-only | — | Review, README shots, re-editing in a paint tool. |
+| PNG launcher icon (40×40) | `koto-img png2kicon` | `KICON1` mask source | `apps/<dir>/icon.kicon` | `image` | Import path for the app icon mask (KOTO-0196). |
+| `.kicon` launcher icon | `koto-img kicon2png` | PNG preview | harness-only | — | Review / re-editing the icon mask in a paint tool. |
 | PicoMings sprite sheet source | future sprite packer | tile/sprite banks plus index | `assets/sprites/*` | `image`/`data` | Scanline sprite composition. |
 | Koto bytecode | `koto-compiler` or `kbc-asm` | `KBC1` bytecode | `bytecode/*.kbc` | `bytecode` | Runtime entry or support modules. |
 
@@ -63,12 +70,13 @@ python harness\asset_pipeline.py verify-layout `
 
 App tile/sprite art is authored as a reviewable ASCII `.kspr` source and compiled
 to a binary `KIM1` strip by `harness/build_apps.py`. An app registers it with an
-`images` block (mirroring the `maps`/`assets` blocks) in `apps/apps.json`:
+`images` block (mirroring the `maps`/`audio` blocks) in its `apps/<dir>/app.json`
+descriptor — app-relative source, package-local output:
 
 ```json
 "images": [
-  { "source": "apps/kotorogue/sprites/tiles.kspr",
-    "output": "sdcard_mock/sprites/kotorogue_tiles.kim" }
+  { "source": "sprites/tiles.kspr",
+    "output": "sprites/kotorogue_tiles.kim" }
 ]
 ```
 
@@ -88,6 +96,32 @@ the app can pull it into its heap with [`asset_load`](../spec/KOTO_SDK.md) and b
 16×16 tile from byte offset `8 + tile * 512` with `draw_pixels`. `draw_pixels` is
 opaque, so entity/item tiles carry their floor background and are only drawn over
 lit floor. `build_apps.py --check` fails if a committed `.kim` is stale.
+
+### PNG import/export (`koto-img`, KOTO-0187)
+
+Sprite art does not have to be typed as ASCII: `tools/koto-img` converts
+between PNG and the formats above, so sheets can be drawn in Aseprite or any
+paint tool and committed as reviewable `.kspr` text.
+
+```powershell
+cargo run -p koto-img -- png2kspr art/tiles.png apps/myapp/sprites/tiles.kspr
+cargo run -p koto-img -- kspr2png apps/myapp/sprites/tiles.kspr preview.png
+cargo run -p koto-img -- kim2png  sdcard_mock/sprites/myapp_tiles.kim preview.png
+```
+
+- **`png2kspr`** slices a PNG (width and height must be non-zero multiples of
+  16, all pixels fully opaque) into 16×16 tiles, left-to-right then
+  top-to-bottom, and emits deterministic `.kspr` text. Colors are kept exact —
+  an image with more distinct colors than the palette alphabet (65 characters)
+  is rejected, never quantized.
+- **`kspr2png` / `kim2png`** render what the device blits: palette colors are
+  truncated to RGB565 exactly as `build_apps.py` packs them, then expanded to
+  8-bit by bit replication. Because that expansion is idempotent, a
+  `kspr2png` → edit → `png2kspr` cycle recompiles to a **byte-identical
+  `.kim`** for untouched pixels (palette characters and tile names are
+  regenerated, so the `.kspr` text itself may differ). The crate's tests pin
+  this round-trip and byte-parity with `build_apps.py` on the KotoRogue sheet.
+
 
 ## Harness Coverage
 

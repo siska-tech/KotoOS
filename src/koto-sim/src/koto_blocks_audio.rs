@@ -1,9 +1,8 @@
-//! KotoBlocks ↔ koto-audio bridge: the M13 generated-sequence workflow.
+//! SIM bridge for built-in KotoAudio cues.
 //!
 //! This is the **primary** KotoOS audio path (KOTO-0162): the KotoAudio bounded
-//! runtime driving generated compact sequences and authored SFX. The runtime KotoMML
-//! synth and `.kwt` loader in [`crate::audio`] are the deprecated **legacy** path (see
-//! `docs/architecture/AUDIO_DEPRECATION_POLICY.md`). New music/SFX belong here, not there.
+//! runtime driving host-owned fixed cues. Package KMML is handled by the owned
+//! runtime-cue path in `SimAudio`, after reading the mounted SD payload.
 //!
 //! An *additive* integration of the `koto-audio` bounded audio runtime: its mixed
 //! output is folded into `SimAudio`'s single stream. For the full picture —
@@ -12,33 +11,19 @@
 //!
 //! # Responsibilities
 //!
-//! This module is the **SIM-side bridge** between KotoBlocks game-audio events and
-//! the bounded [`koto_audio::AudioService`]. It owns:
+//! This module is the **SIM-side bridge** between app audio events and the bounded
+//! [`koto_audio::AudioService`]. It owns:
 //!
-//! * the **generated BGM sequence**: the static [`CompactSequence`] table
-//!   `BLOCKS_LIKE_BGM_COMPACT`, adapted once into a looping [`PolyphonicSequence`];
-//! * the small **authored SFX cues** ([`SeqSfx`]) as static [`Sequence`] tables
-//!   played on the SFX bus;
+//! * generic [`PolyphonicSequence`] BGM and [`Sequence`] SFX playback;
 //! * the **SimAudio merge**: the service mixes fixed blocks into a shared queue via
 //!   [`BlockSink`], and [`KotoBlocksAudio::mix_into`] folds that queue additively
 //!   into `SimAudio`'s single output stream.
 //!
 //! # What this module is *not*
 //!
-//! * **Not** a runtime `.kmml` parser. The BGM table is generated *offline* by
-//!   `koto-audio-tools` and vendored here; the SFX are hand-authored Rust. The
-//!   runtime KotoMML synth used by every other app lives in [`crate::audio`].
-//! * **Not** a `.kwt` wavetable loader. BGM/SFX use koto-audio's built-in voices.
-//! * **Not** the hostcall dispatcher. KotoBlocks reaches the host as `play_bgm_asset`
-//!   / `play_sfx_asset` / `stop_bgm` hostcalls on the `audio/koto_blocks_*.kmml`
-//!   asset paths; `runtime::host` performs the dispatch. The *route table* that maps
-//!   those paths to primary cues ([`primary_audio_route`] / [`PrimaryCue`]) lives
-//!   here, next to the cues it names, so the host has no `.kmml` magic strings of its
-//!   own. Every non-KotoBlocks audio-asset hostcall keeps the legacy MML path.
-//!
-//! The koto-audio crate is used unchanged; the existing SimAudio MML synth, raw-PCM
-//! (`audio_submit_i16`) path, PCM16 clip path, and every non-KotoBlocks app keep
-//! their current behavior.
+//! * **Not** the package `.kmml` loader. `SimRuntimeHost` reads and compiles it.
+//! * BGM/SFX use koto-audio's built-in voices and runtime-ready assets.
+//! * **Not** the hostcall dispatcher.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -110,72 +95,6 @@ impl SeqSfx {
             SeqSfx::GameOver => OVER_SEQ,
         }
     }
-}
-
-// --- Primary audio route table (KOTO-0164) --------------------------------
-//
-// The **primary audio path** for an app is a small route table mapping asset
-// paths to primary KotoAudio cues. An app declares audio assets in its manifest
-// and triggers them with `play_bgm_asset` / `play_sfx_asset`; the host looks the
-// path up here and drives the bounded [`KotoBlocksAudio`] bridge, **without
-// reading the asset payload**. The asset path is a *routing key*, not a
-// compatibility format — the `.kmml` extension is legacy naming, kept only so the
-// manifest permission check (`asset_paths`) passes; the audio itself is the
-// generated / authored Rust tables in this module.
-//
-// New apps that want the primary path register a route table like the KotoBlocks
-// one below. Today KotoBlocks is the only registered app, so the table is a set
-// of `const`s plus one lookup function rather than a per-app registry — but the
-// shape (path key → [`PrimaryCue`]) is what a future per-app registry would hold
-// one entry of per app. A path with no route falls through to the deprecated
-// legacy MML path in `runtime::host` (see `docs/architecture/PRIMARY_AUDIO_CUE_MODEL.md`); new
-// apps must not rely on that fallback.
-
-/// KotoBlocks primary-audio asset paths (routing keys). These mirror the Pico
-/// firmware `KOTO_BLOCKS_*_ASSET` constants so the SIM and device route the same
-/// keys; keep the two in sync (and with the routing table in
-/// `docs/architecture/PRIMARY_AUDIO_CUE_MODEL.md`).
-pub const KOTO_BLOCKS_BGM_ASSET: &str = "audio/koto_blocks_bgm.kmml";
-pub const KOTO_BLOCKS_MOVE_ASSET: &str = "audio/koto_blocks_move.kmml";
-pub const KOTO_BLOCKS_ROTATE_ASSET: &str = "audio/koto_blocks_rotate.kmml";
-pub const KOTO_BLOCKS_LOCK_ASSET: &str = "audio/koto_blocks_lock.kmml";
-pub const KOTO_BLOCKS_CLEAR_ASSET: &str = "audio/koto_blocks_clear.kmml";
-pub const KOTO_BLOCKS_TETRIS_ASSET: &str = "audio/koto_blocks_tetris.kmml";
-pub const KOTO_BLOCKS_OVER_ASSET: &str = "audio/koto_blocks_over.kmml";
-
-/// What a routed asset path plays on the primary KotoAudio path. Returned by
-/// [`primary_audio_route`] so the host can dispatch without any `.kmml` magic-string
-/// branching of its own.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrimaryCue {
-    /// Start the looping generated BGM sequence (`seq-bgm` in diagnostics).
-    Bgm,
-    /// Play a one-shot authored SFX cue (`seq-sfx` in diagnostics).
-    Sfx(SeqSfx),
-}
-
-/// The KotoBlocks route table: asset-path routing key → primary cue. Exact string
-/// match; a mistyped or renamed path returns `None` and the host falls back to the
-/// legacy MML path.
-const KOTO_BLOCKS_ROUTES: &[(&str, PrimaryCue)] = &[
-    (KOTO_BLOCKS_BGM_ASSET, PrimaryCue::Bgm),
-    (KOTO_BLOCKS_MOVE_ASSET, PrimaryCue::Sfx(SeqSfx::Move)),
-    (KOTO_BLOCKS_ROTATE_ASSET, PrimaryCue::Sfx(SeqSfx::Rotate)),
-    (KOTO_BLOCKS_LOCK_ASSET, PrimaryCue::Sfx(SeqSfx::HardDrop)),
-    (KOTO_BLOCKS_CLEAR_ASSET, PrimaryCue::Sfx(SeqSfx::LineClear)),
-    (KOTO_BLOCKS_TETRIS_ASSET, PrimaryCue::Sfx(SeqSfx::Tetris)),
-    (KOTO_BLOCKS_OVER_ASSET, PrimaryCue::Sfx(SeqSfx::GameOver)),
-];
-
-/// Resolves an audio asset `path` to its primary-audio cue, or `None` if no app
-/// route claims it (the host then takes the legacy MML path). This is the single
-/// place the SIM matches primary-audio asset paths; keeping it here localises the
-/// magic strings to the bridge module that owns the cues.
-pub fn primary_audio_route(path: &str) -> Option<PrimaryCue> {
-    KOTO_BLOCKS_ROUTES
-        .iter()
-        .find(|(key, _)| *key == path)
-        .map(|(_, cue)| *cue)
 }
 
 /// A [`koto_audio::AudioBackend`] that copies each mixed block into a shared
@@ -296,6 +215,16 @@ impl KotoBlocksAudio {
         }
     }
 
+    /// Starts a fixed static BGM cue.
+    pub fn start_bgm_cue(&mut self, sequence: &'static PolyphonicSequence<'static>) {
+        if self.bgm_started {
+            return;
+        }
+        if self.service.play_bgm_sequence(*sequence).is_ok() {
+            self.bgm_started = true;
+        }
+    }
+
     /// Stops only the BGM bus. Active SFX sources keep playing.
     pub fn stop_bgm(&mut self) {
         let _ = self.service.stop_bgm();
@@ -306,6 +235,11 @@ impl KotoBlocksAudio {
     /// drops the cue (never panics).
     pub fn sfx(&mut self, kind: SeqSfx) {
         let _ = self.service.play_sequence(kind.sequence());
+    }
+
+    /// Plays a fixed static SFX cue.
+    pub fn sfx_cue(&mut self, sequence: &'static Sequence<'static>) {
+        let _ = self.service.play_sequence(*sequence);
     }
 
     /// Sets the BGM bus gain (256 = unity).

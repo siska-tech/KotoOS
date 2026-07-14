@@ -1,20 +1,35 @@
-//! PIO-backed PicoCalc PSRAM block-transfer backend.
+//! In-tree PicoCalc PSRAM backend and diagnostic implementation.
 //!
-//! The PIO protocol is adapted from Ian Scott's MIT-licensed
-//! `rp2040-psram` implementation. This backend intentionally exposes only
-//! copies between PSRAM and caller-owned SRAM buffers.
+//! This backend is retained for legacy, diagnostic, and feature-specific
+//! code paths. The default product-firmware backend uses the Rust
+//! `koto-psram` driver through `psram_ext`:
+//! https://github.com/siska-tech/koto-psram
+//!
+//! The PIO protocol used by this backend is adapted from Ian Scott's
+//! MIT-licensed `rp2040-psram` implementation.
+//!
+//! PicoCalc-specific QPI initialization and diagnostic experiments in this
+//! file were informed by JBlanked's Picoware project:
+//! https://github.com/jblanked/Picoware/
+//!
+//! This backend intentionally exposes only copies between PSRAM and
+//! caller-owned SRAM buffers.
 
 #[cfg(feature = "psram_qpi_backend")]
 use embassy_rp::gpio::Level;
 use embassy_rp::{
     gpio::{Drive, SlewRate},
-    pac, peripherals,
+    pac,
     pio::{Common, Config, Direction, LoadedProgram, Pin, ShiftDirection, StateMachine},
 };
 use embassy_time::{block_for, Duration};
 use koto_core::hal::{HalError, PsramHal};
 #[cfg(feature = "psram_dma_read_code_window")]
 use koto_core::psram::PsramError;
+
+use crate::board::{PsramCsPin, PsramPio, PsramSckPin, PsramSio0Pin, PsramSio1Pin};
+#[cfg(feature = "psram_qpi_backend")]
+use crate::board::{PsramSio2Pin, PsramSio3Pin};
 
 #[cfg(all(
     feature = "psram_dma_read_code_window",
@@ -33,11 +48,11 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 pub const PSRAM_CAPACITY: u32 = 8 * 1024 * 1024;
 pub const PSRAM_PROD_READ_CHUNK_BYTES: usize = 16;
 pub const PSRAM_FAST_READ_DUMMY_CYCLES: u8 = 8;
-pub const PSRAM_PIO_SYS_HZ: u32 = 133_000_000;
-#[cfg(feature = "psram_dma_read_code_window")]
+pub const PSRAM_PIO_SYS_HZ: u32 = crate::board::DEFAULT_SYSTEM_HZ;
+#[cfg(all(feature = "psram_dma_read_code_window", feature = "mcu-rp2040"))]
 pub const PSRAM_PIO_CLOCK_DIVIDER: u32 = 3;
-#[cfg(not(feature = "psram_dma_read_code_window"))]
-pub const PSRAM_PIO_CLOCK_DIVIDER: u32 = 4;
+#[cfg(not(all(feature = "psram_dma_read_code_window", feature = "mcu-rp2040")))]
+pub const PSRAM_PIO_CLOCK_DIVIDER: u32 = crate::board::PSRAM_PIO_DIVIDER;
 pub const PSRAM_PIO_SM_HZ: u32 = PSRAM_PIO_SYS_HZ / PSRAM_PIO_CLOCK_DIVIDER;
 pub const PSRAM_PIO_CYCLES_PER_BIT: u8 = 2;
 #[cfg(feature = "psram_qpi_backend")]
@@ -88,6 +103,23 @@ pub struct PicoCalcPsramDiagState {
     pub tx_fjoin: bool,
     pub tx_threshold: u8,
     pub qpi_input_sync_bypass: bool,
+}
+
+/// APS6404-compatible identity captured immediately after the mandatory reset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PicoCalcPsramIdentity {
+    pub raw: [u8; 8],
+    pub manufacturer: u8,
+    pub known_good_die: u8,
+    pub density: u8,
+}
+
+impl PicoCalcPsramIdentity {
+    pub const fn is_aps6404_8m(self) -> bool {
+        self.manufacturer == 0x0d
+            && self.known_good_die == 0x5d
+            && (self.density == 0x26 || (self.density >> 5) == 2)
+    }
 }
 
 #[cfg(feature = "psram_dma_read_code_window")]
@@ -640,31 +672,31 @@ pub type FirmwarePsramHal<'d> = PicoCalcPsram<'d>;
 
 #[cfg(feature = "psram_qpi_backend")]
 pub struct PicoCalcQpiPsram<'d> {
-    sm: StateMachine<'d, peripherals::PIO1, 0>,
-    _program: LoadedProgram<'d, peripherals::PIO1>,
-    _read16_program: LoadedProgram<'d, peripherals::PIO1>,
+    sm: StateMachine<'d, PsramPio, 0>,
+    _program: LoadedProgram<'d, PsramPio>,
+    _read16_program: LoadedProgram<'d, PsramPio>,
     #[cfg(feature = "psram_qpi_safe_read_code_window")]
-    _serial_program: LoadedProgram<'d, peripherals::PIO1>,
-    _write4_program: LoadedProgram<'d, peripherals::PIO1>,
-    _cs: Pin<'d, peripherals::PIO1>,
-    _sck: Pin<'d, peripherals::PIO1>,
-    _sio0: Pin<'d, peripherals::PIO1>,
-    _sio1: Pin<'d, peripherals::PIO1>,
-    _sio2: Pin<'d, peripherals::PIO1>,
-    _sio3: Pin<'d, peripherals::PIO1>,
+    _serial_program: LoadedProgram<'d, PsramPio>,
+    _write4_program: LoadedProgram<'d, PsramPio>,
+    _cs: Pin<'d, PsramPio>,
+    _sck: Pin<'d, PsramPio>,
+    _sio0: Pin<'d, PsramPio>,
+    _sio1: Pin<'d, PsramPio>,
+    _sio2: Pin<'d, PsramPio>,
+    _sio3: Pin<'d, PsramPio>,
 }
 
 #[cfg(feature = "psram_qpi_backend")]
 impl<'d> PicoCalcQpiPsram<'d> {
     pub fn new(
-        common: &mut Common<'d, peripherals::PIO1>,
-        mut sm: StateMachine<'d, peripherals::PIO1, 0>,
-        cs: embassy_rp::Peri<'d, peripherals::PIN_20>,
-        sck: embassy_rp::Peri<'d, peripherals::PIN_21>,
-        sio0: embassy_rp::Peri<'d, peripherals::PIN_2>,
-        sio1: embassy_rp::Peri<'d, peripherals::PIN_3>,
-        sio2: embassy_rp::Peri<'d, peripherals::PIN_4>,
-        sio3: embassy_rp::Peri<'d, peripherals::PIN_5>,
+        common: &mut Common<'d, PsramPio>,
+        mut sm: StateMachine<'d, PsramPio, 0>,
+        cs: embassy_rp::Peri<'d, PsramCsPin>,
+        sck: embassy_rp::Peri<'d, PsramSckPin>,
+        sio0: embassy_rp::Peri<'d, PsramSio0Pin>,
+        sio1: embassy_rp::Peri<'d, PsramSio1Pin>,
+        sio2: embassy_rp::Peri<'d, PsramSio2Pin>,
+        sio3: embassy_rp::Peri<'d, PsramSio3Pin>,
     ) -> Result<Self, HalError> {
         sm.set_enable(false);
         sm.clear_fifos();
@@ -673,6 +705,9 @@ impl<'d> PicoCalcQpiPsram<'d> {
         // Matches Picoware `psram_send_spi_command`: the PSRAM powers up in
         // 1-bit SPI mode, so reset and enter-QPI are sent via SIO bit-bang
         // before the pins are handed to PIO.
+
+        // Adapted with reference to Picoware's PicoCalc QSPI PSRAM PIO program:
+        // https://github.com/jblanked/Picoware/blob/main/src/MicroPython/PicoCalc/picoware_psram/psram_qspi.pio
         bitbang_spi_command(0x66);
         block_for(Duration::from_micros(50));
         bitbang_spi_command(0x99);
@@ -1017,7 +1052,7 @@ impl<'d> PicoCalcQpiPsram<'d> {
         PicoCalcPsramDiagState {
             clkdiv,
             clkdiv_frac,
-            sm_hz: ((u64::from(PSRAM_PIO_SYS_HZ) * 256) / divider_fp) as u32,
+            sm_hz: ((u64::from(embassy_rp::clocks::clk_sys_freq()) * 256) / divider_fp) as u32,
             cycles_per_bit: 2,
             flevel: pio1.flevel().read().0,
             fstat: pio1.fstat().read().0,
@@ -1625,12 +1660,13 @@ fn bitbang_spi_read(address: u32, dst: &mut [u8]) -> Result<(), HalError> {
 }
 
 pub struct PicoCalcPsram<'d> {
-    sm: StateMachine<'d, peripherals::PIO1, 0>,
-    _program: LoadedProgram<'d, peripherals::PIO1>,
-    _cs: Pin<'d, peripherals::PIO1>,
-    _sck: Pin<'d, peripherals::PIO1>,
-    _mosi: Pin<'d, peripherals::PIO1>,
-    _miso: Pin<'d, peripherals::PIO1>,
+    sm: StateMachine<'d, PsramPio, 0>,
+    _program: LoadedProgram<'d, PsramPio>,
+    _cs: Pin<'d, PsramPio>,
+    _sck: Pin<'d, PsramPio>,
+    _mosi: Pin<'d, PsramPio>,
+    _miso: Pin<'d, PsramPio>,
+    identity: PicoCalcPsramIdentity,
 }
 
 impl<'d> PicoCalcPsram<'d> {
@@ -1700,12 +1736,12 @@ impl<'d> PicoCalcPsram<'d> {
     // redesign for higher sustained bandwidth.
 
     pub fn new(
-        common: &mut Common<'d, peripherals::PIO1>,
-        mut sm: StateMachine<'d, peripherals::PIO1, 0>,
-        cs: embassy_rp::Peri<'d, peripherals::PIN_20>,
-        sck: embassy_rp::Peri<'d, peripherals::PIN_21>,
-        mosi: embassy_rp::Peri<'d, peripherals::PIN_2>,
-        miso: embassy_rp::Peri<'d, peripherals::PIN_3>,
+        common: &mut Common<'d, PsramPio>,
+        mut sm: StateMachine<'d, PsramPio, 0>,
+        cs: embassy_rp::Peri<'d, PsramCsPin>,
+        sck: embassy_rp::Peri<'d, PsramSckPin>,
+        mosi: embassy_rp::Peri<'d, PsramSio0Pin>,
+        miso: embassy_rp::Peri<'d, PsramSio1Pin>,
     ) -> Self {
         let program = pio::pio_asm!(
             r#"
@@ -1763,11 +1799,18 @@ impl<'d> PicoCalcPsram<'d> {
             _sck: sck,
             _mosi: mosi,
             _miso: miso,
+            identity: PicoCalcPsramIdentity {
+                raw: [0; 8],
+                manufacturer: 0,
+                known_good_die: 0,
+                density: 0,
+            },
         };
         psram.write_only(&[8, 0, 0x66]);
         block_for(Duration::from_micros(50));
         psram.write_only(&[8, 0, 0x99]);
         block_for(Duration::from_micros(100));
+        psram.identity = psram.read_identity_after_reset();
         psram
     }
 
@@ -1813,6 +1856,24 @@ impl<'d> PicoCalcPsram<'d> {
         }
     }
 
+    fn read_identity_after_reset(&mut self) -> PicoCalcPsramIdentity {
+        let mut raw = [0u8; 8];
+        // READ ID is opcode + 24 address bits, followed immediately by EID
+        // bytes (no fast-read dummy cycles). The command is only valid directly
+        // after reset, hence capture it once during construction.
+        self.transfer(&[32, 63, 0x9f, 0, 0, 0], &mut raw);
+        PicoCalcPsramIdentity {
+            manufacturer: raw[0],
+            known_good_die: raw[1],
+            density: raw[2],
+            raw,
+        }
+    }
+
+    pub const fn identity(&self) -> PicoCalcPsramIdentity {
+        self.identity
+    }
+
     fn check_range(address: u32, len: usize) -> Result<(), HalError> {
         let len = u32::try_from(len).map_err(|_| HalError::InvalidArgument)?;
         let end = address.checked_add(len).ok_or(HalError::InvalidArgument)?;
@@ -1844,7 +1905,7 @@ impl<'d> PicoCalcPsram<'d> {
         self.sm.clear_fifos();
         self.sm.restart();
         pac::PIO1.sm(0).clkdiv().write(|w| {
-            // RP2040 PIO CLKDIV uses INT in bits [31:16] and FRAC in [15:8].
+            // RP-series PIO CLKDIV uses INT in bits [31:16] and FRAC in [15:8].
             w.0 = (u32::from(divider_int) << 16) | (u32::from(divider_frac) << 8);
         });
         self.sm.clkdiv_restart();
@@ -1930,7 +1991,7 @@ impl<'d> PicoCalcPsram<'d> {
         PicoCalcPsramDiagState {
             clkdiv,
             clkdiv_frac,
-            sm_hz: ((u64::from(PSRAM_PIO_SYS_HZ) * 256) / divider_fp) as u32,
+            sm_hz: ((u64::from(embassy_rp::clocks::clk_sys_freq()) * 256) / divider_fp) as u32,
             cycles_per_bit: PSRAM_PIO_CYCLES_PER_BIT,
             flevel: pio1.flevel().read().0,
             fstat: pio1.fstat().read().0,
@@ -1948,7 +2009,7 @@ impl<'d> PicoCalcPsram<'d> {
 
 impl PsramHal for PicoCalcPsram<'_> {
     fn available(&self) -> bool {
-        true
+        !cfg!(feature = "force_psram_fallback") && self.identity.is_aps6404_8m()
     }
 
     fn read(&mut self, address: u32, dst: &mut [u8]) -> Result<(), HalError> {

@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use koto_compiler::{
-    compile_to_asm_with_options, compile_with_options, describe_slot_map, slot_map, CodegenOptions,
-};
+use koto_compiler::{compile_source, describe_slot_map, CodegenOptions, CompileRequest, FsLoader};
 
 fn main() -> ExitCode {
     let args = match CliArgs::parse(std::env::args().skip(1)) {
@@ -26,18 +24,25 @@ fn main() -> ExitCode {
         }
     };
     let file = args.source.display().to_string();
+    let compilation = compile_source(
+        CompileRequest {
+            file: &file,
+            source: &source,
+            options: args.options,
+        },
+        &mut FsLoader,
+    );
+    if let Some(error) = compilation.diagnostics.first() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
 
     if args.slot_map {
-        return match slot_map(&file, &source) {
-            Ok(map) => {
-                println!("{}", describe_slot_map(&map));
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
+        let map = compilation
+            .slot_map
+            .expect("successful compilation has a slot map");
+        println!("{}", describe_slot_map(&map));
+        return ExitCode::SUCCESS;
     }
 
     let output = match &args.output {
@@ -49,41 +54,35 @@ fn main() -> ExitCode {
     };
 
     if args.emit_asm {
-        match compile_to_asm_with_options(&file, &source, args.options) {
-            Ok(asm) => match std::fs::write(&output, asm.as_bytes()) {
-                Ok(()) => {
-                    println!("compiled {} -> {} (assembly)", file, output.display());
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("failed to write {}: {error}", output.display());
-                    ExitCode::FAILURE
-                }
-            },
+        let asm = compilation
+            .assembly
+            .expect("successful compilation has assembly");
+        match std::fs::write(&output, asm.as_bytes()) {
+            Ok(()) => {
+                println!("compiled {} -> {} (assembly)", file, output.display());
+                ExitCode::SUCCESS
+            }
             Err(error) => {
-                eprintln!("{error}");
+                eprintln!("failed to write {}: {error}", output.display());
                 ExitCode::FAILURE
             }
         }
     } else {
-        match compile_with_options(&file, &source, args.options) {
-            Ok(bytecode) => match std::fs::write(&output, &bytecode) {
-                Ok(()) => {
-                    println!(
-                        "compiled {} -> {} ({} bytes)",
-                        file,
-                        output.display(),
-                        bytecode.len()
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("failed to write {}: {error}", output.display());
-                    ExitCode::FAILURE
-                }
-            },
+        let bytecode = compilation
+            .bytecode
+            .expect("successful compilation has bytecode");
+        match std::fs::write(&output, &bytecode) {
+            Ok(()) => {
+                println!(
+                    "compiled {} -> {} ({} bytes)",
+                    file,
+                    output.display(),
+                    bytecode.len()
+                );
+                ExitCode::SUCCESS
+            }
             Err(error) => {
-                eprintln!("{error}");
+                eprintln!("failed to write {}: {error}", output.display());
                 ExitCode::FAILURE
             }
         }
@@ -108,7 +107,7 @@ impl CliArgs {
             match arg.as_str() {
                 "--emit-asm" => emit_asm = true,
                 "--slot-map" => slot_map = true,
-                // KOTO-0156 per-app code-window layout opt-ins (apps.json `codegen`).
+                // KOTO-0156 per-app code-window layout opt-ins (app.json `codegen`).
                 "--relocate-preamble" => options.relocate_preamble = true,
                 "--outline-cold-blocks" => options.outline_cold_blocks = true,
                 // KOTO-0169 Stage 4 per-app opt-OUT: pin the pre-Stage-4

@@ -1,5 +1,6 @@
 use std::{env, fs, process::ExitCode};
 
+use koto_audio::{ClipLoop, LoopCount};
 use koto_audio_tools::{
     convert_wav_to_clip_asset, ConvertOptions, OutputCodec, Sldpcm4FallbackPolicy,
 };
@@ -45,6 +46,17 @@ fn run() -> Result<String, String> {
             "--strict-input" | "--no-resample" => {
                 options.strict_input = true;
             }
+            "--max-samples" => {
+                let samples = args
+                    .next()
+                    .ok_or_else(|| usage("missing --max-samples value"))?;
+                options.max_output_samples = Some(parse_max_samples(&samples)?);
+            }
+            "--loop" => {
+                options.loop_metadata = ClipLoop::Whole {
+                    count: LoopCount::Infinite,
+                };
+            }
             _ if arg.starts_with('-') => return Err(usage("unknown option")),
             _ => positional.push(arg),
         }
@@ -70,6 +82,7 @@ fn usage(reason: &str) -> String {
         concat!(
             "usage: koto-audio-convert [--codec pcm16|experimental-sldpcm4] ",
             "[--sldpcm4-fallback pcm16|reject|force] [--target-rate hz] ",
+            "[--max-samples count] [--loop] ",
             "[--strict-input|--no-resample] <input.wav> <output.kacl>\n",
             "error: {}"
         ),
@@ -104,4 +117,12 @@ fn parse_target_rate(value: &str) -> Result<u32, String> {
         return Err(usage("--target-rate must be greater than zero"));
     }
     Ok(rate)
+}
+
+fn parse_max_samples(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(|| usage("--max-samples must be greater than zero"))
 }

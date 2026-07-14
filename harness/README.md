@@ -16,7 +16,8 @@ Current checks:
 - `harness/fixtures/sample_app.kpa.json` has the expected package metadata shape.
 - `harness/fixtures/sample_app.layout.csv` records asset offsets in monotonic
   read order, and the harness rejects a non-monotonic layout fixture.
-- `sdcard_mock/apps` contains at least one simulator package manifest.
+- `sdcard_mock/apps` contains reproducible binary `.kpa` packages (the adjacent
+  `.kpa.json` files are packer inputs, not runtime files).
 - The initial Cargo workspace and Rust crate entry points exist.
 - The asset pipeline fixture converts a PBM icon, validates a `.kfont` Japanese
   preview, and verifies generated asset placement.
@@ -27,23 +28,37 @@ The harness is deliberately small. As KotoSim and the package toolchain appear, 
 
 ## App build loop
 
-`build_apps.py` compiles the source-authored apps listed in `apps/apps.json` into
-their committed `sdcard_mock` bytecode. Each app declares a `kind`: `koto`
-(high-level source via `koto-compiler`) or `asm` (low-level IR via `kbc-asm`).
+`build_apps.py` discovers each app from its own `apps/<dir>/app.json` descriptor
+(KOTO-0195), compiles its source into committed bytecode, generates the
+packaging manifest, and packs every declared asset — including Native KotoAudio
+KMML — into a binary `APPS/*.kpa` archive in the SD-card tree. Each app declares
+a `kind`: `koto` (high-level source via `koto-compiler`) or `asm` (low-level IR
+via `kbc-asm`).
 
 ```powershell
 python harness\build_apps.py            # rebuild committed bytecode
 python harness\build_apps.py --check    # fail if committed bytecode is stale
 ```
 
-`--check` is part of `check_all.py`, so source/bytecode drift or a manifest entry
-that does not point at the built output fails the local checks.
+`--check` is part of `check_all.py`, so source/bytecode/SD-asset drift or a
+manifest entry that does not point at the built output fails the local checks.
 
 ## Local checks
 
 `check_all.py` runs the full local gate: `cargo fmt --check`, Clippy, `cargo test`,
 the app build sync (`build_apps.py --check`), the scripted memo validation, golden
 frame validation, the runtime budget gate, and `check_project.py`.
+
+Embedded targets are an explicit cross-build gate because they require Rust
+targets that host-only contributors may not have installed:
+
+```powershell
+rustup target add thumbv6m-none-eabi thumbv8m.main-none-eabihf
+python harness\check_embedded.py
+```
+
+This checks every retained `koto-pico` binary for the default RP2040 profile
+and the RP2350A/Pico 2 W profile (KOTO-0204).
 
 ## Runtime budget gate
 

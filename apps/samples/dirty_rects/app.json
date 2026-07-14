@@ -1,0 +1,19 @@
+{
+  "app_id": "dev.koto.samples.dirty-rects",
+  "kind": "koto",
+  "package": "sample_dirty_rects",
+  "name": "SDK Dirty Rects",
+  "description": "Demonstrates dirty-rect drawing.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

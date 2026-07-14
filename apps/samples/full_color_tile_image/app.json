@@ -1,0 +1,47 @@
+{
+  "app_id": "dev.koto.samples.full-color-tile-image",
+  "kind": "koto",
+  "package": "sample_full_color_tile_image",
+  "name": "SDK Full Color Image Gallery",
+  "description": "Streams four full-resolution 320x320 RGB565 images with dissolve and wipe transitions.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "images": [
+    {
+      "source": "art/landscape.png",
+      "output": "images/landscape.kim",
+      "full_color_image": true
+    },
+    {
+      "source": "art/city.png",
+      "output": "images/city.kim",
+      "full_color_image": true
+    },
+    {
+      "source": "art/autumn.png",
+      "output": "images/autumn.kim",
+      "full_color_image": true
+    },
+    {
+      "source": "art/space.png",
+      "output": "images/space.kim",
+      "full_color_image": true
+    }
+  ],
+  "audio": [
+    {
+      "source": "audio/music_sld4.kacl",
+      "output": "audio/gallery_music_sld4.kacl"
+    }
+  ]
+}

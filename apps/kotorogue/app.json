@@ -1,0 +1,81 @@
+{
+  "app_id": "dev.koto.games.kotorogue",
+  "kind": "koto",
+  "package": "kotorogue",
+  "name": "KotoRogue",
+  "description": "部屋とモンスターが毎回変わる、ターン制のローグライク。階段を降りて最深部を目指そう。",
+  "category": "ゲーム",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#1A1424",
+    "primary": "#E8D27A",
+    "secondary": "#5C5470",
+    "accent": "#E34A4A",
+    "highlight": "#F6E27A",
+    "shadow": "#0C0A14"
+  },
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "codegen": {
+    "comment": "KOTO-0156 pair (see KotoShogi/KotoMines): the code spans ~4 tiles; the title and result blocks end in `continue` so outline_cold_blocks relocates them, and relocate_preamble pulls the steady play loop toward word 0. kotorogue_code_window_tile_profile guards the measured walk.",
+    "relocate_preamble": true,
+    "outline_cold_blocks": true
+  },
+  "images": [
+    {
+      "source": "sprites/tiles.kspr",
+      "output": "sprites/kotorogue_tiles.kim"
+    }
+  ],
+  "audio": [
+    {
+      "source": "audio/bgm.kmml",
+      "output": "audio/kotorogue_bgm.kmml"
+    },
+    {
+      "source": "audio/step.kmml",
+      "output": "audio/kotorogue_step.kmml"
+    },
+    {
+      "source": "audio/hit.kmml",
+      "output": "audio/kotorogue_hit.kmml"
+    },
+    {
+      "source": "audio/kill.kmml",
+      "output": "audio/kotorogue_kill.kmml"
+    },
+    {
+      "source": "audio/gold.kmml",
+      "output": "audio/kotorogue_gold.kmml"
+    },
+    {
+      "source": "audio/potion.kmml",
+      "output": "audio/kotorogue_potion.kmml"
+    },
+    {
+      "source": "audio/stairs.kmml",
+      "output": "audio/kotorogue_stairs.kmml"
+    },
+    {
+      "source": "audio/hurt.kmml",
+      "output": "audio/kotorogue_hurt.kmml"
+    },
+    {
+      "source": "audio/over.kmml",
+      "output": "audio/kotorogue_over.kmml"
+    },
+    {
+      "source": "audio/win.kmml",
+      "output": "audio/kotorogue_win.kmml"
+    }
+  ]
+}

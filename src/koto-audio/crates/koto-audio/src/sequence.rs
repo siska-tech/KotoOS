@@ -1,5 +1,6 @@
 use crate::{
     builtin_drums, AudioError, AudioLimits, AudioResult, DecodeResult, Decoder, MixerVolume,
+    RuntimeCue,
 };
 
 /// Maximum voice count for the experimental polyphonic sequence foundation.
@@ -1181,6 +1182,266 @@ impl Decoder for SequenceDecoder<'_> {
     fn completed_loops(&self) -> u32 {
         0
     }
+}
+
+/// Owned polyphonic player for a dynamically compiled runtime cue.
+///
+/// Unlike [`PolyphonicSequenceDecoder`], this player holds event arrays by
+/// value and keeps only indices into them. It is therefore safe to replace
+/// from data copied out of PSRAM and never retains a reference to a staging
+/// buffer or generated Rust table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeCuePlayer<const N: usize> {
+    cue: RuntimeCue<N>,
+    voices: [RuntimeVoiceState; MAX_SEQUENCE_VOICES],
+    sample_rate_hz: u32,
+    playing: bool,
+}
+
+impl<const N: usize> RuntimeCuePlayer<N> {
+    /// Creates an idle owned player at the requested output sample rate.
+    pub const fn new(sample_rate_hz: u32) -> Self {
+        Self {
+            cue: RuntimeCue::empty(),
+            voices: [RuntimeVoiceState::IDLE; MAX_SEQUENCE_VOICES],
+            sample_rate_hz,
+            playing: false,
+        }
+    }
+
+    /// Replaces the current score and starts it from the first event.
+    pub fn play(&mut self, cue: RuntimeCue<N>) -> AudioResult<()> {
+        if self.sample_rate_hz == 0
+            || cue.track_count == 0
+            || cue.track_count > MAX_SEQUENCE_VOICES
+            || cue.tick_rate_hz == 0
+        {
+            return Err(AudioError::InvalidArgument);
+        }
+        for track in &cue.tracks[..cue.track_count] {
+            if track.len == 0 || track.events[track.len - 1] != SequenceEvent::End {
+                return Err(AudioError::MalformedAsset);
+            }
+        }
+        self.cue = cue;
+        self.voices.fill(RuntimeVoiceState::IDLE);
+        for voice in &mut self.voices[..self.cue.track_count] {
+            voice.ended = false;
+        }
+        self.playing = true;
+        Ok(())
+    }
+
+    /// Decodes a pointer-free cue image directly into the owned player and starts it.
+    pub fn play_image(&mut self, bytes: &[u8]) -> AudioResult<()> {
+        self.stop();
+        self.cue
+            .decode_into(bytes)
+            .map_err(|_| AudioError::MalformedAsset)?;
+        if self.cue.track_count == 0 || self.cue.tick_rate_hz == 0 {
+            return Err(AudioError::MalformedAsset);
+        }
+        self.voices.fill(RuntimeVoiceState::IDLE);
+        for voice in &mut self.voices[..self.cue.track_count] {
+            voice.ended = false;
+        }
+        self.playing = true;
+        Ok(())
+    }
+
+    /// Stops the current score immediately.
+    pub fn stop(&mut self) {
+        self.playing = false;
+        self.voices.fill(RuntimeVoiceState::IDLE);
+    }
+
+    /// Returns whether at least one voice can still produce samples.
+    pub const fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    /// Produces the next mixed mono sample, or [`DecodeResult::End`].
+    #[cfg_attr(feature = "ram-hot-mix", link_section = ".data.koto_audio_mix")]
+    pub fn next_sample(&mut self) -> DecodeResult {
+        if !self.playing {
+            return DecodeResult::End;
+        }
+        let mut mixed = 0i64;
+        let mut emitted = 0usize;
+        let mut continuing = 0usize;
+        for index in 0..self.cue.track_count {
+            match runtime_voice_next(
+                &self.cue.tracks[index],
+                self.cue.tick_rate_hz,
+                self.sample_rate_hz,
+                &mut self.voices[index],
+            ) {
+                DecodeResult::Sample(sample) => {
+                    emitted += 1;
+                    mixed = mixed
+                        .saturating_add(scale_voice_sample(sample, self.cue.tracks[index].gain));
+                }
+                DecodeResult::End => {}
+            }
+            if !self.voices[index].ended {
+                continuing += 1;
+            }
+        }
+        if emitted == 0 {
+            self.playing = false;
+            DecodeResult::End
+        } else {
+            if continuing == 0 {
+                self.playing = false;
+            }
+            DecodeResult::Sample(saturate_i64_to_i16(mixed))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RuntimeVoiceState {
+    event_index: usize,
+    loop_start: Option<usize>,
+    loop_remaining: Option<u8>,
+    active: ActiveTone,
+    ended: bool,
+}
+
+impl RuntimeVoiceState {
+    const IDLE: Self = Self {
+        event_index: 0,
+        loop_start: None,
+        loop_remaining: None,
+        active: ActiveTone::silent(),
+        ended: true,
+    };
+}
+
+fn runtime_voice_next<const N: usize>(
+    track: &crate::RuntimeCueTrack<N>,
+    tick_rate_hz: u16,
+    sample_rate_hz: u32,
+    state: &mut RuntimeVoiceState,
+) -> DecodeResult {
+    while !state.ended && state.active.remaining_frames == 0 {
+        let Some(event) = track.events.get(state.event_index).copied() else {
+            state.ended = true;
+            break;
+        };
+        state.event_index = state.event_index.saturating_add(1);
+        match event {
+            SequenceEvent::Note {
+                pitch,
+                duration_ticks,
+                volume,
+                instrument_id,
+            } => {
+                let Some(instrument) = BUILTIN_SEQUENCE_INSTRUMENTS.get(usize::from(instrument_id))
+                else {
+                    state.ended = true;
+                    break;
+                };
+                let total_frames =
+                    runtime_frames_for_ticks(sample_rate_hz, tick_rate_hz, duration_ticks);
+                let envelope_frames = |ticks: u16| {
+                    if ticks == 0 {
+                        0
+                    } else {
+                        runtime_frames_for_ticks(sample_rate_hz, tick_rate_hz, ticks)
+                            .min(total_frames)
+                    }
+                };
+                state.active = ActiveTone {
+                    remaining_frames: total_frames,
+                    total_frames,
+                    elapsed_frames: 0,
+                    phase: 0,
+                    phase_step: phase_step(pitch, sample_rate_hz),
+                    kind: instrument.kind,
+                    drum_sample_index: 0,
+                    #[cfg(feature = "sldpcm4-drums")]
+                    drum_previous_sample: 0,
+                    volume: u32::from(volume).saturating_mul(u32::from(instrument.volume)),
+                    attack_frames: envelope_frames(instrument.attack_ticks),
+                    release_frames: envelope_frames(instrument.release_ticks),
+                    rest: false,
+                    scale_env: SCALE_ENV_INVALID,
+                    scale_k: 0,
+                    scaled_square: 0,
+                };
+            }
+            SequenceEvent::Rest { duration_ticks } => {
+                let total_frames =
+                    runtime_frames_for_ticks(sample_rate_hz, tick_rate_hz, duration_ticks);
+                state.active = ActiveTone {
+                    remaining_frames: total_frames,
+                    total_frames,
+                    elapsed_frames: 0,
+                    rest: true,
+                    ..ActiveTone::silent()
+                };
+            }
+            SequenceEvent::LoopStart => {
+                state.loop_start = Some(state.event_index);
+                state.loop_remaining = None;
+            }
+            SequenceEvent::LoopEnd { repeat_count } => {
+                runtime_apply_loop(state, repeat_count);
+            }
+            SequenceEvent::End => state.ended = true,
+        }
+    }
+    if state.ended {
+        return DecodeResult::End;
+    }
+    let sample = state.active.next_sample();
+    while !state.ended && state.active.remaining_frames == 0 {
+        let Some(event) = track.events.get(state.event_index).copied() else {
+            state.ended = true;
+            break;
+        };
+        match event {
+            SequenceEvent::LoopStart => {
+                state.event_index += 1;
+                state.loop_start = Some(state.event_index);
+                state.loop_remaining = None;
+            }
+            SequenceEvent::LoopEnd { repeat_count } => {
+                state.event_index += 1;
+                runtime_apply_loop(state, repeat_count);
+            }
+            SequenceEvent::End => {
+                state.event_index += 1;
+                state.ended = true;
+            }
+            SequenceEvent::Note { .. } | SequenceEvent::Rest { .. } => break,
+        }
+    }
+    DecodeResult::Sample(sample)
+}
+
+fn runtime_apply_loop(state: &mut RuntimeVoiceState, repeat_count: u8) {
+    let Some(loop_start) = state.loop_start else {
+        state.ended = true;
+        return;
+    };
+    if repeat_count == SEQUENCE_REPEAT_INFINITE {
+        state.event_index = loop_start;
+    } else {
+        let remaining = state.loop_remaining.get_or_insert(repeat_count);
+        if *remaining > 0 {
+            *remaining = remaining.saturating_sub(1);
+            state.event_index = loop_start;
+        } else {
+            state.loop_remaining = None;
+        }
+    }
+}
+
+fn runtime_frames_for_ticks(sample_rate_hz: u32, tick_rate_hz: u16, ticks: u16) -> u32 {
+    let frames_per_tick = (sample_rate_hz / u32::from(tick_rate_hz)).max(1);
+    u32::from(ticks).saturating_mul(frames_per_tick).max(1)
 }
 
 /// The square oscillator's raw half-cycle amplitude.

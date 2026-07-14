@@ -1,7 +1,0 @@
-# KotoRun BGM — bright, driving chiptune loop.
-#TRACK pulse
-@1 T168 V8 O5 L8 [ C E G >C G E D G  E G >C E C <G E D ]
-#TRACK bass
-@2 T168 V7 O2 L8 [ C R C G  A R A E  F R F C  G R G D ]
-#TRACK sparkle
-@0 T168 V5 O6 L16 [ R G R E R C R E  R A R G R E R D ]

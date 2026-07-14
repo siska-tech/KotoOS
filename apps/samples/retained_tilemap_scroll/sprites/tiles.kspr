@@ -1,0 +1,87 @@
+# KOTO-0200 retained tilemap sheet: grass, stone, water, marker.
+# Edit this file with the Koto Sprite Editor. build_apps.py compiles it to KIM1.
+
+color g 2A7D4F
+color G 3A9860
+color d 1D5C38
+color s 756552
+color S 9A866A
+color k 40372F
+color w 2479AA
+color W 55B5DD
+color b 164E78
+color m E6B83E
+color M C66E2D
+color p F8E7A0
+
+tile 0 grass
+gggggggggggggggg
+ggGgggggggggGggg
+gggggggggggggggg
+gggggggggggggggg
+ggggggGggggggggg
+gggggggggggggggg
+gGggggggggGggggg
+gggggggggggggggg
+gggggggggggggggg
+ggggGggggggggGgg
+gggggggggggggggg
+gggggggggggggggg
+ggggggggGggggggg
+ggGggggggggggggg
+ggggggggggGggggg
+gggggggggggggggg
+
+tile 1 stone
+SSSSSSSksSSSSSSS
+sssssssksSSSSSSS
+sssssssksSSSSSSS
+kkkkkkkkkkkkkkkk
+SSSksSSSSSSksSSS
+sssksSSSSSSksSSS
+sssksSSSSSSksSSS
+kkkkkkkkkkkkkkkk
+SSSSSSSksSSSSSSS
+sssssssksSSSSSSS
+sssssssksSSSSSSS
+kkkkkkkkkkkkkkkk
+SSSksSSSSSSksSSS
+sssksSSSSSSksSSS
+sssksSSSSSSksSSS
+kkkkkkkkkkkkkkkk
+
+tile 2 water
+wwwwwwwwwwwwwwww
+wwwwWWwwwwwwWWww
+wwwWWWWwwwwWWWWw
+wwWWwwWWwwWWwwWW
+wwwwwwwwwwwwwwww
+wwwwwwwwwwwwwwww
+WwwwwWWwwwwwwWWw
+WWwwWWWWwwwwWWWW
+wwWWwwWWwwWWwwWW
+wwwwwwwwwwwwwwww
+wwwwwwwwwwwwwwww
+wwwwWWwwwwwwWWww
+wwwWWWWwwwwWWWWw
+wwWWwwWWwwWWwwWW
+bbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbb
+
+tile 3 marker
+gggggggggggggggg
+gggggggMMggggggg
+ggggggMMMMgggggg
+gggggMMppMMggggg
+ggggMMppppMMgggg
+gggMMppppppMMggg
+gggMpppMMpppMggg
+gggMppMggMppMggg
+gggMppMggMppMggg
+gggMpppMMpppMggg
+gggMMppppppMMggg
+ggggMMppppMMgggg
+gggggMMppMMggggg
+ggggggMMMMgggggg
+gggggggMMggggggg
+gggggggggggggggg

@@ -1,9 +1,10 @@
 //! `probe_sd` — SD card mount and sequential-read probe (KOTO-0068).
 //!
 //! Brings up SPI0, mounts the FAT volume via `embedded-sdmmc` using the
-//! validated 12 MHz fast / 1 MHz fallback clock sequence, lists `apps/` long
-//! filenames, and streams the first `*.kpa.json` over USB CDC in 128-byte
-//! chunks.
+//! standards-compliant 400 kHz acquisition / validated fast transfer sequence,
+//! lists `apps/` long
+//! filenames, and streams the first `*.kpa.json` over UART0 and, when
+//! connected, USB CDC in 128-byte chunks.
 //!
 //! Not part of normal development: flash manually only to re-validate SD
 //! storage. See `docs/hardware/PICO_HARDWARE_LOG.md`.
@@ -19,9 +20,10 @@ use embassy_rp::{
     gpio::{Input, Level, Output, Pull},
     peripherals,
     spi::{Config as SpiConfig, Spi},
+    uart::{Config as UartConfig, UartTx},
     usb::{Driver, InterruptHandler as UsbInterruptHandler},
 };
-use embassy_time::{Delay, Timer};
+use embassy_time::{Delay, Instant, Timer};
 use embassy_usb::{
     class::cdc_acm::{CdcAcmClass, State},
     Builder, Config,
@@ -36,11 +38,15 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<peripherals::USB>;
 });
 
-const FAST_SPI_HZ: u32 = 12_000_000;
-const FALLBACK_SPI_HZ: u32 = 1_000_000;
+use koto_pico::firmware::config::SD_ACQUIRE_SPI_HZ;
+use koto_pico::firmware::storage::initialize_sd_card;
 const BANNER: &[u8] = concat!(
     "KotoOS KOTO-0068 sd-read v",
     env!("CARGO_PKG_VERSION"),
+    " board=",
+    env!("KOTO_BOARD_ID"),
+    " mcu=",
+    env!("KOTO_MCU_ID"),
     "\r\n"
 )
 .as_bytes();
@@ -50,17 +56,21 @@ const BANNER: &[u8] = concat!(
     entry = "cortex_m_rt::entry"
 )]
 async fn main(_spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
-    let detect = Input::new(p.PIN_22, Pull::Up);
+    let p = koto_pico::board::split_peripherals(embassy_rp::init(Default::default()));
+    let detect = Input::new(p.sd_detect, Pull::Up);
 
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = FAST_SPI_HZ;
-    let spi = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, spi_config);
-    let cs = Output::new(p.PIN_17, Level::High);
+    spi_config.frequency = SD_ACQUIRE_SPI_HZ;
+    let spi = Spi::new_blocking(p.sd_spi, p.sd_sck, p.sd_mosi, p.sd_miso, spi_config);
+    let cs = Output::new(p.sd_cs, Level::High);
     let device = ExclusiveDevice::new(spi, cs, Delay).unwrap();
     let sdcard = SdCard::new(device, Delay);
 
-    let driver = Driver::new(p.USB, Irqs);
+    let mut uart_config = UartConfig::default();
+    uart_config.baudrate = 115_200;
+    let mut uart = UartTx::new_blocking(p.uart, p.uart_tx, uart_config);
+
+    let driver = Driver::new(p.usb, Irqs);
     let mut usb_config = Config::new(0xc0de, 0x0068);
     usb_config.manufacturer = Some("KotoOS");
     usb_config.product = Some("KotoOS SD read probe");
@@ -85,9 +95,22 @@ async fn main(_spawner: Spawner) {
 
     let usb_task = usb.run();
     let probe_task = async {
-        cdc.wait_connection().await;
-        if write_packets(&mut cdc, BANNER).await.is_err() {
-            return;
+        emit(&mut uart, &mut cdc, BANNER).await;
+        emit(
+            &mut uart,
+            &mut cdc,
+            b"log=uart0 tx=GP0 baud=115200 usb_cdc=optional\r\n",
+        )
+        .await;
+
+        // Mounting and reading can finish before the host opens PicoCalc's
+        // USB-UART COM port after a reboot. Keep the observation window open
+        // before touching the card so the complete one-shot report is visible.
+        for remaining in (1..=10).rev() {
+            let mut countdown = TextBuffer::<64>::new();
+            let _ = write!(countdown, "sd probe starts in {}s\r\n", remaining);
+            emit(&mut uart, &mut cdc, countdown.as_bytes()).await;
+            Timer::after_secs(1).await;
         }
 
         let mut line = TextBuffer::<2048>::new();
@@ -96,41 +119,21 @@ async fn main(_spawner: Spawner) {
             "sd detect={} pin=GP22 spi=SPI0 sck=GP18 mosi=GP19 miso=GP16 cs=GP17\r\n",
             if detect.is_low() { "present" } else { "absent" }
         );
-        let _ = write_packets(&mut cdc, line.as_bytes()).await;
+        emit(&mut uart, &mut cdc, line.as_bytes()).await;
 
-        line.clear();
-        let _ = write!(line, "sd init clock={}Hz\r\n", FAST_SPI_HZ);
-        let _ = write_packets(&mut cdc, line.as_bytes()).await;
-
-        let (card_size, active_hz) = match sdcard.num_bytes() {
-            Ok(size) => (size, FAST_SPI_HZ),
+        let Some(active_hz) = initialize_sd_card(&sdcard, &mut uart) else {
+            emit(&mut uart, &mut cdc, b"sd init failed\r\n").await;
+            wait_forever(&mut uart, &mut cdc).await;
+            return;
+        };
+        let card_size = match sdcard.num_bytes() {
+            Ok(size) => size,
             Err(error) => {
                 line.clear();
-                let _ = write!(
-                    line,
-                    "sd init failed clock={}Hz error={:?}; fallback={}Hz\r\n",
-                    FAST_SPI_HZ, error, FALLBACK_SPI_HZ
-                );
-                let _ = write_packets(&mut cdc, line.as_bytes()).await;
-
-                let mut fallback = SpiConfig::default();
-                fallback.frequency = FALLBACK_SPI_HZ;
-                sdcard.spi(|device| device.bus_mut().set_config(&fallback));
-                sdcard.mark_card_uninit();
-                match sdcard.num_bytes() {
-                    Ok(size) => (size, FALLBACK_SPI_HZ),
-                    Err(error) => {
-                        line.clear();
-                        let _ = write!(
-                            line,
-                            "sd init failed clock={}Hz error={:?}\r\n",
-                            FALLBACK_SPI_HZ, error
-                        );
-                        let _ = write_packets(&mut cdc, line.as_bytes()).await;
-                        wait_forever(&mut cdc).await;
-                        return;
-                    }
-                }
+                let _ = write!(line, "sd transfer validation failed error={:?}\r\n", error);
+                emit(&mut uart, &mut cdc, line.as_bytes()).await;
+                wait_forever(&mut uart, &mut cdc).await;
+                return;
             }
         };
 
@@ -140,7 +143,7 @@ async fn main(_spawner: Spawner) {
             "sd init pass clock={}Hz bytes={}\r\n",
             active_hz, card_size
         );
-        let _ = write_packets(&mut cdc, line.as_bytes()).await;
+        emit(&mut uart, &mut cdc, line.as_bytes()).await;
 
         let volume_mgr = VolumeManager::new(sdcard, Clock);
         let volume = match volume_mgr.open_volume(VolumeIdx(0)) {
@@ -148,8 +151,8 @@ async fn main(_spawner: Spawner) {
             Err(error) => {
                 line.clear();
                 let _ = write!(line, "fat mount failed error={:?}\r\n", error);
-                let _ = write_packets(&mut cdc, line.as_bytes()).await;
-                wait_forever(&mut cdc).await;
+                emit(&mut uart, &mut cdc, line.as_bytes()).await;
+                wait_forever(&mut uart, &mut cdc).await;
                 return;
             }
         };
@@ -158,8 +161,8 @@ async fn main(_spawner: Spawner) {
             Err(error) => {
                 line.clear();
                 let _ = write!(line, "fat root failed error={:?}\r\n", error);
-                let _ = write_packets(&mut cdc, line.as_bytes()).await;
-                wait_forever(&mut cdc).await;
+                emit(&mut uart, &mut cdc, line.as_bytes()).await;
+                wait_forever(&mut uart, &mut cdc).await;
                 return;
             }
         };
@@ -168,8 +171,8 @@ async fn main(_spawner: Spawner) {
             Err(error) => {
                 line.clear();
                 let _ = write!(line, "apps open failed error={:?}\r\n", error);
-                let _ = write_packets(&mut cdc, line.as_bytes()).await;
-                wait_forever(&mut cdc).await;
+                emit(&mut uart, &mut cdc, line.as_bytes()).await;
+                wait_forever(&mut uart, &mut cdc).await;
                 return;
             }
         };
@@ -177,6 +180,7 @@ async fn main(_spawner: Spawner) {
         let mut lfn_storage = [0u8; 192];
         let mut lfn = LfnBuffer::new(&mut lfn_storage);
         let mut selected: Option<ShortFileName> = None;
+        let mut selected_is_text = false;
         line.clear();
         let _ = line.write_str("apps listing begin\r\n");
         let listing = apps.iterate_dir_lfn(&mut lfn, |entry, long_name| {
@@ -195,9 +199,10 @@ async fn main(_spawner: Spawner) {
             );
             if selected.is_none()
                 && !entry.attributes.is_directory()
-                && is_manifest_name(display_name)
+                && is_package_name(display_name)
             {
                 selected = Some(entry.name.clone());
+                selected_is_text = is_manifest_name(display_name);
             }
         });
         let _ = line.write_str("apps listing end\r\n");
@@ -205,11 +210,16 @@ async fn main(_spawner: Spawner) {
             line.clear();
             let _ = write!(line, "apps listing failed error={:?}\r\n", error);
         }
-        let _ = write_packets(&mut cdc, line.as_bytes()).await;
+        emit(&mut uart, &mut cdc, line.as_bytes()).await;
 
         let Some(manifest_name) = selected else {
-            let _ = write_packets(&mut cdc, b"manifest not found suffix=.kpa.json\r\n").await;
-            wait_forever(&mut cdc).await;
+            emit(
+                &mut uart,
+                &mut cdc,
+                b"package not found suffix=.kpa.json|.kpa\r\n",
+            )
+            .await;
+            wait_forever(&mut uart, &mut cdc).await;
             return;
         };
         let manifest = match apps.open_file_in_dir(&manifest_name, Mode::ReadOnly) {
@@ -218,11 +228,11 @@ async fn main(_spawner: Spawner) {
                 line.clear();
                 let _ = write!(
                     line,
-                    "manifest open failed short={} error={:?}\r\n",
+                    "package open failed short={} error={:?}\r\n",
                     manifest_name, error
                 );
-                let _ = write_packets(&mut cdc, line.as_bytes()).await;
-                wait_forever(&mut cdc).await;
+                emit(&mut uart, &mut cdc, line.as_bytes()).await;
+                wait_forever(&mut uart, &mut cdc).await;
                 return;
             }
         };
@@ -230,65 +240,89 @@ async fn main(_spawner: Spawner) {
         line.clear();
         let _ = write!(
             line,
-            "manifest read begin short={} bytes={} chunk=128\r\n",
+            "package read begin short={} bytes={} chunk=128 text={}\r\n",
             manifest_name,
-            manifest.length()
+            manifest.length(),
+            selected_is_text
         );
-        let _ = write_packets(&mut cdc, line.as_bytes()).await;
+        emit(&mut uart, &mut cdc, line.as_bytes()).await;
 
         let mut total = 0usize;
+        let mut checksum = 0x811c9dc5u32;
         let mut chunk = [0u8; 128];
+        let read_started = Instant::now();
         while !manifest.is_eof() {
             match manifest.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(count) => {
                     total += count;
-                    if write_terminal_text(&mut cdc, &chunk[..count])
-                        .await
-                        .is_err()
-                    {
-                        return;
+                    for byte in &chunk[..count] {
+                        checksum = (checksum ^ u32::from(*byte)).wrapping_mul(0x0100_0193);
                     }
                 }
                 Err(error) => {
                     line.clear();
-                    let _ = write!(line, "\r\nmanifest read failed error={:?}\r\n", error);
-                    let _ = write_packets(&mut cdc, line.as_bytes()).await;
-                    wait_forever(&mut cdc).await;
+                    let _ = write!(line, "\r\npackage read failed error={:?}\r\n", error);
+                    emit(&mut uart, &mut cdc, line.as_bytes()).await;
+                    wait_forever(&mut uart, &mut cdc).await;
                     return;
                 }
             }
         }
+        let elapsed_us = read_started.elapsed().as_micros().max(1);
+        let kib_per_s = (total as u64)
+            .saturating_mul(1_000_000)
+            .saturating_div(elapsed_us)
+            .saturating_div(1024);
         line.clear();
-        let _ = write!(line, "\r\nmanifest read end bytes={}\r\n", total);
-        let _ = write_packets(&mut cdc, line.as_bytes()).await;
-        let _ = write_packets(&mut cdc, b"KOTO-0068 awaiting observation\r\n").await;
-        wait_forever(&mut cdc).await;
+        let _ = write!(
+            line,
+            "\r\npackage read end bytes={} elapsed_us={} kib_per_s={} fnv1a32={:08x}\r\n",
+            total, elapsed_us, kib_per_s, checksum
+        );
+        emit(&mut uart, &mut cdc, line.as_bytes()).await;
+        emit(&mut uart, &mut cdc, b"KOTO-0068 awaiting observation\r\n").await;
+        wait_forever(&mut uart, &mut cdc).await;
     };
 
     join(usb_task, probe_task).await;
 }
 
 fn is_manifest_name(name: &str) -> bool {
-    const SUFFIX: &[u8] = b".kpa.json";
+    has_suffix_ignore_ascii_case(name, b".kpa.json")
+}
+
+fn is_package_name(name: &str) -> bool {
+    is_manifest_name(name) || has_suffix_ignore_ascii_case(name, b".kpa")
+}
+
+fn has_suffix_ignore_ascii_case(name: &str, suffix: &[u8]) -> bool {
     let bytes = name.as_bytes();
-    bytes.len() >= SUFFIX.len()
-        && bytes[bytes.len() - SUFFIX.len()..]
+    bytes.len() >= suffix.len()
+        && bytes[bytes.len() - suffix.len()..]
             .iter()
-            .zip(SUFFIX)
+            .zip(suffix)
             .all(|(actual, expected)| actual.to_ascii_lowercase() == *expected)
 }
 
-async fn wait_forever<'a>(cdc: &mut CdcAcmClass<'a, Driver<'a, peripherals::USB>>) {
+async fn wait_forever<'a>(
+    uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
+    cdc: &mut CdcAcmClass<'a, Driver<'a, peripherals::USB>>,
+) {
     loop {
         Timer::after_secs(5).await;
-        if cdc
-            .write_packet(b"KOTO-0068 awaiting reconnect\r\n")
-            .await
-            .is_err()
-        {
-            return;
-        }
+        emit(uart, cdc, b"KOTO-0068 awaiting observation\r\n").await;
+    }
+}
+
+async fn emit<'a>(
+    uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
+    cdc: &mut CdcAcmClass<'a, Driver<'a, peripherals::USB>>,
+    bytes: &[u8],
+) {
+    let _ = uart.blocking_write(bytes);
+    if cdc.dtr() {
+        let _ = write_packets(cdc, bytes).await;
     }
 }
 
@@ -300,23 +334,6 @@ async fn write_packets<'a>(
         cdc.write_packet(chunk).await.map_err(|_| ())?;
     }
     Ok(())
-}
-
-async fn write_terminal_text<'a>(
-    cdc: &mut CdcAcmClass<'a, Driver<'a, peripherals::USB>>,
-    bytes: &[u8],
-) -> Result<(), ()> {
-    let mut display = [0u8; 256];
-    let mut len = 0usize;
-    for byte in bytes {
-        if *byte == b'\n' {
-            display[len] = b'\r';
-            len += 1;
-        }
-        display[len] = *byte;
-        len += 1;
-    }
-    write_packets(cdc, &display[..len]).await
 }
 
 #[derive(Clone, Copy)]
@@ -371,12 +388,16 @@ impl<const N: usize> fmt::Write for TextBuffer<N> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_manifest_name;
+    use super::{is_manifest_name, is_package_name};
 
     #[test]
     fn recognizes_manifest_suffix_case_insensitively() {
         assert!(is_manifest_name("memo.kpa.json"));
         assert!(is_manifest_name("MEMO.KPA.JSON"));
         assert!(!is_manifest_name("memo.json"));
+        assert!(is_package_name("memo.kpa"));
+        assert!(is_package_name("MEMO.KPA"));
+        assert!(is_package_name("memo.kpa.json"));
+        assert!(!is_package_name("memo.json"));
     }
 }

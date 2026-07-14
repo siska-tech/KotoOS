@@ -1,0 +1,19 @@
+{
+  "app_id": "dev.koto.samples.actor-array",
+  "kind": "koto",
+  "package": "sample_actor_array",
+  "name": "SDK Actor Array",
+  "description": "Demonstrates heap-backed ActorArray game state.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

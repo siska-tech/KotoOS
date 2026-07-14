@@ -9,7 +9,7 @@
 //! remaps every diagnostic through it, so errors report real `file:line:col`
 //! across include boundaries. Design note: `docs/spec/KOTO_LANGUAGE_INCLUDE.md`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::CompileError;
@@ -31,6 +31,51 @@ pub struct FsLoader;
 impl IncludeLoader for FsLoader {
     fn load(&mut self, path: &Path) -> Result<String, String> {
         std::fs::read_to_string(path).map_err(|error| format!("{error}"))
+    }
+}
+
+/// Include resolver that checks in-memory source overlays before falling back
+/// to another loader. An editor can pass the active document as the root
+/// source and put other unsaved open buffers in this overlay.
+pub struct OverlayLoader<L> {
+    fallback: L,
+    overlays: HashMap<PathBuf, String>,
+}
+
+impl<L> OverlayLoader<L> {
+    pub fn new(fallback: L) -> Self {
+        Self {
+            fallback,
+            overlays: HashMap::new(),
+        }
+    }
+
+    /// Add or replace an in-memory file. Paths use the same normalization as
+    /// include expansion, so `./util.koto` and `util.koto` address one entry.
+    pub fn insert(&mut self, path: impl AsRef<Path>, source: impl Into<String>) {
+        self.overlays
+            .insert(normalize(path.as_ref()), source.into());
+    }
+
+    pub fn remove(&mut self, path: impl AsRef<Path>) -> Option<String> {
+        self.overlays.remove(&normalize(path.as_ref()))
+    }
+
+    pub fn fallback(&self) -> &L {
+        &self.fallback
+    }
+
+    pub fn fallback_mut(&mut self) -> &mut L {
+        &mut self.fallback
+    }
+}
+
+impl<L: IncludeLoader> IncludeLoader for OverlayLoader<L> {
+    fn load(&mut self, path: &Path) -> Result<String, String> {
+        match self.overlays.get(&normalize(path)) {
+            Some(source) => Ok(source.clone()),
+            None => self.fallback.load(path),
+        }
     }
 }
 

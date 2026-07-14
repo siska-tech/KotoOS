@@ -1,0 +1,85 @@
+body {
+  font-family: var(--vscode-font-family);
+  color: var(--vscode-foreground);
+  padding: 8px;
+  user-select: none;
+}
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.swatch {
+  width: 26px;
+  height: 26px;
+  border: 2px solid transparent;
+  border-radius: 3px;
+  font-size: 11px;
+  color: #fff;
+  text-shadow: 0 0 2px #000;
+  cursor: pointer;
+}
+
+.swatch.selected {
+  border-color: var(--vscode-focusBorder);
+}
+
+#toolbar button:not(.swatch) {
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  border: none;
+  padding: 4px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+#status {
+  margin-left: auto;
+  opacity: 0.8;
+  font-size: 12px;
+}
+
+#main {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+#tiles {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 512px;
+  overflow-y: auto;
+  min-width: 110px;
+}
+
+.tile-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.tile-item.selected {
+  border-color: var(--vscode-focusBorder);
+  background: var(--vscode-list-activeSelectionBackground);
+}
+
+.tile-item canvas {
+  image-rendering: pixelated;
+}
+
+#grid {
+  image-rendering: pixelated;
+  border: 1px solid var(--vscode-panel-border);
+  cursor: crosshair;
+}

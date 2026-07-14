@@ -558,9 +558,9 @@ mod diag_impl {
         // `in_bits` is encoded in one byte (Y counter), so one transaction can
         // read at most 256 bits (= 32 bytes) with the current PIO program.
         const SM1_MAX_TXN_BYTES: usize = super::PSRAM_SM1_FUDGE_CLKDIV3_CHUNK_BYTES;
-        const PIN_CS: u8 = 20;
-        const PIN_MOSI: u8 = 2;
-        const PIN_MISO: u8 = 3;
+        const PIN_CS: u8 = crate::board::PICOCALC_WIRING.psram_cs;
+        const PIN_MOSI: u8 = crate::board::PICOCALC_WIRING.psram_sio[0];
+        const PIN_MISO: u8 = crate::board::PICOCALC_WIRING.psram_sio[1];
         const PIO_FDEBUG_OFFSET: u32 = 0x08;
 
         #[inline]

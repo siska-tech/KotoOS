@@ -1,0 +1,31 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.samples.dirty-rects",
+  "name": "SDK Dirty Rects",
+  "entry": "bytecode/sample_dirty_rects.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample_dirty_rects.kicon",
+  "description": "Demonstrates dirty-rect drawing.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_dirty_rects.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample_dirty_rects.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

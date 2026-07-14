@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Koto Sprite Sheet",
+  "scopeName": "source.kspr",
+  "patterns": [
+    {
+      "name": "comment.line.number-sign.kspr",
+      "match": "^\\s*#.*$"
+    },
+    {
+      "match": "^\\s*(color)\\s+(\\S)\\s+([0-9a-fA-F]{6})\\b",
+      "captures": {
+        "1": { "name": "keyword.other.color.kspr" },
+        "2": { "name": "variable.other.palette-char.kspr" },
+        "3": { "name": "constant.numeric.hex.rgb.kspr" }
+      }
+    },
+    {
+      "match": "^\\s*(tile)\\s+(\\d+)\\s+(\\S+)",
+      "captures": {
+        "1": { "name": "keyword.other.tile.kspr" },
+        "2": { "name": "constant.numeric.tile-id.kspr" },
+        "3": { "name": "entity.name.section.tile-name.kspr" }
+      }
+    },
+    {
+      "comment": "16-char pixel rows: keep them visually quiet but distinct",
+      "name": "string.unquoted.pixel-row.kspr",
+      "match": "^\\s*\\S{16}\\s*$"
+    }
+  ]
+}

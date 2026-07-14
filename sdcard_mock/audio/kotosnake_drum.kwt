@@ -1,6 +1,0 @@
-# KotoSnake drum - sine punch + LFSR grit. One percussive wavetable used at different
-# pitches: low = kick, mid = snare, high = hat. Snappy zero-sustain envelope.
-KWT1
-WAVE 14 23 -6 59 -8 14 83 75 87 97 98 63 41 44 60 71 33 100 54 100 77 48 38 65 86 22 40 9 12 65 34 -24 38 -35 -53 -29 -57 -67 -62 -15 -18 -9 -58 -22 -93 -27 -70 -26 -43 -91 -36 -34 -87 -31 -41 -17 -24 -24 -28 -6 12 -6 22 -6
-ENV 0 30 0 8
-GAIN 135

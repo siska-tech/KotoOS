@@ -1,0 +1,246 @@
+{
+  "name": "vscode-koto",
+  "displayName": "KotoOS Development",
+  "description": "Koto language intelligence, syntax highlighting, diagnostics, and asset editors for KotoOS app development.",
+  "version": "0.3.0",
+  "publisher": "koto",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "koto",
+        "aliases": [
+          "Koto"
+        ],
+        "extensions": [
+          ".koto"
+        ],
+        "configuration": "./language-configuration/koto.json"
+      },
+      {
+        "id": "kotomml",
+        "aliases": [
+          "KotoMML"
+        ],
+        "extensions": [
+          ".kmml"
+        ],
+        "configuration": "./language-configuration/hash.json"
+      },
+      {
+        "id": "kspr",
+        "aliases": [
+          "Koto Sprite Sheet"
+        ],
+        "extensions": [
+          ".kspr"
+        ],
+        "configuration": "./language-configuration/hash.json"
+      },
+      {
+        "id": "kicon",
+        "aliases": [
+          "Koto Launcher Icon"
+        ],
+        "extensions": [
+          ".kicon"
+        ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "koto",
+        "scopeName": "source.koto",
+        "path": "./syntaxes/koto.tmLanguage.json"
+      },
+      {
+        "language": "kotomml",
+        "scopeName": "source.kotomml",
+        "path": "./syntaxes/kotomml.tmLanguage.json"
+      },
+      {
+        "language": "kspr",
+        "scopeName": "source.kspr",
+        "path": "./syntaxes/kspr.tmLanguage.json"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "koto.ksprEditor",
+        "displayName": "Koto Sprite Editor",
+        "selector": [
+          {
+            "filenamePattern": "*.kspr"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "koto.kiconEditor",
+        "displayName": "Koto Icon Editor",
+        "selector": [
+          {
+            "filenamePattern": "*.kicon"
+          }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "koto.tilemapEditor",
+        "displayName": "Koto Tilemap Editor",
+        "selector": [
+          {
+            "filenamePattern": "*.map"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "jsonValidation": [
+      {
+        "fileMatch": "**/apps/**/app.json",
+        "url": "./schemas/app.schema.json"
+      }
+    ],
+    "configuration": {
+      "title": "Koto Language Server",
+      "properties": {
+        "koto.languageServer.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable live Koto diagnostics, definitions, hover, and slot inlays."
+        },
+        "koto.languageServer.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a koto-lsp executable. Empty runs `cargo run -q -p koto-lsp --` in the workspace."
+        },
+        "koto.languageServer.debounceMs": {
+          "type": "number",
+          "default": 150,
+          "minimum": 0,
+          "description": "Delay before sending a changed full document to koto-lsp."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "koto.kspr.openEditor",
+        "title": "Koto: Open in Sprite Editor",
+        "icon": "$(symbol-color)"
+      },
+      {
+        "command": "koto.icon.openEditor",
+        "title": "Koto: Open in Icon Editor",
+        "icon": "$(symbol-color)"
+      },
+      {
+        "command": "koto.app.openIcon",
+        "title": "Koto: Open App Icon",
+        "icon": "$(file-media)"
+      },
+      {
+        "command": "koto.app.addResource",
+        "title": "Koto: Add App Resource",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "koto.app.createProject",
+        "title": "Koto: Create New App Project",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "koto.tilemap.openEditor",
+        "title": "Koto: Open in Tilemap Editor",
+        "icon": "$(map)"
+      },
+      {
+        "command": "koto.kmml.play",
+        "title": "Koto MML: Play (KotoAudio)",
+        "icon": "$(play)"
+      },
+      {
+        "command": "koto.kmml.playOptions",
+        "title": "Koto MML: Play with options (mute / loop)"
+      },
+      {
+        "command": "koto.kmml.stop",
+        "title": "Koto MML: Stop",
+        "icon": "$(debug-stop)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "koto.kmml.play",
+          "when": "resourceLangId == kotomml",
+          "group": "navigation@1"
+        },
+        {
+          "command": "koto.kmml.stop",
+          "when": "resourceLangId == kotomml",
+          "group": "navigation@2"
+        },
+        {
+          "command": "koto.kspr.openEditor",
+          "when": "resourceLangId == kspr && activeCustomEditorId != koto.ksprEditor",
+          "group": "navigation@1"
+        },
+        {
+          "command": "koto.icon.openEditor",
+          "when": "resourceLangId == kicon && activeCustomEditorId != koto.kiconEditor",
+          "group": "navigation@1"
+        },
+        {
+          "command": "koto.app.openIcon",
+          "when": "resourceFilename == app.json",
+          "group": "navigation@1"
+        },
+        {
+          "command": "koto.app.addResource",
+          "when": "resourceFilename == app.json",
+          "group": "navigation@2"
+        },
+        {
+          "command": "koto.tilemap.openEditor",
+          "when": "resourceExtname == .map && activeCustomEditorId != koto.tilemapEditor",
+          "group": "navigation@1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "koto.app.createProject",
+          "when": "view == workbench.explorer.fileView",
+          "group": "navigation@10"
+        }
+      ]
+    },
+    "problemMatchers": [
+      {
+        "name": "koto",
+        "label": "koto-compiler diagnostics (file:line:col: message)",
+        "owner": "koto",
+        "source": "koto-compiler",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ],
+        "pattern": {
+          "regexp": "^(.+\\.koto):(\\d+):(\\d+):\\s+(.+)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "message": 4
+        }
+      }
+    ]
+  }
+}

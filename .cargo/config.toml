@@ -8,3 +8,13 @@ rustflags = [
     "-C",
     "link-arg=-Tlink-rp.x",
 ]
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    "-C",
+    "link-arg=--nmagic",
+    "-C",
+    "link-arg=-Tlink-rp235x.x",
+    "-C",
+    "link-arg=-Tlink.x",
+]

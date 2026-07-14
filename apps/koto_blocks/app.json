@@ -1,0 +1,63 @@
+{
+  "app_id": "dev.koto.games.koto-blocks",
+  "kind": "koto",
+  "package": "koto_blocks",
+  "name": "KotoBlocks",
+  "description": "落ち物ブロックパズル。スプライト・タイル描画のサンプル。",
+  "category": "ゲーム",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#1A263E",
+    "primary": "#2ACADC",
+    "secondary": "#F6C236",
+    "accent": "#B058D2",
+    "highlight": "#46BE69",
+    "shadow": "#0E1626"
+  },
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "codegen": {
+    "comment": "KOTO-0156: the per-frame loop body exceeds one 16 KiB PSRAM code-window tile. Relocating the one-time string-init preamble to the tail (relocate_preamble) AND outlining the cold title-state block (outline_cold_blocks) together front-load the steady loop into a single tile -> steady gameplay refills 2 -> 0. Neither alone wins (preamble-only regresses to 442 refills, outline-only to 14); only the pair. See docs/devlog/KOTO_KOTOBLOCKS_COLD_BLOCK_OUTLINING.md.",
+    "relocate_preamble": true,
+    "outline_cold_blocks": true
+  },
+  "audio": [
+    {
+      "source": "audio/bgm.kmml",
+      "output": "audio/koto_blocks_bgm.kmml"
+    },
+    {
+      "source": "audio/move.kmml",
+      "output": "audio/koto_blocks_move.kmml"
+    },
+    {
+      "source": "audio/rotate.kmml",
+      "output": "audio/koto_blocks_rotate.kmml"
+    },
+    {
+      "source": "audio/lock.kmml",
+      "output": "audio/koto_blocks_lock.kmml"
+    },
+    {
+      "source": "audio/clear.kmml",
+      "output": "audio/koto_blocks_clear.kmml"
+    },
+    {
+      "source": "audio/over.kmml",
+      "output": "audio/koto_blocks_over.kmml"
+    },
+    {
+      "source": "audio/tetris.kmml",
+      "output": "audio/koto_blocks_tetris.kmml"
+    }
+  ]
+}

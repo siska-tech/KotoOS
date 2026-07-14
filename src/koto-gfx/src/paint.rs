@@ -18,8 +18,8 @@
 use crate::derive::stamp_cell;
 use crate::font::BitmapFont;
 use crate::layer::{
-    AppDrawCommand, Game2dBoard, Game2dSprite, Game2dStampDef, Game2dText, GAME2D_BOARD_COLS,
-    GAME2D_ORIGIN_X, GAME2D_ORIGIN_Y, GAME2D_TILE_BYTES, GAME2D_TILE_PX,
+    AppDrawCommand, Game2dSprite, Game2dStampDef, Game2dText, Game2dTilemap, GAME2D_TILE_BYTES,
+    GAME2D_TILE_PX,
 };
 use crate::raster::{Canvas, Rgb565};
 use crate::Rect;
@@ -28,23 +28,24 @@ use crate::Rect;
 /// holds the app-heap byte offset of a 16x16 RGB565 tile; the canvas viewport
 /// clips blits outside the current rect, so off-strip cells are no-ops
 /// (KOTO-0135).
-pub fn paint_board_layer(canvas: &mut Canvas<'_>, board: &Game2dBoard, heap: &[u8]) {
-    for (index, &tile_ref) in board.iter().enumerate() {
-        let Ok(off) = usize::try_from(tile_ref) else {
-            continue; // empty (`-1`)
-        };
-        let Some(src) = heap.get(off..off.saturating_add(GAME2D_TILE_BYTES)) else {
-            continue;
-        };
-        let cx = (index % GAME2D_BOARD_COLS) as i32;
-        let cy = (index / GAME2D_BOARD_COLS) as i32;
-        canvas.blit_rgb565(
-            GAME2D_ORIGIN_X + cx * GAME2D_TILE_PX,
-            GAME2D_ORIGIN_Y + cy * GAME2D_TILE_PX,
-            GAME2D_TILE_PX,
-            GAME2D_TILE_PX,
-            src,
-        );
+pub fn paint_board_layer(canvas: &mut Canvas<'_>, board: &Game2dTilemap, heap: &[u8]) {
+    for cy in 0..usize::from(board.rows) {
+        for cx in 0..usize::from(board.columns) {
+            let tile_ref = board.cells[Game2dTilemap::cell_index(cx, cy)];
+            let Ok(off) = usize::try_from(tile_ref) else {
+                continue; // empty (`-1`)
+            };
+            let Some(src) = heap.get(off..off.saturating_add(GAME2D_TILE_BYTES)) else {
+                continue;
+            };
+            canvas.blit_rgb565(
+                i32::from(board.origin_x) + cx as i32 * GAME2D_TILE_PX,
+                i32::from(board.origin_y) + cy as i32 * GAME2D_TILE_PX,
+                GAME2D_TILE_PX,
+                GAME2D_TILE_PX,
+                src,
+            );
+        }
     }
 }
 
@@ -135,9 +136,8 @@ pub fn paint_command_list(
                 off,
                 len,
             } => {
-                if let Some(src) =
-                    heap.get(*off as usize..(*off as usize).saturating_add(*len as usize))
-                {
+                let off = crate::pixel_heap_offset(*off) as usize;
+                if let Some(src) = heap.get(off..off.saturating_add(*len as usize)) {
                     canvas.blit_rgb565(*x, *y, *w, *h, src);
                 }
             }
@@ -169,7 +169,7 @@ pub fn paint_app_commands(
     canvas: &mut Canvas<'_>,
     font: &BitmapFont<'_>,
     static_commands: &[AppDrawCommand],
-    board: &Game2dBoard,
+    board: &Game2dTilemap,
     sprites: &[Game2dSprite],
     stamps: &[Game2dStampDef],
     text_items: &[Game2dText],

@@ -23,24 +23,52 @@ To create a high-level app skeleton and register it in the build loop:
 cargo run -p koto-app-scaffold -- --app-id dev.koto.apps.todo-list --name "Todo List"
 ```
 
-The command creates `apps/todo_list/src/main.koto`, a smoke scenario under
-`apps/todo_list/scenarios/`, a `.kpa.json` manifest, an icon placeholder, and an
-`apps/apps.json` entry. It validates the generated app ID, display name, runtime,
+In VS Code, the same operation is available without CLI flags: click the
+new-folder action in the Explorer title or run **Koto: Create New App Project**
+(KOTO-0197). Enter the reverse-DNS app ID, display name, and the proposed
+`apps/<slug>` directory, then confirm the summary. The extension streams the
+scaffold output and opens the generated `src/main.koto`; cancellation and all
+duplicate/overwrite checks remain enforced by `koto-app-scaffold`.
+
+The command creates a self-contained `apps/todo_list/` folder:
+`src/main.koto` + `src/helpers.koto`, a smoke scenario under `scenarios/`, an
+`icon.kicon` placeholder, and the `app.json` descriptor (section 2) — no shared
+registry is touched. It validates the generated app ID, display name, runtime,
 entry path, and icon path through the same package manifest rules used by the
 runtime and packer.
 
-## 2. Register the app
+## 2. The app descriptor (`app.json`)
 
-Add an entry to [`apps/apps.json`](../../apps/apps.json):
+Each app is a self-contained folder under `apps/` described by its own
+`apps/<dir>/app.json` (KOTO-0195). The scaffold writes it; `build_apps.py`
+discovers every descriptor by scanning `apps/**/app.json`, so there is no
+shared registry to edit. A descriptor carries the build recipe **and** the
+package fields (name, icon, palette, memory, permissions):
 
 ```json
-{ "app_id": "dev.koto.memo", "kind": "koto",
-  "source": "apps/memo/src/main.koto",
-  "output": "sdcard_mock/bytecode/memo.kbc",
-  "manifest": "sdcard_mock/apps/memo.kpa.json" }
+{
+  "app_id": "dev.koto.memo",
+  "kind": "koto",
+  "package": "memo",
+  "name": "Koto Memo",
+  "description": "テキストメモを作成・編集できます。",
+  "category": "アプリ",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": { "sram_work_bytes": 24576, "psram_cache_bytes": 32768 },
+  "permissions": { "fs": "sandbox", "network": false }
+}
 ```
 
-`kind` is `koto` (compiled by `koto-compiler`) or `asm` (assembled by `kbc-asm`).
+In-app paths (`source`, `icon`, and the optional `audio` / `images` / `maps`
+sources) are **app-relative**, so the folder is copy-paste portable. `kind` is
+`koto` (compiled by `koto-compiler`) or `asm` (assembled by `kbc-asm`).
+`package` is the staging/archive stem (`APPS/<package>.kpa`). The build
+generates the `.kpa.json` manifest and stages `icon.kicon` into
+`package_inputs/` — those are intermediates, not authored by hand. Optional
+blocks: `codegen` (per-app compiler flags), `maps` (`.map` validation and packaging),
+`images` (`.kspr` → `.kim`), `audio` (staged/compiled Native KotoAudio),
+`shell_icon` (launcher palette).
 
 ## 3. Build
 
@@ -110,7 +138,90 @@ Save As. F10 quits the app, and Esc quits the simulator. Backspace and Delete us
 normal key repeat when held. The
 window paints the VM's own draw output and routes keys into the running VM.
 
-## 6. Diagnostics
+### Direct app launch and live reload (`--watch`, KOTO-0191)
+
+`--window --app` skips the shell and starts inside the app; adding `--watch`
+turns the window into a live-reload loop:
+
+```powershell
+cargo run -p koto-sim --features window -- --window --app dev.koto.games.kotorogue `
+  --watch apps/kotorogue --watch-replay apps/kotorogue/scenarios/play.txt
+```
+
+Saving any file under the watched tree (sources, includes, `.kspr`, `.kmml`,
+maps) rebuilds **just that app** through the registry build
+(`harness/build_apps.py --app`, so images/maps/assets stay in sync) and
+relaunches it in the same window — typically well under a second. The rebuild
+runs on the window thread, so the frame pauses for that moment.
+
+- A compile error does **not** end the loop: the running app keeps its last
+  good build, the `file:line:col` diagnostic prints to the console (the same
+  format the `$koto` problem matcher parses), and the next good save
+  recovers.
+- `--watch-replay PATH` replays an [app input script](#app-input-scripts)
+  after every (re)launch, landing back at the scene being iterated on — no VM
+  snapshotting, just the deterministic replay the scripted runs already use.
+- Like all window-mode sessions, watch runs against `sdcard_mock` directly
+  (rebuilding rewrites the committed bytecode, as a manual rebuild would);
+  headless `--app` runs keep their throwaway-copy behavior.
+
+## 6. Editor setup (VS Code)
+
+The repo ships a declarative VS Code extension (KOTO-0190) with syntax
+highlighting for `.koto`/`.kmml`/`.kspr` and a `$koto` problem matcher
+that turns `koto-compiler` `file:line:col` diagnostics — including inside
+`include`d files — into in-editor squiggles. Install it once by linking it
+into your extensions directory and reloading the window:
+
+```powershell
+New-Item -ItemType Junction `
+  -Path "$env:USERPROFILE\.vscode\extensions\koto.vscode-koto" `
+  -Target "tools\vscode-koto"
+```
+
+See [tools/vscode-koto/README.md](../../tools/vscode-koto/README.md) for
+details and uninstall.
+
+With the extension active, the workspace tasks in `.vscode/tasks.json`
+(Terminal → Run Task…) drive the loop above without leaving the editor:
+
+- **Koto: build apps** (`Ctrl+Shift+B`) — `build_apps.py` with compile
+  errors as diagnostics.
+- **Koto: run current app (headless report)** / **Koto: screenshot current
+  app** — resolve the app from the file you are editing (any file under
+  `apps/<dir>/`, includes and assets too) via `harness/dev_app.py`;
+  screenshots land in `target/koto-dev/<dir>.bmp`, driven by
+  `apps/<dir>/scenarios/frame_capture.txt` when present.
+- **Koto: watch current app (live reload)** — the KOTO-0191 loop above for
+  the app you are editing; `apps/<dir>/scenarios/watch_replay.txt` is picked
+  up automatically as the replay script when present.
+- **Koto: sim window** — plain window mode (section 5).
+- **Koto: check all** — the full local gate (section 9).
+
+For `.koto` files, the extension also starts `koto-lsp` (KOTO-0194). Unsaved
+changes receive compiler diagnostics after a 150 ms debounce; F12 follows
+function/constant definitions across `include` files; hover shows function
+signatures and slot footprints or constant values; and the first line shows a
+`slots used/45` inlay with a warning at 90%. Set
+`koto.languageServer.path` for a prebuilt server, or leave it empty to run the
+workspace `koto-lsp` through Cargo.
+
+The extension also ships asset editors and descriptor validation: open a
+`.kspr` with *Open With… → Koto Sprite Editor* for a pixel-grid editor
+(KOTO-0192); open a `.kicon` with *Koto Icon Editor* for a 40×40 mask editor
+whose palette panel edits the sibling `app.json` `shell_icon`, or use the
+**Koto: Open App Icon** button on an `app.json` (KOTO-0196). The adjacent
+**Koto: Add App Resource** button selects an app-local `.kspr`, `.kmml`, or
+`.kacl`, suggests its package output, and adds it to `images` or `audio`.
+Maps remain manual because they require dimensions, glyphs, and source-marker
+configuration. Use the play/stop editor-title buttons on
+`.kmml` files to audition the native KotoAudio score (the KOTO-0188 CLI); and
+`app.json` descriptors get schema completion and validation as you type. Both
+asset editors edit the text format in place (byte-identical untouched saves,
+one-line diffs per pixel). See
+[tools/vscode-koto/README.md](../../tools/vscode-koto/README.md).
+
+## 7. Diagnostics
 
 When an app traps, the runner reports the app ID, the frame, the VM program counter,
 and the VM error, for example:
@@ -192,7 +303,7 @@ peak_lets`, per-scope reuse from KOTO-0092) — a guide to which helpers are hea
 inline; they no longer own fixed slot ranges. The budget gate reports
 `user_slots_used` and warns as it nears the cap.
 
-## 7. Save Data
+## 8. Save Data
 
 Bytecode apps save through the sandboxed file host calls. A path such as
 `memo.txt` for `dev.koto.memo` is stored under:
@@ -221,7 +332,7 @@ Direct `--app` runs still use a throwaway copy of `sdcard_mock`, so they do not
 modify committed test state unless a separate save-data management command is
 used.
 
-## 8. Validate
+## 9. Validate
 
 `python harness\check_all.py` runs the whole local gate, including the app build
 sync, the scripted memo validation, and golden frame validation, so a green run

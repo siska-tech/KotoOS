@@ -19,7 +19,6 @@ embassy-futures = "0.1.2"
 embassy-rp = { version = "0.10.0", features = [
     "critical-section-impl",
     "executor-thread",
-    "rp2040",
     "time-driver",
     "unstable-pac",
 ] }
@@ -29,15 +28,15 @@ embedded-hal = "1.0.0"
 embedded-hal-bus = "0.2.0"
 embedded-sdmmc = { version = "0.9.0", default-features = false }
 # Ported bounded audio runtime (sibling project, KOTO-0165). The CPU1 worker
-# drives its DefaultAudioService; the cue tables are compiled from apps' .kmml
-# sources by tools/koto-audio-gen.
+# drives its DefaultAudioService plus owned runtime-cue players. Package KMML is
+# read from SD and compiled into pointer-free PSRAM images at runtime.
 koto-audio = { path = "../koto-audio/crates/koto-audio", features = [
     "sldpcm4-drums",
 ] }
 koto-core = { path = "../koto-core" }
 koto-game2d = { path = "../koto-game2d" }
 koto-gfx = { path = "../koto-gfx" }
-koto-psram = { path = "../../../koto-psram", features = ["rp2040-embassy"] }
+koto-psram = { path = "../koto-psram", optional = true }
 panic-halt = "1.0.0"
 pio = "0.3.0"
 portable-atomic = { version = "1.13.1", features = ["critical-section"] }
@@ -109,7 +108,24 @@ bench = false
 # compile_error in psram_ext.rs). The phase=176 canary line stays as the
 # permanent regression tripwire: any `.bss` growth must keep `free_min`
 # comfortably positive on hardware.
-default = ["ram_interpreter", "psram_fast_code_window", "ram_audio_mixer"]
+default = ["board-picocalc-pico", "ram_interpreter", "ram_audio_mixer"]
+# Public board selection. Each board owns its MCU selection and performance
+# policy so adding a board does not spread MCU/board combinations across build
+# commands or runtime source. lib.rs rejects zero or multiple board selections.
+board-picocalc-pico = ["mcu-rp2040", "psram_fast_code_window"]
+board-picocalc-pico2w = ["mcu-rp235xa", "psram_fast_code_window"]
+# Internal MCU selection used by Embassy, PAC-level code, and the linker. Build
+# entry points should select a board feature rather than either feature below.
+mcu-rp2040 = [
+    "embassy-rp/rp2040",
+    "dep:koto-psram",
+    "koto-psram/rp2040-embassy",
+]
+mcu-rp235xa = [
+    "embassy-rp/rp235xa",
+    "dep:koto-psram",
+    "koto-psram/rp235xa-embassy",
+]
 # Interpreter-in-SRAM placement (KOTO-0169 Stage 2, H2-b): run the koto-vm hot
 # loop of the PSRAM-window app path from SRAM instead of flash XIP
 # (cortex-m-rt's link.x copies the tagged `.data.*` section to RAM at reset).
@@ -137,13 +153,19 @@ ram_audio_mixer = ["koto-audio/ram-hot-mix"]
 # escape hatch. It does not affect the `psram_qpi_*` / `psram_dma_*` experiment
 # profiles, which select their own backends.
 legacy_psram = []
-# Fast CodeWindow refill (KOTO-0153; default-on since KOTO-0171). The default
+# Device-validation-only switch used by KOTO-0205 to prove that the product
+# firmware boots and runs its bounded SRAM path when baseboard PSRAM is absent.
+# The normal artifact never enables this feature.
+force_psram_fallback = []
+# Fast CodeWindow refill (KOTO-0153; default-on since KOTO-0171 on RP2040 and
+# enabled by the RP2350A MCU profile after KOTO-0205 parity validation). The default
 # `koto-psram` backend attempts the hardware-validated `FastFallingClkdiv2`
 # read (read_clkdiv=2.0, falling-edge sampling, extra dummy byte, RX byte-FIFO
 # + RX DMA) for PsramCodeWindow refills, falling back to the safe koto-psram
 # read on any unsupported address/length or read error. Ordinary PSRAM
 # reads/writes stay on the safe profile; only refills switch. Pulls in the
-# matching `koto-psram/psram_fast_read_clkdiv2` driver feature. Requires the
+# matching `koto-psram/psram_fast_read_clkdiv2` driver feature. Divider 2 means
+# a 62.5 MHz state-machine clock on RP2040 and 75 MHz on RP2350A. Requires the
 # default `koto-psram` backend (mutually exclusive with the legacy/qpi/dma
 # profiles — those now need `--no-default-features`).
 psram_fast_code_window = ["koto-psram/psram_fast_read_clkdiv2"]

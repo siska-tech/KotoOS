@@ -29,7 +29,6 @@ compile_error!(
     "`psram_fast_code_window` requires the default koto-psram backend and is mutually exclusive with `legacy_psram`, `psram_dma_read_code_window`, and `psram_qpi_safe_read_code_window` — build those profiles with `--no-default-features` (psram_fast_code_window is default-on since KOTO-0171)"
 );
 
-use embassy_rp::peripherals::{PIN_2, PIN_20, PIN_21, PIN_3, PIN_4, PIN_5, PIO1};
 use embassy_rp::Peri;
 use koto_core::hal::{HalError, PsramHal};
 use koto_psram::bus::PsramBus;
@@ -39,6 +38,10 @@ use koto_psram::error::PsramError;
 use koto_psram::pio::blocking::BlockingDriver;
 use koto_psram::rp2040_embassy::{EmbassyRpQpiBackend, EmbassyRpQpiError};
 use koto_psram::PsramAddr;
+
+use crate::board::{
+    PsramCsPin, PsramPio, PsramSckPin, PsramSio0Pin, PsramSio1Pin, PsramSio2Pin, PsramSio3Pin,
+};
 
 #[cfg(feature = "psram_fast_code_window")]
 use embassy_rp::dma;
@@ -53,7 +56,17 @@ pub use fast_counters::{
 
 /// Concrete `koto-psram` Embassy backend bound to the PicoCalc PIO1/SM0 wiring
 /// (SIO0..3 on GP2-5, CS on GP20, SCK on GP21).
-type Backend<'d> = EmbassyRpQpiBackend<'d, PIO1, 0, PIN_2, PIN_3, PIN_4, PIN_5, PIN_20, PIN_21>;
+type Backend<'d> = EmbassyRpQpiBackend<
+    'd,
+    PsramPio,
+    0,
+    PsramSio0Pin,
+    PsramSio1Pin,
+    PsramSio2Pin,
+    PsramSio3Pin,
+    PsramCsPin,
+    PsramSckPin,
+>;
 
 /// PAC DMA channel `koto-psram`'s fast RX-DMA path drives directly. The firmware
 /// must reserve `DMA_CH1` and pass it to [`KotoPsram::new`] so the embassy
@@ -100,14 +113,14 @@ impl<'d> KotoPsram<'d> {
     #[cfg(not(feature = "psram_fast_code_window"))]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        common: embassy_rp::pio::Common<'d, PIO1>,
-        sm0: embassy_rp::pio::StateMachine<'d, PIO1, 0>,
-        cs: Peri<'d, PIN_20>,
-        sck: Peri<'d, PIN_21>,
-        sio0: Peri<'d, PIN_2>,
-        sio1: Peri<'d, PIN_3>,
-        sio2: Peri<'d, PIN_4>,
-        sio3: Peri<'d, PIN_5>,
+        common: embassy_rp::pio::Common<'d, PsramPio>,
+        sm0: embassy_rp::pio::StateMachine<'d, PsramPio, 0>,
+        cs: Peri<'d, PsramCsPin>,
+        sck: Peri<'d, PsramSckPin>,
+        sio0: Peri<'d, PsramSio0Pin>,
+        sio1: Peri<'d, PsramSio1Pin>,
+        sio2: Peri<'d, PsramSio2Pin>,
+        sio3: Peri<'d, PsramSio3Pin>,
     ) -> Result<Self, HalError> {
         let backend = EmbassyRpQpiBackend::with_timing(
             common,
@@ -137,14 +150,14 @@ impl<'d> KotoPsram<'d> {
     #[cfg(feature = "psram_fast_code_window")]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        common: embassy_rp::pio::Common<'d, PIO1>,
-        sm0: embassy_rp::pio::StateMachine<'d, PIO1, 0>,
-        cs: Peri<'d, PIN_20>,
-        sck: Peri<'d, PIN_21>,
-        sio0: Peri<'d, PIN_2>,
-        sio1: Peri<'d, PIN_3>,
-        sio2: Peri<'d, PIN_4>,
-        sio3: Peri<'d, PIN_5>,
+        common: embassy_rp::pio::Common<'d, PsramPio>,
+        sm0: embassy_rp::pio::StateMachine<'d, PsramPio, 0>,
+        cs: Peri<'d, PsramCsPin>,
+        sck: Peri<'d, PsramSckPin>,
+        sio0: Peri<'d, PsramSio0Pin>,
+        sio1: Peri<'d, PsramSio1Pin>,
+        sio2: Peri<'d, PsramSio2Pin>,
+        sio3: Peri<'d, PsramSio3Pin>,
         rx_dma: dma::Channel<'d>,
     ) -> Result<Self, HalError> {
         let backend = EmbassyRpQpiBackend::with_timing(

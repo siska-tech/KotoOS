@@ -1,0 +1,20 @@
+[package]
+name = "koto-mml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# `.kmml` audition CLI (KOTO-0188): render a score to WAV or play it on the
+# host through the native KotoAudio device-parity pipeline.
+
+[features]
+# Opt-in host playback (`koto-mml play`); headless builds/CI stay
+# dependency-free, same pattern as koto-sim's `window` feature.
+play = ["dep:cpal"]
+
+[dependencies]
+koto-audio = { path = "../../src/koto-audio/crates/koto-audio" }
+koto-audio-tools = { path = "../../src/koto-audio/crates/koto-audio-tools" }
+koto-audio-gen = { path = "../koto-audio-gen" }
+koto-sim = { path = "../../src/koto-sim" }
+cpal = { version = "0.15", optional = true }

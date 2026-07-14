@@ -77,6 +77,19 @@ Recorded results (2026-06-22, `thumbv6m-none-eabi` release, SPI 62.5 MHz):
 | App launch / return | launch immediate; return 165 ms (full themed repaint) |
 | Pane toggle | 279–280 ms (full repaint + bounded `SHELLPRF.TXT` write) |
 
+## Phase 5: RP2350 / Pico 2 Compatibility Gate
+
+The cross-build and hardware matrix is defined in the
+[RP2350 / Pico 2 Support Roadmap](RP2350_SUPPORT_ROADMAP.md). RP2350 support is
+not declared from compilation alone: each board profile needs an identifiable
+UF2, a recorded boot, applicable peripheral probes, the shell/app/audio stress
+session, and a board-specific stack-canary result.
+
+The first active gate is the RP2350A Pico 2 W currently available for device
+testing (KOTO-0204 and KOTO-0205). Pico Plus 2(W) is the subsequent KOTO-0206
+gate and additionally requires module QMI PSRAM identity, boundary, and soak
+tests plus a forced fallback to the separate PicoCalc baseboard PSRAM.
+
 ## Release Gates
 
 MVP is not considered complete until:

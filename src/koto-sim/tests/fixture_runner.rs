@@ -9,7 +9,7 @@
 //! code-fetch count. The point is observation — instruction/hostcall/frame/code-read
 //! metrics for a fixed fixture — not VM optimisation, so it changes no VM behaviour.
 //!
-//! The fixtures live in `sdcard_mock/bytecode/` (where the rest of `koto-sim`
+//! The fixtures live in `package_inputs/bytecode/` (where the rest of `koto-sim`
 //! already reads them), so the harness sits in `koto-sim` rather than in the
 //! `no_std`, app-asset-free `koto-vm` crate.
 
@@ -29,24 +29,46 @@ const CALLS: usize = SIM_VM_CALL_DEPTH;
 /// The interactive game fixture exercised by the harness: it drives the retained
 /// Game2D tile/sprite/text layers, immediate draws, and per-asset audio, so it is
 /// the richest single fixture for hostcall coverage.
-const KOTO_BLOCKS: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/koto_blocks.kbc");
+const KOTO_BLOCKS: &[u8] = include_bytes!("../../../package_inputs/bytecode/koto_blocks.kbc");
 /// Sokoban uses a package-local 32x32 tile sheet and captures the visible board
 /// viewport into the retained Game2D static layer.
-const SOKOBAN: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/sokoban.kbc");
+const SOKOBAN: &[u8] = include_bytes!("../../../package_inputs/bytecode/sokoban.kbc");
 /// KotoSnake migrates its fixed chrome (page/field/grid/header+HUD bars/labels) to
 /// the retained Game2D static layer and its live HUD numbers to retained text,
 /// keeping the flowing-rainbow snake / apple / particles on the immediate path.
-const KOTOSNAKE: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/kotosnake.kbc");
+const KOTOSNAKE: &[u8] = include_bytes!("../../../package_inputs/bytecode/kotosnake.kbc");
 /// A second, far simpler fixture, to show the runner is fixture-agnostic.
-const COUNTER_LOOP: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/sample_counter_loop.kbc");
+const COUNTER_LOOP: &[u8] =
+    include_bytes!("../../../package_inputs/bytecode/sample_counter_loop.kbc");
 
-const KOTOSHOGI: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/kotoshogi.kbc");
+const KOTOSHOGI: &[u8] = include_bytes!("../../../package_inputs/bytecode/kotoshogi.kbc");
 
-const KOTOMINES: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/kotomines.kbc");
+const KOTOMINES: &[u8] = include_bytes!("../../../package_inputs/bytecode/kotomines.kbc");
 
-const KOTORUN: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/kotorun.kbc");
+const KOTORUN: &[u8] = include_bytes!("../../../package_inputs/bytecode/kotorun.kbc");
 
-const KOTOROGUE: &[u8] = include_bytes!("../../../sdcard_mock/bytecode/kotorogue.kbc");
+const KOTOROGUE: &[u8] = include_bytes!("../../../package_inputs/bytecode/kotorogue.kbc");
+
+const RETAINED_TILEMAP: &[u8] =
+    include_bytes!("../../../package_inputs/bytecode/sample_retained_tilemap.kbc");
+
+const RETAINED_TILEMAP_SCROLL: &[u8] =
+    include_bytes!("../../../package_inputs/bytecode/sample_retained_tilemap_scroll.kbc");
+
+const FULL_COLOR_TILE_IMAGE: &[u8] =
+    include_bytes!("../../../package_inputs/bytecode/sample_full_color_tile_image.kbc");
+const FULL_COLOR_TILE_SHEET: &[u8] = include_bytes!("../../../package_inputs/images/landscape.kim");
+const FULL_COLOR_CITY_SHEET: &[u8] = include_bytes!("../../../package_inputs/images/city.kim");
+const FULL_COLOR_AUTUMN_SHEET: &[u8] = include_bytes!("../../../package_inputs/images/autumn.kim");
+const FULL_COLOR_SPACE_SHEET: &[u8] = include_bytes!("../../../package_inputs/images/space.kim");
+
+const RETAINED_TILEMAP_MAP: &[u8] =
+    include_bytes!("../../../apps/samples/retained_tilemap/maps/world.map");
+const RETAINED_TILEMAP_SCROLL_MAP: &[u8] =
+    include_bytes!("../../../apps/samples/retained_tilemap_scroll/maps/world.map");
+const SOKOBAN_MAP_1: &[u8] = include_bytes!("../../../apps/sokoban/maps/01-switchback.map");
+const SOKOBAN_MAP_2: &[u8] = include_bytes!("../../../apps/sokoban/maps/02-cross-dock.map");
+const SOKOBAN_MAP_3: &[u8] = include_bytes!("../../../apps/sokoban/maps/03-last-mile.map");
 
 /// The return status a hostcall reported, distilled from [`HostCallOutcome`] so the
 /// harness can tally success vs. failure without retaining the (heap-bound) payloads.
@@ -97,6 +119,8 @@ struct RecordingHost {
     /// test can prove *which* board cells a lock wrote (e.g. KotoBlocks' hard drop
     /// locking the active piece against the floor).
     tiles_set: Vec<(i32, i32, i32, i32)>,
+    /// Every retained tilemap configuration, including geometry and pixel origin.
+    tilemaps_configured: Vec<(i32, i32, i32, i32, i32)>,
     /// Every immediate `draw_rect(x, y, w, h, rgb565)` this run, in order, so a test
     /// can assert the *shape* of an effect's rect composition (e.g. KotoBlocks'
     /// line-clear blink drawing one full-width band per row instead of per-cell).
@@ -126,6 +150,9 @@ struct RecordingHost {
     static_frame: usize,
     /// Peak `static_frame` across all rebuilds this run.
     static_frame_peak: usize,
+    /// Optional test-only truncation applied to package map loads. `None` copies
+    /// the complete authored asset; a limit exercises the app's bounded decoder.
+    map_asset_limit: Option<usize>,
 }
 
 /// Which immediate draw primitive an [`ImmDraw`] came from. Geometry is meaningful
@@ -259,6 +286,30 @@ impl VmHost for RecordingHost {
         self.record(host_call::DRAW_PIXELS_RGB565, 6, HostCallOutcome::Ok0)
     }
 
+    fn draw_pixels_persistent_rgb565(
+        &mut self,
+        _x: i32,
+        _y: i32,
+        w: i32,
+        h: i32,
+        _pixels: &[u8],
+    ) -> HostCallOutcome {
+        self.draws += 1;
+        self.imm.push(ImmDraw {
+            kind: ImmKind::Pixels,
+            in_static: false,
+            w,
+            h,
+            color: -1,
+        });
+        self.note_immediate();
+        self.record(
+            host_call::DRAW_PIXELS_PERSISTENT_RGB565,
+            6,
+            HostCallOutcome::Ok0,
+        )
+    }
+
     // --- Retained Game2D layers ---------------------------------------------
     fn game2d_set_tile(&mut self, layer: i32, x: i32, y: i32, tile_ref: i32) -> HostCallOutcome {
         self.tiles_set.push((layer, x, y, tile_ref));
@@ -267,6 +318,19 @@ impl VmHost for RecordingHost {
 
     fn game2d_clear_layer(&mut self, _layer: i32) -> HostCallOutcome {
         self.record(host_call::GAME2D_CLEAR_LAYER, 1, HostCallOutcome::Ok0)
+    }
+
+    fn game2d_configure_tilemap(
+        &mut self,
+        layer: i32,
+        columns: i32,
+        rows: i32,
+        origin_x: i32,
+        origin_y: i32,
+    ) -> HostCallOutcome {
+        self.tilemaps_configured
+            .push((layer, columns, rows, origin_x, origin_y));
+        self.record(host_call::GAME2D_CONFIGURE_TILEMAP, 5, HostCallOutcome::Ok0)
     }
 
     fn game2d_present(&mut self, _heap: &[u8]) -> HostCallOutcome {
@@ -419,9 +483,52 @@ impl VmHost for RecordingHost {
         )
     }
 
-    fn asset_load(&mut self, _path: &str, _dst: &mut [u8]) -> HostCallOutcome {
-        // No package mounted: report zero bytes copied (a valid, empty load).
-        self.record(host_call::ASSET_LOAD, 4, HostCallOutcome::Ok1(0))
+    fn asset_load(&mut self, path: &str, dst: &mut [u8]) -> HostCallOutcome {
+        let source = match path {
+            "maps/world.map" if dst.len() == 440 => Some(RETAINED_TILEMAP_MAP),
+            "maps/world.map" if dst.len() == 816 => Some(RETAINED_TILEMAP_SCROLL_MAP),
+            "maps/01-switchback.map" => Some(SOKOBAN_MAP_1),
+            "maps/02-cross-dock.map" => Some(SOKOBAN_MAP_2),
+            "maps/03-last-mile.map" => Some(SOKOBAN_MAP_3),
+            _ => None,
+        };
+        let copied = if let Some(source) = source {
+            let limit = self.map_asset_limit.unwrap_or(usize::MAX);
+            let len = source.len().min(dst.len()).min(limit);
+            dst[..len].copy_from_slice(&source[..len]);
+            len
+        } else {
+            // Non-map assets are irrelevant to this recording host's geometry
+            // checks; report an empty successful load as before.
+            0
+        };
+        self.record(
+            host_call::ASSET_LOAD,
+            4,
+            HostCallOutcome::Ok1(copied as i32),
+        )
+    }
+
+    fn asset_load_range(&mut self, path: &str, offset: usize, dst: &mut [u8]) -> HostCallOutcome {
+        let source = match path {
+            "images/landscape.kim" => Some(FULL_COLOR_TILE_SHEET),
+            "images/city.kim" => Some(FULL_COLOR_CITY_SHEET),
+            "images/autumn.kim" => Some(FULL_COLOR_AUTUMN_SHEET),
+            "images/space.kim" => Some(FULL_COLOR_SPACE_SHEET),
+            _ => None,
+        };
+        let copied = source
+            .and_then(|source| source.get(offset..))
+            .map_or(0, |source| {
+                let len = source.len().min(dst.len());
+                dst[..len].copy_from_slice(&source[..len]);
+                len
+            });
+        self.record(
+            host_call::ASSET_LOAD_RANGE,
+            5,
+            HostCallOutcome::Ok1(copied as i32),
+        )
     }
 }
 
@@ -477,6 +584,9 @@ struct FixtureReport {
     /// Worst-case per-rebuild retained static-layer command count (draws captured in a
     /// `game2d_static_begin/end` window). Must stay within `GAME2D_STATIC_CMD_CAP`.
     static_frame_peak: usize,
+    /// Retained tile writes and configurations retained for sample contract tests.
+    tiles_set: Vec<(i32, i32, i32, i32)>,
+    tilemaps_configured: Vec<(i32, i32, i32, i32, i32)>,
     /// Per host-call-id totals, sorted by id, for the printed summary.
     by_id: Vec<(u8, usize)>,
     /// One entry per stepped frame, in execution order.
@@ -662,6 +772,15 @@ fn run_fixture_scripted(
 fn run_fixture_core(
     bytes: &[u8],
     max_frames: u32,
+    input_for: impl FnMut(u32) -> VmInputSnapshot,
+) -> Result<FixtureReport, SessionError> {
+    run_fixture_core_with_map_limit(bytes, max_frames, None, input_for)
+}
+
+fn run_fixture_core_with_map_limit(
+    bytes: &[u8],
+    max_frames: u32,
+    map_asset_limit: Option<usize>,
     mut input_for: impl FnMut(u32) -> VmInputSnapshot,
 ) -> Result<FixtureReport, SessionError> {
     let mut session = BytecodeSession::<STACK, CALLS>::new(
@@ -679,7 +798,10 @@ fn run_fixture_core(
         heap[..end - start].copy_from_slice(&bytes[start..end]);
     }
 
-    let mut host = RecordingHost::default();
+    let mut host = RecordingHost {
+        map_asset_limit,
+        ..RecordingHost::default()
+    };
     let mut code = CountingCode::new(SliceCode::new(bytes, session.program().code_range().0));
 
     let mut frames_run = 0;
@@ -794,6 +916,8 @@ fn run_fixture_core(
         internal_host_calls,
         immediate_frame_peak: host.imm_frame_peak,
         static_frame_peak: host.static_frame_peak,
+        tiles_set: host.tiles_set,
+        tilemaps_configured: host.tilemaps_configured,
         draws: host.draws,
         audio: host.audio,
         inputs: host.inputs,
@@ -802,6 +926,137 @@ fn run_fixture_core(
         #[cfg(feature = "opcode_stats")]
         opcode_hist,
     })
+}
+
+/// KOTO-0200: the static SDK sample connects an editor-authored 20x20 ASCII map
+/// to the generic retained layer. It configures once, uploads each of the 400
+/// cells once, presents every frame, and becomes write-free once initialized.
+#[test]
+fn retained_tilemap_sample_uploads_once_then_idles() {
+    const FRAMES: u32 = 24;
+    let report = run_fixture(RETAINED_TILEMAP, FRAMES, VmInputSnapshot::empty())
+        .expect("retained tilemap sample verifies");
+
+    assert_eq!(report.trap, None);
+    assert_eq!(report.frames_run, FRAMES);
+    assert_eq!(report.tilemaps_configured, vec![(0, 20, 20, 0, 0)]);
+    assert_eq!(report.calls_to(host_call::GAME2D_CONFIGURE_TILEMAP), 1);
+    assert_eq!(report.calls_to(host_call::ASSET_LOAD), 2);
+    assert_eq!(report.calls_to(host_call::GAME2D_STATIC_BEGIN), 0);
+    assert_eq!(report.calls_to(host_call::GAME2D_STATIC_END), 0);
+    assert_eq!(report.calls_to(host_call::GAME2D_SET_TILE), 400);
+    assert_eq!(report.calls_to(host_call::GAME2D_PRESENT), FRAMES as usize);
+    assert_eq!(report.tiles_set.len(), 400);
+    assert!(report
+        .tiles_set
+        .iter()
+        .all(|&(layer, x, y, tile_ref)| layer == 0
+            && (0..20).contains(&x)
+            && (0..20).contains(&y)
+            && tile_ref >= 0));
+}
+
+/// Four exact 320x320 RGB565 images stream eight scanlines at a time while the
+/// gallery alternates a dissolve and column wipe using persistent LCD updates.
+#[test]
+fn full_color_image_streams_scanline_bands_with_bounded_heap() {
+    const FRAMES: u32 = 500;
+    let report = run_fixture(FULL_COLOR_TILE_IMAGE, FRAMES, VmInputSnapshot::empty())
+        .expect("full-color image transition gallery verifies");
+
+    assert_eq!(report.trap, None);
+    assert_eq!(report.frames_run, FRAMES);
+    assert!(report.tilemaps_configured.is_empty());
+    assert_eq!(report.calls_to(host_call::ASSET_LOAD_RANGE), 120);
+    assert_eq!(report.calls_to(host_call::PLAY_BGM_ASSET), 1);
+    assert_eq!(
+        report.calls_to(host_call::DRAW_PIXELS_PERSISTENT_RGB565),
+        920
+    );
+    assert!(report.immediate_frame_peak <= 20);
+}
+
+#[test]
+fn retained_tilemap_rejects_truncated_map_asset_before_upload() {
+    let report = run_fixture_core_with_map_limit(RETAINED_TILEMAP, 1, Some(16), |_| {
+        VmInputSnapshot::empty()
+    })
+    .expect("truncated map exits safely");
+
+    assert_eq!(report.trap, None);
+    assert_eq!(report.final_result, VmRunResult::Exited(2));
+    assert_eq!(report.calls_to(host_call::GAME2D_CONFIGURE_TILEMAP), 0);
+    assert_eq!(report.calls_to(host_call::GAME2D_SET_TILE), 0);
+}
+
+/// KOTO-0200: the scrolling sample retains a bounded 20x20 viewport over its
+/// larger authored world. One right input starts a staged content diff: at least
+/// one visible cell changes, but homogeneous cells do not get rewritten.
+#[test]
+fn retained_tilemap_scroll_updates_only_changed_visible_cells() {
+    const FRAMES: u32 = 24;
+    let idle = run_fixture(RETAINED_TILEMAP_SCROLL, FRAMES, VmInputSnapshot::empty())
+        .expect("scrolling tilemap sample verifies");
+    let moved = run_fixture_core(RETAINED_TILEMAP_SCROLL, FRAMES, |frame| {
+        if frame == 16 {
+            VmInputSnapshot {
+                intent_bits: text_intent::RIGHT,
+                ..VmInputSnapshot::empty()
+            }
+        } else {
+            VmInputSnapshot::empty()
+        }
+    })
+    .expect("scrolling tilemap sample verifies with input");
+
+    assert_eq!(idle.trap, None);
+    assert_eq!(idle.tilemaps_configured, vec![(0, 20, 20, 0, 0)]);
+    assert_eq!(idle.calls_to(host_call::ASSET_LOAD), 2);
+    assert_eq!(idle.calls_to(host_call::GAME2D_STATIC_BEGIN), 0);
+    assert_eq!(idle.calls_to(host_call::GAME2D_STATIC_END), 0);
+    assert_eq!(idle.calls_to(host_call::GAME2D_SET_TILE), 400);
+    assert_eq!(idle.calls_to(host_call::GAME2D_PRESENT), FRAMES as usize);
+
+    assert_eq!(moved.trap, None);
+    assert_eq!(moved.tilemaps_configured, vec![(0, 20, 20, 0, 0)]);
+    let changed = moved.tiles_set.len() - idle.tiles_set.len();
+    assert!(changed > 0, "camera movement changed no visible tile");
+    assert!(
+        changed < 400,
+        "camera movement rewrote the complete viewport instead of diffing it"
+    );
+    assert!(moved.tiles_set[400..]
+        .iter()
+        .all(|&(layer, x, y, _)| { layer == 0 && (0..20).contains(&x) && (0..20).contains(&y) }));
+}
+
+/// Repeated left steps reach camera x=0. A further left input is clamped and
+/// therefore schedules no extra viewport scan or retained writes.
+#[test]
+fn retained_tilemap_scroll_clamps_at_world_boundary() {
+    let scripted = |frame| {
+        if matches!(frame, 8 | 16 | 24 | 32 | 40 | 48 | 56) {
+            VmInputSnapshot {
+                intent_bits: text_intent::LEFT,
+                ..VmInputSnapshot::empty()
+            }
+        } else {
+            VmInputSnapshot::empty()
+        }
+    };
+    let at_boundary = run_fixture_core(RETAINED_TILEMAP_SCROLL, 56, scripted)
+        .expect("scrolling tilemap reaches left boundary");
+    let past_boundary = run_fixture_core(RETAINED_TILEMAP_SCROLL, 64, scripted)
+        .expect("scrolling tilemap clamps past left boundary");
+
+    assert_eq!(at_boundary.trap, None);
+    assert_eq!(past_boundary.trap, None);
+    assert_eq!(
+        past_boundary.tiles_set.len(),
+        at_boundary.tiles_set.len(),
+        "a clamped camera step emitted retained tile writes"
+    );
+    assert_eq!(past_boundary.tilemaps_configured, vec![(0, 20, 20, 0, 0)]);
 }
 
 /// The richest fixture: KotoBlocks runs cleanly for a handful of frames and drives a
@@ -901,7 +1156,7 @@ fn koto_blocks_play_uses_retained_game2d_layers() {
     inputs.push(empty); // first play frame: spawn piece, place sprites/text, present
     inputs.push(empty);
     inputs.push(hard_drop); // lock the piece -> board cells change
-    inputs.extend(std::iter::repeat(empty).take(4));
+    inputs.extend(std::iter::repeat_n(empty, 4));
 
     let report = run_fixture_scripted(KOTO_BLOCKS, &inputs).expect("koto_blocks verifies");
     report.print("koto_blocks_play");
@@ -929,6 +1184,10 @@ fn koto_blocks_play_uses_retained_game2d_layers() {
     assert!(
         report.calls_to(host_call::GAME2D_TEXT_SET) >= 1,
         "status values never rendered through the retained text layer"
+    );
+    assert!(
+        report.calls_to(host_call::GAME2D_CONFIGURE_TILEMAP) >= 1,
+        "retained tilemap geometry was not configured"
     );
     assert!(
         report.calls_to(host_call::GAME2D_SET_TILE) >= 1,
@@ -1027,7 +1286,7 @@ fn kotosnake_play_uses_retained_static_and_text_layers() {
     // static chrome layer); the following frames are steady gameplay, each setting
     // the score/length/best retained text values.
     let mut inputs = vec![start];
-    inputs.extend(std::iter::repeat(empty).take(4));
+    inputs.extend(std::iter::repeat_n(empty, 4));
 
     let report = run_fixture_scripted(KOTOSNAKE, &inputs).expect("kotosnake verifies");
     report.print("kotosnake_play");
@@ -1835,7 +2094,7 @@ fn koto_blocks_line_clear_blinks_as_row_bands() {
     inputs.push(start); // title -> play
     inputs.push(empty); // spawn the active piece at the top
     inputs.push(space); // hard drop -> lock -> the scan clears the seeded rows
-    inputs.extend(std::iter::repeat(empty).take(28)); // play out the blink animation
+    inputs.extend(std::iter::repeat_n(empty, 28)); // play out the blink animation
 
     let (_host, frames) = drive_koto_blocks(&inputs, |frame, heap| {
         // Just before the spawn frame, fill rows 16..19 completely (a four-high wall).
@@ -1898,8 +2157,8 @@ fn koto_blocks_game_over_skips_swept_board_fill() {
 
     let mut inputs = vec![empty; 34];
     inputs.push(start);
-    inputs.extend(std::iter::repeat(space).take(60)); // stack to the top -> top out
-    inputs.extend(std::iter::repeat(empty).take(30)); // idle: the sweep descends and rests
+    inputs.extend(std::iter::repeat_n(space, 60)); // stack to the top -> top out
+    inputs.extend(std::iter::repeat_n(empty, 30)); // idle: the sweep descends and rests
 
     let (_host, frames) = drive_koto_blocks(&inputs, |_, _| {});
 
@@ -1981,7 +2240,7 @@ fn koto_blocks_space_hard_drops_active_piece() {
     // Hard drop: a single Space frame must lock the piece this frame. The next render
     // writes the four landed cells into the board tilemap at the bottom of the well.
     let mut tail = vec![space];
-    tail.extend(std::iter::repeat(empty).take(5));
+    tail.extend(std::iter::repeat_n(empty, 5));
     let dropped = play_koto_blocks(&to_play(&tail));
     let board_writes: Vec<_> = dropped
         .tiles_set
@@ -2086,7 +2345,7 @@ impl CodeSource for TileRecorder<'_> {
 /// body that exceeded one tile (a monotone tile0->tile1 walk plus loop-back, NOT a
 /// refill ping-pong). KOTO-0156 then removed that floor: the committed `koto_blocks.kbc`
 /// is now built with the preamble-relocation + cold-block-outlining layout opts
-/// (apps.json `codegen`), which front-load the steady loop into a single tile, so steady
+/// (app.json `codegen`), which front-load the steady loop into a single tile, so steady
 /// gameplay now fetches **0 refills / 1 code tile**. This test locks that in. Pure
 /// observation: the VM reads identical bytes; only the wrapper accounts.
 #[test]
@@ -2112,7 +2371,7 @@ fn koto_blocks_code_window_tile_profile() {
     inputs.push(empty);
     inputs.push(empty);
     inputs.push(hard_drop);
-    inputs.extend(std::iter::repeat(empty).take(6));
+    inputs.extend(std::iter::repeat_n(empty, 6));
 
     let mut session = BytecodeSession::<STACK, CALLS>::new(
         KOTO_BLOCKS,
@@ -2202,7 +2461,7 @@ fn koto_blocks_code_window_tile_profile() {
 /// KotoShogi at `refills=166 / code_tiles=4 / vm_us~230ms / fps=4`: the steady play
 /// walk crossed four 16 KiB tiles and the 81-cell glyph loop straddled a tile
 /// boundary, ping-ponging the device's single-tile window twice per iteration
-/// (81 * 2 ≈ 162, plus the walk). Fixed by the KOTO-0156 layout pair (apps.json
+/// (81 * 2 ≈ 162, plus the walk). Fixed by the KOTO-0156 layout pair (app.json
 /// `codegen`: relocate_preamble + outline_cold_blocks over the `continue`-ending
 /// title/victory blocks) plus a packed kanji-table glyph loop in the app source.
 /// This locks in the repaired steady profile for idle play *and* for the
@@ -2220,9 +2479,9 @@ fn kotoshogi_code_window_tile_profile() {
     // then select the pawn under the initial cursor and let the ghost map build.
     let mut inputs = vec![empty; 2];
     inputs.push(start);
-    inputs.extend(std::iter::repeat(empty).take(30));
+    inputs.extend(std::iter::repeat_n(empty, 30));
     inputs.push(start);
-    inputs.extend(std::iter::repeat(empty).take(16));
+    inputs.extend(std::iter::repeat_n(empty, 16));
 
     let mut session = BytecodeSession::<STACK, CALLS>::new(
         KOTOSHOGI,
@@ -2328,7 +2587,7 @@ fn kotomines_code_window_tile_profile() {
     inputs.push(start);
     inputs.push(empty);
     inputs.push(start);
-    inputs.extend(std::iter::repeat(empty).take(20));
+    inputs.extend(std::iter::repeat_n(empty, 20));
 
     let mut session = BytecodeSession::<STACK, CALLS>::new(
         KOTOMINES,
@@ -2454,7 +2713,7 @@ fn kotosnake_code_window_tile_profile() {
     };
     let mut inputs = vec![empty; 2];
     inputs.push(start);
-    inputs.extend(std::iter::repeat(empty).take(20));
+    inputs.extend(std::iter::repeat_n(empty, 20));
 
     let profile = run_tile_profile("KotoSnake", KOTOSNAKE, &inputs);
     assert!(profile.len() > 10, "no steady play frames were sampled");
@@ -2479,7 +2738,7 @@ fn kotorun_code_window_tile_profile() {
     };
     let mut inputs = vec![empty; 2];
     inputs.push(start);
-    inputs.extend(std::iter::repeat(empty).take(20));
+    inputs.extend(std::iter::repeat_n(empty, 20));
 
     let profile = run_tile_profile("KotoRun", KOTORUN, &inputs);
     assert!(profile.len() > 10, "no steady play frames were sampled");
@@ -2658,7 +2917,8 @@ fn kotorun_steady_flat_run_keeps_immediate_rects_byte_stable() {
         ..VmInputSnapshot::empty()
     };
 
-    let mut frames: Vec<Vec<(i32, i32, i32, i32, i32)>> = Vec::new();
+    type RectCall = (i32, i32, i32, i32, i32);
+    let mut frames: Vec<Vec<RectCall>> = Vec::new();
     let mut app_draw_peak = 0usize;
     for frame in 0..TOTAL {
         let input = if frame == 2 { start_input } else { empty };
@@ -2848,12 +3108,12 @@ fn kotorogue_code_window_tile_profile() {
     // Title -> start -> idle -> a few turns (move right) -> idle.
     let mut inputs = vec![empty; 2];
     inputs.push(start);
-    inputs.extend(std::iter::repeat(empty).take(6));
+    inputs.extend(std::iter::repeat_n(empty, 6));
     for _ in 0..4 {
         inputs.push(step);
         inputs.push(empty);
     }
-    inputs.extend(std::iter::repeat(empty).take(8));
+    inputs.extend(std::iter::repeat_n(empty, 8));
 
     let profile = run_tile_profile("KotoRogue", KOTOROGUE, &inputs);
     assert!(profile.len() > 12, "no steady play frames were sampled");

@@ -1,0 +1,23 @@
+# Allow all 20 columns of the first image to wipe in, then capture it.
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame
+frame

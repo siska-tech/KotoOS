@@ -1,20 +1,30 @@
 """Reproducible build loop for source-authored KotoOS apps.
 
-Reads the app registry at ``apps/apps.json`` and compiles each app's source into
-its committed ``sdcard_mock`` bytecode. Each app declares a ``kind``:
+Each app is a self-contained folder under ``apps/`` described by its own
+``apps/<dir>/app.json`` descriptor (KOTO-0195). This tool discovers every
+descriptor, compiles the app's source into its committed bytecode, generates
+the packaging manifest and stages the app's icon and assets, and packs
+bytecode, images, sprites, icons, and compiled Native KotoAudio into one
+committed ``APPS/*.kpa`` archive. Each app declares a ``kind``:
 
 - ``koto``: high-level Koto source compiled by ``koto-compiler``.
 - ``asm``: low-level ``kbc-asm`` assembly / IR.
 
+An ``app.json`` is the single authoring surface: it carries the build recipe
+(``source``, optional ``codegen`` / ``maps`` / ``images`` / ``audio``) *and*
+the package descriptor (``name``, ``description``, ``category``, ``icon``,
+``shell_icon``, ``memory``, ``permissions``). In-app paths are app-relative so
+the folder is copy-paste portable; the staged ``.kpa.json`` manifest and the
+``package_inputs`` intermediates are generated from it.
+
 Usage:
-  python harness/build_apps.py            # rebuild committed bytecode
-  python harness/build_apps.py --check    # fail if committed bytecode is stale
+  python harness/build_apps.py            # rebuild committed outputs
+  python harness/build_apps.py --check    # fail if a committed output is stale
+  python harness/build_apps.py --app ID   # rebuild only the app with this app_id
 
 The ``--check`` mode is wired into ``harness/check_all.py`` so drift between an
-app's source and its committed ``.kbc`` (or a manifest entry that does not point
-at the built output) fails the local checks. Both tools already emit
-verifier-valid bytecode (``koto-compiler`` runs ``verify_kbc``; the committed
-assembly fixtures are verified by their crate tests).
+app's source and its committed ``.kbc`` / manifest / ``.kpa`` fails the local
+checks. ``koto-compiler`` runs ``verify_kbc`` on its output.
 """
 
 from __future__ import annotations
@@ -26,75 +36,199 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REGISTRY = ROOT / "apps" / "apps.json"
+APPS_DIR = ROOT / "apps"
+PACKAGE_INPUTS = ROOT / "package_inputs"
 
 TOOL_FOR_KIND = {
     "koto": "koto-compiler",
     "asm": "kbc-asm",
 }
 
-# Markers that bracket the build-time generated stage table inside a Koto source.
-STAGE_BEGIN_PREFIX = "// === BEGIN GENERATED STAGES"
-STAGE_END_MARKER = "// === END GENERATED STAGES ==="
+# Required top-level fields every app.json must declare.
+REQUIRED_FIELDS = ("app_id", "kind", "package", "name", "source")
 
 
-def render_stage_block(stages: list[tuple[str, str]]) -> str:
-    """Render the generated Koto between the stage markers (markers excluded).
+def pkg_path(package_local: str) -> Path:
+    """Resolve a package-local path (`audio/x.kmml`) under package_inputs."""
+    return PACKAGE_INPUTS / package_local
 
-    Each map's printable tilemap is embedded flat (row-major, newlines stripped)
-    as a string literal; the app decodes the glyphs at runtime. Adding a stage is
-    just dropping another `*.txt` map, so this block grows automatically.
+
+def in_app_path(app: dict, relative: str) -> Path:
+    """Resolve an app-relative path (`src/main.koto`) under the app folder."""
+    return app["_dir"] / relative
+
+def discover_apps(errors: list[str]) -> list[dict]:
+    """Load every ``apps/**/app.json`` descriptor, sorted and validated.
+
+    Duplicate ``app_id`` and missing required fields fail per file — a job the
+    central registry used to do implicitly. Each returned dict gains ``_dir``
+    (the app folder) and ``_package`` (the staging/archive stem).
     """
-    lines = ["// Regenerate with: python harness/build_apps.py"]
-    lines.append("fn stage_count() -> int {")
-    lines.append(f"    return {len(stages)};")
-    lines.append("}")
-    lines.append("")
-    lines.append("fn stage_data(level: int) -> int {")
-    for index, (name, flat) in enumerate(stages, start=1):
-        lines.append(f'    if level == {index} {{ return "{flat}"; }}   // {name}')
-    lines.append(f'    return "{stages[0][1]}";')  # fallback to the first stage
-    lines.append("}")
-    return "\n".join(lines)
+    apps: list[dict] = []
+    seen: dict[str, Path] = {}
+    for descriptor in sorted(APPS_DIR.glob("**/app.json")):
+        rel = descriptor.relative_to(ROOT)
+        try:
+            app = json.loads(descriptor.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            errors.append(f"{rel}: invalid JSON: {exc}")
+            continue
+        missing = [field for field in REQUIRED_FIELDS if not app.get(field)]
+        if missing:
+            errors.append(f"{rel}: missing required field(s) {missing}")
+            continue
+        app_id = app["app_id"]
+        if app_id in seen:
+            errors.append(
+                f"{rel}: duplicate app_id {app_id!r} (already in {seen[app_id]})"
+            )
+            continue
+        seen[app_id] = rel
+        app["_dir"] = descriptor.parent
+        app["_package"] = app["package"]
+        apps.append(app)
+    if not apps and not errors:
+        errors.append("no apps/**/app.json descriptors found")
+    return apps
 
 
-def replace_stage_region(text: str, block: str) -> tuple[str, bool]:
-    """Replace the lines between the stage markers with `block`. LF-normalized."""
-    lines = text.split("\n")
-    begin = end = None
-    for index, line in enumerate(lines):
-        if begin is None and line.startswith(STAGE_BEGIN_PREFIX):
-            begin = index
-        elif begin is not None and line.strip() == STAGE_END_MARKER:
-            end = index
-            break
-    if begin is None or end is None:
-        return text, False
-    merged = lines[: begin + 1] + block.split("\n") + lines[end:]
-    return "\n".join(merged), True
+def build_manifest(app: dict) -> dict:
+    """Generate the packaging manifest (`.kpa.json`) from an app descriptor.
+
+    Asset order is bytecode, icon, maps, images, audio — the layout the packer turns
+    into the archive, so it is what keeps a ``.kpa`` reproducible.
+    """
+    package = app["_package"]
+    assets = [
+        {"path": f"bytecode/{package}.kbc", "type": "bytecode", "sequential": True},
+        {"path": f"icons/{package}.kicon", "type": "image", "sequential": False},
+    ]
+    for map_asset in app.get("_map_assets", []):
+        assets.append({"path": map_asset["path"], "type": "data", "sequential": True})
+    for image in app.get("images", []):
+        assets.append({"path": image["output"], "type": "image", "sequential": True})
+        if image.get("tilemap_output"):
+            assets.append(
+                {"path": image["tilemap_output"], "type": "data", "sequential": True}
+            )
+    for audio in app.get("audio", []):
+        assets.append({"path": audio["output"], "type": "audio", "sequential": True})
+    manifest = {
+        "format": "kpa-manifest",
+        "version": 1,
+        "app_id": app["app_id"],
+        "name": app["name"],
+        "entry": f"bytecode/{package}.kbc",
+        "runtime": app.get("runtime", "kotoruntime-bytecode"),
+        "icon": f"icons/{package}.kicon",
+    }
+    if "shell_icon" in app:
+        manifest["shell_icon"] = app["shell_icon"]
+    manifest["description"] = app.get("description", "")
+    manifest["category"] = app.get("category", "")
+    if "memory" in app:
+        manifest["memory"] = app["memory"]
+    manifest["assets"] = assets
+    manifest["permissions"] = app.get("permissions", {"fs": "sandbox", "network": False})
+    return manifest
 
 
-def load_stages(maps: dict, app_id: str, errors: list[str]) -> list[tuple[str, str]]:
-    map_dir = ROOT / maps["dir"]
+def generate_manifest(app: dict, check: bool, errors: list[str]) -> None:
+    """Write (or, with --check, verify) the generated ``.kpa.json`` manifest."""
+    manifest_path = pkg_path(f"manifests/{app['_package']}.kpa.json")
+    manifest = build_manifest(app)
+    paths = [asset["path"] for asset in manifest["assets"]]
+    duplicates = sorted({path for path in paths if paths.count(path) > 1})
+    if duplicates:
+        errors.append(f"{app['app_id']}: duplicate package asset path(s) {duplicates}")
+        return
+    text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    if check:
+        if not manifest_path.exists():
+            errors.append(f"{app['app_id']}: committed manifest {manifest_path.name} is missing")
+        elif manifest_path.read_text(encoding="utf-8") != text:
+            errors.append(
+                f"{app['app_id']}: {manifest_path.relative_to(ROOT).as_posix()} is stale; "
+                f"rebuild with `python harness/build_apps.py`"
+            )
+    else:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(text, encoding="utf-8")
+
+
+def stage_icon(app: dict, check: bool, errors: list[str]) -> None:
+    """Stage the app's ``icon.kicon`` into ``package_inputs/icons/<package>``."""
+    source = in_app_path(app, app.get("icon", "icon.kicon"))
+    output = pkg_path(f"icons/{app['_package']}.kicon")
+    if not source.exists():
+        errors.append(f"{app['app_id']}: missing icon {app.get('icon', 'icon.kicon')!r}")
+        return
+    if check:
+        if not output.exists():
+            errors.append(f"{app['app_id']}: committed icon {output.name} is missing")
+        elif source.read_bytes() != output.read_bytes():
+            errors.append(
+                f"{app['app_id']}: {output.relative_to(ROOT).as_posix()} is stale; "
+                f"rebuild with `python harness/build_apps.py`"
+            )
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, output)
+
+
+def package_path_parts(value: str) -> list[str] | None:
+    """Return clean package path parts, rejecting absolute/traversal syntax."""
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if not normalized or normalized.startswith("/") or ":" in parts[0]:
+        return None
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    return parts
+
+
+def load_maps(app: dict, maps: dict, app_id: str, errors: list[str]) -> list[dict]:
+    dir_value = maps.get("dir")
+    if not isinstance(dir_value, str):
+        errors.append(f"{app_id}: maps.dir must be a relative package path")
+        return []
+    dir_parts = package_path_parts(dir_value)
+    if dir_parts is None:
+        errors.append(f"{app_id}: maps.dir must stay inside the app/package: {dir_value!r}")
+        return []
+    map_dir = app["_dir"].joinpath(*dir_parts)
     width = int(maps["width"])
     height = int(maps["height"])
     allowed = set(maps.get("glyphs", ""))
     if not map_dir.is_dir():
         errors.append(f"{app_id}: missing maps dir {maps['dir']!r}")
         return []
-    files = sorted(map_dir.glob("*.txt"))
+    files = sorted(map_dir.glob("*.map"))
     if not files:
-        errors.append(f"{app_id}: no .txt maps in {maps['dir']!r}")
+        errors.append(f"{app_id}: no .map files in {maps['dir']!r}")
         return []
-    stages: list[tuple[str, str]] = []
+    assets: list[dict] = []
+    max_glyph_bytes = max((len(glyph.encode("utf-8")) for glyph in allowed), default=1)
+    max_asset_bytes = (width * max_glyph_bytes + 2) * height
     for path in files:
-        rows = path.read_text(encoding="utf-8").splitlines()
-        while rows and rows[-1] == "":
-            rows.pop()
+        raw = path.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            errors.append(f"{app_id}: {path.name} is not UTF-8: {exc}")
+            continue
+        canonical = text.replace("\r\n", "\n")
+        if "\r" in canonical:
+            errors.append(f"{app_id}: {path.name} uses a bare CR line ending")
+            continue
+        if canonical.endswith("\n"):
+            canonical = canonical[:-1]
+        rows = canonical.split("\n")
         if len(rows) != height:
             errors.append(f"{app_id}: {path.name} has {len(rows)} rows, expected {height}")
             continue
@@ -112,58 +246,68 @@ def load_stages(maps: dict, app_id: str, errors: list[str]) -> list[tuple[str, s
         if flat.count("@") != 1:
             errors.append(f"{app_id}: {path.name} must contain exactly one '@' start")
             continue
-        stages.append((path.name, flat))
-    return stages
+        if len(raw) > max_asset_bytes:
+            errors.append(
+                f"{app_id}: {path.name} is {len(raw)} bytes, exceeds declared map maximum "
+                f"{max_asset_bytes}"
+            )
+            continue
+        package_path = "/".join([*dir_parts, path.name])
+        assets.append(
+            {
+                "path": package_path,
+                "source_path": path,
+                "flat": flat.encode("utf-8"),
+                "max_bytes": max_asset_bytes,
+            }
+        )
+    return assets
 
 
 def generate_maps(app: dict, check: bool, errors: list[str]) -> None:
-    """Embed `*.txt` tilemaps into the app's Koto source between the markers."""
+    """Validate `.map` sources and register them as package-local data assets."""
+    del check  # maps are packed directly from their app-local source files
     maps = app.get("maps")
     if not maps:
+        app["_map_assets"] = []
         return
     app_id = app.get("app_id")
-    source_path = ROOT / maps["source"]
-    if not source_path.exists():
-        errors.append(f"{app_id}: missing maps source {maps['source']!r}")
+    required = ("dir", "width", "height", "glyphs")
+    missing = [field for field in required if field not in maps]
+    if missing:
+        errors.append(f"{app_id}: maps missing required field(s) {missing}")
+        return
+    if (
+        not isinstance(maps["width"], int)
+        or isinstance(maps["width"], bool)
+        or maps["width"] < 1
+        or not isinstance(maps["height"], int)
+        or isinstance(maps["height"], bool)
+        or maps["height"] < 1
+    ):
+        errors.append(f"{app_id}: maps width and height must be positive integers")
+        return
+    if not isinstance(maps["glyphs"], str) or not maps["glyphs"]:
+        errors.append(f"{app_id}: maps.glyphs must be a non-empty string")
         return
     before = len(errors)
-    stages = load_stages(maps, app_id, errors)
-    if len(errors) != before or not stages:
+    assets = load_maps(app, maps, app_id, errors)
+    if len(errors) != before or not assets:
         return
-    text = source_path.read_text(encoding="utf-8")
-    new_text, replaced = replace_stage_region(text, render_stage_block(stages))
-    if not replaced:
-        errors.append(f"{app_id}: missing generated-stage markers in {maps['source']!r}")
-        return
-    if new_text == text:
-        return
-    if check:
-        errors.append(
-            f"{app_id}: {maps['source']} stage block is stale; "
-            f"rebuild with `python harness/build_apps.py`"
-        )
-    else:
-        source_path.write_bytes(new_text.encode("utf-8"))
-        print(f"generated: {len(stages)} stages -> {maps['source']}")
+    app["_map_assets"] = assets
 
 
-def load_registry(errors: list[str]) -> list[dict]:
-    if not REGISTRY.exists():
-        errors.append(f"missing app registry: {REGISTRY.relative_to(ROOT)}")
-        return []
-    try:
-        data = json.loads(REGISTRY.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        errors.append(f"invalid JSON in {REGISTRY.relative_to(ROOT)}: {exc}")
-        return []
-    apps = data.get("apps")
-    if not isinstance(apps, list) or not apps:
-        errors.append("app registry must contain a non-empty `apps` list")
-        return []
-    return apps
+def reject_embedded_map_payloads(app: dict, bytecode: bytes, errors: list[str]) -> None:
+    """Regression guard: complete flattened maps must never return to KBC rodata."""
+    for asset in app.get("_map_assets", []):
+        payload = asset["flat"]
+        if payload and payload in bytecode:
+            errors.append(
+                f"{app['app_id']}: flattened map payload {asset['path']!r} is embedded in bytecode"
+            )
 
 
-# Per-app KOTO-0156 code-window layout opt-ins: apps.json `codegen` booleans mapped to
+# Per-app KOTO-0156 code-window layout opt-ins: app.json `codegen` booleans mapped to
 # koto-compiler CLI flags. Off unless a `codegen` block requests them, so every other
 # app's bytecode is byte-identical to the baseline layout.
 CODEGEN_FLAGS = {
@@ -203,12 +347,16 @@ def build_one(app: dict, dest: Path, errors: list[str]) -> bool:
     if tool is None:
         errors.append(f"{app.get('app_id')}: unknown kind {kind!r}")
         return False
-    if not source or not (ROOT / source).exists():
+    source_path = in_app_path(app, source) if source else None
+    if not source_path or not source_path.exists():
         errors.append(f"{app.get('app_id')}: missing source {source!r}")
         return False
     extra = codegen_flags(app, errors) if kind == "koto" else []
+    # Pass the repo-relative posix path: the compiler embeds the source path in
+    # the bytecode's KDBG debug data, so an absolute path would change the bytes.
+    source_arg = source_path.relative_to(ROOT).as_posix()
     completed = subprocess.run(
-        ["cargo", "run", "-q", "-p", tool, "--", source, str(dest), *extra],
+        ["cargo", "run", "-q", "-p", tool, "--", source_arg, str(dest), *extra],
         cwd=ROOT,
     )
     if completed.returncode != 0:
@@ -217,36 +365,107 @@ def build_one(app: dict, dest: Path, errors: list[str]) -> bool:
     return True
 
 
-def check_manifest(app: dict, errors: list[str]) -> None:
-    manifest_path = app.get("manifest")
-    output = app.get("output")
-    if not manifest_path:
-        return
-    manifest_file = ROOT / manifest_path
-    if not manifest_file.exists():
-        errors.append(f"{app.get('app_id')}: missing manifest {manifest_path!r}")
-        return
-    try:
-        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        errors.append(f"{app.get('app_id')}: invalid manifest JSON: {exc}")
-        return
-    # The manifest entry must point at the built output, relative to sdcard_mock.
-    expected_entry = Path(output).relative_to("sdcard_mock").as_posix()
-    if manifest.get("entry") != expected_entry:
-        errors.append(
-            f"{app.get('app_id')}: manifest entry {manifest.get('entry')!r} "
-            f"does not match built output {expected_entry!r}"
-        )
-    if manifest.get("app_id") != app.get("app_id"):
-        errors.append(
-            f"{app.get('app_id')}: manifest app_id {manifest.get('app_id')!r} mismatch"
-        )
-
 def rgb565_le(hex6: str) -> bytes:
     """Pack an `RRGGBB` hex colour into little-endian RGB565."""
     r, g, b = int(hex6[0:2], 16), int(hex6[2:4], 16), int(hex6[4:6], 16)
     return struct.pack("<H", ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
+
+
+def decode_png_rgb(path: Path, app_id: str, errors: list[str]) -> tuple[int, int, bytes] | None:
+    """Decode the small, dependency-free PNG subset used by tile-mosaic sources."""
+    raw = path.read_bytes()
+    if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        errors.append(f"{app_id}: tile-mosaic source is not a PNG: {path}")
+        return None
+    pos = 8
+    width = height = bit_depth = color_type = interlace = 0
+    compressed = bytearray()
+    while pos + 12 <= len(raw):
+        size = struct.unpack_from(">I", raw, pos)[0]
+        kind = raw[pos + 4 : pos + 8]
+        data = raw[pos + 8 : pos + 8 + size]
+        pos += 12 + size
+        if kind == b"IHDR":
+            width, height, bit_depth, color_type, _compression, _filter, interlace = (
+                struct.unpack(">IIBBBBB", data)
+            )
+        elif kind == b"IDAT":
+            compressed += data
+        elif kind == b"IEND":
+            break
+    channels = {2: 3, 6: 4}.get(color_type)
+    if not width or not height or bit_depth != 8 or channels is None or interlace != 0:
+        errors.append(
+            f"{app_id}: tile-mosaic PNG must be non-interlaced 8-bit RGB/RGBA"
+        )
+        return None
+    try:
+        scanlines = zlib.decompress(compressed)
+    except zlib.error as exc:
+        errors.append(f"{app_id}: cannot decompress tile-mosaic PNG: {exc}")
+        return None
+    stride = width * channels
+    expected = (stride + 1) * height
+    if len(scanlines) != expected:
+        errors.append(f"{app_id}: malformed tile-mosaic PNG scanline data")
+        return None
+
+    pixels = bytearray(width * height * 3)
+    previous = bytearray(stride)
+    source_pos = 0
+    dest_pos = 0
+    for _y in range(height):
+        filter_type = scanlines[source_pos]
+        source_pos += 1
+        row = bytearray(scanlines[source_pos : source_pos + stride])
+        source_pos += stride
+        for x in range(stride):
+            left = row[x - channels] if x >= channels else 0
+            above = previous[x]
+            upper_left = previous[x - channels] if x >= channels else 0
+            if filter_type == 1:
+                row[x] = (row[x] + left) & 0xFF
+            elif filter_type == 2:
+                row[x] = (row[x] + above) & 0xFF
+            elif filter_type == 3:
+                row[x] = (row[x] + ((left + above) >> 1)) & 0xFF
+            elif filter_type == 4:
+                estimate = left + above - upper_left
+                pa, pb, pc = abs(estimate - left), abs(estimate - above), abs(estimate - upper_left)
+                predictor = left if pa <= pb and pa <= pc else above if pb <= pc else upper_left
+                row[x] = (row[x] + predictor) & 0xFF
+            elif filter_type != 0:
+                errors.append(f"{app_id}: unsupported PNG filter {filter_type}")
+                return None
+        for x in range(width):
+            src = x * channels
+            pixels[dest_pos : dest_pos + 3] = row[src : src + 3]
+            dest_pos += 3
+        previous = row
+    return width, height, bytes(pixels)
+
+
+def png_to_rgb565_kim(
+    path: Path, app_id: str, source: str, errors: list[str]
+) -> bytes | None:
+    """Convert a 320x320 PNG to a normal row-major RGB565 KIM1 image.
+
+    No tiling, clustering, resampling, or palette reduction occurs; RGB888 to
+    RGB565 quantization is the only colour loss.
+    """
+    decoded = decode_png_rgb(path, app_id, errors)
+    if decoded is None:
+        return None
+    width, height, pixels = decoded
+    if width != 320 or height != 320:
+        errors.append(f"{app_id}: {source!r} is {width}x{height}, expected 320x320")
+        return None
+    kim = bytearray(b"KIM1")
+    kim += struct.pack("<HH", width, height)
+    for i in range(0, len(pixels), 3):
+        r, g, b = pixels[i : i + 3]
+        kim += struct.pack("<H", ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
+    return bytes(kim)
 
 
 def kspr_to_kim(text: str, app_id: str, source: str, errors: list[str]) -> bytes | None:
@@ -299,7 +518,7 @@ def kspr_to_kim(text: str, app_id: str, source: str, errors: list[str]) -> bytes
 
 
 def generate_images(app: dict, check: bool, errors: list[str]) -> None:
-    """Compile each `images` entry's `.kspr` source into a committed `.kim` asset."""
+    """Compile authored sprite sheets and full-colour PNG images."""
     app_id = app.get("app_id")
     for image in app.get("images", []):
         source = image.get("source")
@@ -307,14 +526,19 @@ def generate_images(app: dict, check: bool, errors: list[str]) -> None:
         if not source or not output:
             errors.append(f"{app_id}: image requires `source` and `output`")
             continue
-        source_path = ROOT / source
-        output_path = ROOT / output
+        source_path = in_app_path(app, source)
+        output_path = pkg_path(output)
         if not source_path.exists():
             errors.append(f"{app_id}: missing image source {source!r}")
             continue
-        kim = kspr_to_kim(source_path.read_text(encoding="utf-8"), app_id, source, errors)
-        if kim is None:
-            continue
+        if image.get("full_color_image"):
+            kim = png_to_rgb565_kim(source_path, app_id, source, errors)
+            if kim is None:
+                continue
+        else:
+            kim = kspr_to_kim(source_path.read_text(encoding="utf-8"), app_id, source, errors)
+            if kim is None:
+                continue
         if check:
             if not output_path.exists():
                 errors.append(f"{app_id}: committed image {output!r} is missing")
@@ -328,21 +552,22 @@ def generate_images(app: dict, check: bool, errors: list[str]) -> None:
             print(f"image: {source} -> {output} ({len(kim)} bytes)")
 
 
-def sync_assets(app: dict, check: bool, errors: list[str]) -> None:
-    for asset in app.get("assets", []):
+def sync_audio(app: dict, check: bool, errors: list[str]) -> None:
+    """Stage each `audio` entry's source into package_inputs for packing."""
+    for asset in app.get("audio", []):
         source = asset.get("source")
         output = asset.get("output")
         if not source or not output:
-            errors.append(f"{app.get('app_id')}: asset requires `source` and `output`")
+            errors.append(f"{app.get('app_id')}: audio requires `source` and `output`")
             continue
-        source_path = ROOT / source
-        output_path = ROOT / output
+        source_path = in_app_path(app, source)
+        output_path = pkg_path(output)
         if not source_path.exists():
-            errors.append(f"{app.get('app_id')}: missing asset source {source!r}")
+            errors.append(f"{app.get('app_id')}: missing audio source {source!r}")
             continue
         if check:
             if not output_path.exists():
-                errors.append(f"{app.get('app_id')}: committed asset {output!r} is missing")
+                errors.append(f"{app.get('app_id')}: committed audio {output!r} is missing")
             elif source_path.read_bytes() != output_path.read_bytes():
                 errors.append(
                     f"{app.get('app_id')}: {output} is stale; "
@@ -354,6 +579,71 @@ def sync_assets(app: dict, check: bool, errors: list[str]) -> None:
             print(f"copied: {source} -> {output}")
 
 
+def pack_app(app: dict, check: bool, errors: list[str]) -> None:
+    """Build the real KPA1 archive from the generated manifest.
+
+    The staged ``package_inputs`` files are build inputs only. ``kpa-packer``
+    compiles ``type: audio`` KMML entries to KAQ1 while copying every other
+    declared asset byte-for-byte into the same archive.
+    """
+    manifest = pkg_path(f"manifests/{app['_package']}.kpa.json")
+    package = ROOT / "sdcard_mock" / "apps" / f"{app['_package']}.kpa"
+    with tempfile.TemporaryDirectory() as tmp:
+        temp_root = Path(tmp)
+        assets_root = temp_root / "assets"
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        map_sources = {
+            asset["path"]: asset["source_path"] for asset in app.get("_map_assets", [])
+        }
+        # Every pack gets an isolated input root. This lets two self-contained
+        # apps both use `maps/world.map` without a shared package_inputs path
+        # overwriting one app's source with the other's.
+        for asset in manifest_data["assets"]:
+            package_path = asset["path"]
+            source = map_sources.get(package_path, pkg_path(package_path))
+            destination = assets_root.joinpath(*package_path.split("/"))
+            if not source.exists():
+                errors.append(f"{app.get('app_id')}: missing staged asset {package_path!r}")
+                return
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+
+        built = temp_root / package.name if check else package
+        completed = subprocess.run(
+            [
+                "cargo",
+                "run",
+                "-q",
+                "-p",
+                "kpa-packer",
+                "--",
+                "--manifest",
+                str(manifest),
+                "--assets-root",
+                str(assets_root),
+                "--out",
+                str(built),
+            ],
+            cwd=ROOT,
+        )
+        if completed.returncode != 0:
+            errors.append(f"{app.get('app_id')}: KPA pack failed")
+            return
+        if check:
+            if not package.exists():
+                errors.append(f"{app.get('app_id')}: committed {package.relative_to(ROOT)} is missing")
+            elif package.read_bytes() != built.read_bytes():
+                errors.append(
+                    f"{app.get('app_id')}: {package.relative_to(ROOT)} is stale; "
+                    "rebuild with `python harness/build_apps.py`"
+                )
+            else:
+                print(
+                    f"ok: {app.get('app_id')} -> {package.relative_to(ROOT)} "
+                    f"({built.stat().st_size} bytes)"
+                )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build source-authored KotoOS apps.")
     parser.add_argument(
@@ -361,21 +651,31 @@ def main() -> int:
         action="store_true",
         help="verify committed bytecode matches its source instead of rewriting it",
     )
+    parser.add_argument(
+        "--app",
+        metavar="APP_ID",
+        help="rebuild only the app with this app_id "
+        "(the koto-sim --watch loop's incremental path, KOTO-0191)",
+    )
     args = parser.parse_args()
 
     errors: list[str] = []
-    apps = load_registry(errors)
+    apps = discover_apps(errors)
+    if args.app:
+        apps = [app for app in apps if app.get("app_id") == args.app]
+        if not apps and not errors:
+            errors.append(f"--app {args.app}: no such app_id under apps/**/app.json")
 
     for app in apps:
-        output = app.get("output")
-        if not output:
-            errors.append(f"{app.get('app_id')}: registry entry missing `output`")
-            continue
-        committed = ROOT / output
+        app_error_count = len(errors)
+        package = app["_package"]
+        output = f"bytecode/{package}.kbc"
+        committed = pkg_path(output)
         generate_maps(app, args.check, errors)
         generate_images(app, args.check, errors)
-        check_manifest(app, errors)
-        sync_assets(app, args.check, errors)
+        sync_audio(app, args.check, errors)
+        stage_icon(app, args.check, errors)
+        generate_manifest(app, args.check, errors)
 
         if args.check:
             with tempfile.TemporaryDirectory() as tmp:
@@ -383,6 +683,7 @@ def main() -> int:
                 if not build_one(app, dest, errors):
                     continue
                 built = dest.read_bytes()
+            reject_embedded_map_payloads(app, built, errors)
             if not committed.exists():
                 errors.append(f"{app.get('app_id')}: committed {output} is missing")
             elif committed.read_bytes() != built:
@@ -395,7 +696,10 @@ def main() -> int:
         else:
             committed.parent.mkdir(parents=True, exist_ok=True)
             if build_one(app, committed, errors):
+                reject_embedded_map_payloads(app, committed.read_bytes(), errors)
                 print(f"built: {app.get('app_id')} -> {output}")
+        if len(errors) == app_error_count:
+            pack_app(app, args.check, errors)
 
     if errors:
         print("\nKotoOS app build: FAIL")

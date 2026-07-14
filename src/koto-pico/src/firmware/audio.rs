@@ -10,17 +10,16 @@
 //!
 //! # KOTO-0165: the legacy audio implementation is gone
 //!
-//! The former in-tree engine — the runtime KotoMML parser, the `.kwt` wavetable
+//! The former in-tree engine — the runtime KotoMML parser, custom wavetable
 //! loader, the hand-rolled square/pulse/triangle/saw/noise synth, the mirrored
 //! `PicoBgmScore` tables, and the tone-fallback path — was removed. Every
 //! sequence cue now plays through the `koto-audio` crate itself (the same
-//! runtime the SIM bridge uses), fed from the compiled cue tables in
-//! [`super::audio_cues`] / [`super::audio_cues_generated`]. Only two inputs
+//! runtime the SIM bridge uses). Package cues arrive as pointer-free runtime
+//! images compiled from the SD-resident Native KMML and staged through PSRAM.
+//! Only two inputs
 //! reach this module:
 //!
-//! * **Sequence cues**: `&'static` [`PolyphonicSequence`] (looping BGM) and
-//!   [`Sequence`] (one-shot SFX) references resolved by
-//!   [`super::audio_cues::primary_audio_route`].
+//! * **Sequence cues**: built-in static sequences and owned runtime cue images.
 //! * **Raw PCM**: the bounded `audio_submit_i16` stream, mixed additively with
 //!   the service output exactly like the SIM folds the bridge into `SimAudio`.
 //!
@@ -51,10 +50,12 @@ use embassy_rp::{
 };
 use embassy_time::{block_for, Duration, Instant};
 use koto_audio::{
-    AudioBackend, AudioPolicy, BackendError, BackendReport, BackendResult, BackendState,
-    DefaultAudioService, MixerBlock, PolyphonicSequence, Sequence, DEFAULT_MIXER_BLOCK_FRAMES,
+    runtime_cue_max_encoded_len, AudioBackend, AudioLimits, AudioPolicy, BackendError,
+    BackendReport, BackendResult, BackendState, DecodeResult, DefaultAudioService, MixerBlock,
+    MixerVolume, OwnedClipPlayer, PolyphonicSequence, RuntimeCuePlayer, Sequence,
+    DEFAULT_MIXER_BLOCK_FRAMES,
 };
-use portable_atomic::AtomicU32;
+use portable_atomic::{AtomicBool, AtomicU32};
 use static_cell::StaticCell;
 
 /// Output sample rate. Matches `AudioLimits::v0_default()` and the sample rate
@@ -62,11 +63,21 @@ use static_cell::StaticCell;
 const PCM_OUTPUT_SAMPLE_RATE_HZ: u32 = 16_000;
 /// Fixed service mixer block length (frames per `tick()`).
 const BLOCK_FRAMES: usize = DEFAULT_MIXER_BLOCK_FRAMES;
-/// Raw `audio_submit_i16` ring capacity (128 ms at 16 kHz).
-const PCM_RING_CAPACITY: usize = 2048;
+/// Raw `audio_submit_i16` ring capacity (256 ms at 16 kHz). Long KPA streams
+/// need enough lead to cover an SD file open + seek + multi-sector read without
+/// exposing storage latency to the hardware-paced DMA output, while keeping the
+/// RP2040 SRAM increase bounded.
+const PCM_RING_CAPACITY: usize = 4096;
 /// Rendered service output ring: three mixer blocks (~24 ms) of read-ahead.
 const OUT_RING_CAPACITY: usize = BLOCK_FRAMES * 3;
 const AUDIO_COMMAND_CAPACITY: usize = 16;
+pub const RUNTIME_BGM_EVENTS_PER_TRACK: usize = 272;
+pub const RUNTIME_SFX_EVENTS_PER_TRACK: usize = 32;
+pub const RUNTIME_CUE_IMAGE_CAPACITY: usize =
+    runtime_cue_max_encoded_len::<RUNTIME_BGM_EVENTS_PER_TRACK>();
+/// Maximum complete KACL package image copied to CPU1.
+pub const RUNTIME_CLIP_IMAGE_CAPACITY: usize = 8192;
+const RUNTIME_SFX_PLAYERS: usize = 3;
 /// CPU1 worker stack. The koto-audio mixer keeps ~1.3 KiB of locals in one
 /// `tick()` frame (`[i64; 128]` accumulator + output block), on top of the
 /// worker/service call chain; the old 4 KiB budget was sized for the removed
@@ -162,14 +173,16 @@ impl<const N: usize> PcmRing<N> {
     }
 }
 
-/// Bounded audio work CPU0 hands to the CPU1 worker. Sequence commands carry
-/// `&'static` references into the compiled cue tables, so enqueueing never
-/// copies event data.
+/// Bounded audio work CPU0 hands to the CPU1 worker. Fixed host cues carry
+/// static references; package cues use the owned runtime-image staging slot.
 #[derive(Clone, Copy)]
 enum AudioCommand {
     None,
     PlayBgm(&'static PolyphonicSequence<'static>),
     PlaySfx(&'static Sequence<'static>),
+    PlayRuntimeBgm,
+    PlayRuntimeSfx,
+    PlayRuntimeClip,
     StopBgm,
     StopAll,
 }
@@ -228,6 +241,9 @@ struct AudioShared {
     out: PcmRing<OUT_RING_CAPACITY>,
     commands: AudioCommandQueue,
     high_priority: AudioCommand,
+    runtime_image: [u8; RUNTIME_CUE_IMAGE_CAPACITY],
+    runtime_image_len: usize,
+    runtime_image_busy: bool,
 }
 
 impl AudioShared {
@@ -237,6 +253,9 @@ impl AudioShared {
             out: PcmRing::new(),
             commands: AudioCommandQueue::new(),
             high_priority: AudioCommand::None,
+            runtime_image: [0; RUNTIME_CUE_IMAGE_CAPACITY],
+            runtime_image_len: 0,
+            runtime_image_busy: false,
         }
     }
 
@@ -245,11 +264,17 @@ impl AudioShared {
         self.out.clear();
         self.commands.clear();
         self.high_priority = AudioCommand::None;
+        self.runtime_image_len = 0;
+        self.runtime_image_busy = false;
     }
 }
 
 static AUDIO_SHARED: Mutex<RefCell<AudioShared>> = Mutex::new(RefCell::new(AudioShared::new()));
 static AUDIO_STATS: AudioAtomicStats = AudioAtomicStats::new();
+/// CPU0 marks the host-managed KPA stream active after its first successful
+/// refill. CPU1 uses this only to distinguish an expected empty raw ring from
+/// a streaming starvation gap in the `underruns` diagnostic.
+static PCM_STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // --- Core1 stack canary (KOTO-0186) -----------------------------------------
 //
@@ -318,11 +343,18 @@ type PicoAudioService = DefaultAudioService<'static, PwmBlockSink>;
 /// CPU1-owned service storage (KOTO-0148: retained state in its own StaticCell,
 /// out of the CPU1 stack and the main-task future).
 static AUDIO_SERVICE: StaticCell<PicoAudioService> = StaticCell::new();
+static RUNTIME_BGM_PLAYER: StaticCell<RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>> =
+    StaticCell::new();
+static RUNTIME_SFX_PLAYER: StaticCell<
+    [RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS],
+> = StaticCell::new();
+static RUNTIME_CLIP_PLAYER: StaticCell<OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>> =
+    StaticCell::new();
 
-// Shared-cell and service budgets: the raw ring dominates (4 KiB, unchanged
-// from the pre-KOTO-0165 worker); the service replaces the two removed
+// Shared-cell and service budgets: the long-stream raw ring occupies 8 KiB;
+// the service replaces the two removed
 // by-value `PicoBgmScore` command slots and the legacy players.
-const _: () = assert!(core::mem::size_of::<AudioShared>() <= 6 * 1024);
+const _: () = assert!(core::mem::size_of::<AudioShared>() <= 24 * 1024);
 const _: () = assert!(core::mem::size_of::<PicoAudioService>() <= 4 * 1024);
 
 struct AudioAtomicStats {
@@ -524,8 +556,12 @@ impl PicoAudioBackend {
         let service = PicoAudioService::new(AudioPolicy::v0_default(), PwmBlockSink::new())
             .ok()
             .map(|service| AUDIO_SERVICE.init(service));
+        let runtime_bgm = RUNTIME_BGM_PLAYER.init(RuntimeCuePlayer::new(PCM_OUTPUT_SAMPLE_RATE_HZ));
+        let runtime_sfx = RUNTIME_SFX_PLAYER
+            .init([RuntimeCuePlayer::new(PCM_OUTPUT_SAMPLE_RATE_HZ); RUNTIME_SFX_PLAYERS]);
+        let runtime_clip = RUNTIME_CLIP_PLAYER.init(OwnedClipPlayer::new());
         spawn_core1(core1, stack, move || -> ! {
-            run_audio_worker(pwm, service)
+            run_audio_worker(pwm, service, runtime_bgm, runtime_sfx, runtime_clip)
         });
         Self
     }
@@ -613,6 +649,18 @@ impl PicoAudioBackend {
         Ok(accepted as i32)
     }
 
+    /// Number of mono frames the host streamer can enqueue without dropping.
+    pub fn pcm_free_frames(&self) -> usize {
+        critical_section::with(|cs| {
+            PCM_RING_CAPACITY.saturating_sub(AUDIO_SHARED.borrow_ref(cs).raw.len())
+        })
+    }
+
+    /// Tells the CPU1 diagnostics whether an empty raw ring is a stream gap.
+    pub fn set_pcm_stream_active(&mut self, active: bool) {
+        PCM_STREAM_ACTIVE.store(active, Ordering::Relaxed);
+    }
+
     /// Starts (or replaces) the looping BGM sequence for a routed cue.
     pub fn play_bgm_cue(&mut self, sequence: &'static PolyphonicSequence<'static>) {
         self.enqueue_command(AudioCommand::PlayBgm(sequence));
@@ -621,6 +669,66 @@ impl PicoAudioBackend {
     /// Plays a one-shot SFX sequence for a routed cue.
     pub fn play_sfx_cue(&mut self, sequence: &'static Sequence<'static>) {
         self.enqueue_command(AudioCommand::PlaySfx(sequence));
+    }
+
+    /// Copies one PSRAM-loaded pointer-free cue image to the CPU1 staging slot.
+    pub fn play_runtime_cue(&mut self, image: &[u8], bgm: bool) -> bool {
+        if image.is_empty() || image.len() > RUNTIME_CUE_IMAGE_CAPACITY {
+            self.record_drop();
+            return false;
+        }
+        let accepted = critical_section::with(|cs| {
+            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            if shared.runtime_image_busy {
+                return false;
+            }
+            shared.runtime_image[..image.len()].copy_from_slice(image);
+            shared.runtime_image_len = image.len();
+            shared.runtime_image_busy = true;
+            if !shared.commands.push(if bgm {
+                AudioCommand::PlayRuntimeBgm
+            } else {
+                AudioCommand::PlayRuntimeSfx
+            }) {
+                shared.runtime_image_busy = false;
+                shared.runtime_image_len = 0;
+                return false;
+            }
+            true
+        });
+        if !accepted {
+            AudioAtomicStats::inc(&AUDIO_STATS.command_drops, 1);
+            self.record_drop();
+        }
+        accepted
+    }
+
+    /// Copies one runtime-ready KACL image into CPU1-owned playback storage.
+    pub fn play_runtime_clip(&mut self, image: &[u8]) -> bool {
+        if image.is_empty() || image.len() > RUNTIME_CLIP_IMAGE_CAPACITY {
+            self.record_drop();
+            return false;
+        }
+        let accepted = critical_section::with(|cs| {
+            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            if shared.runtime_image_busy {
+                return false;
+            }
+            shared.runtime_image[..image.len()].copy_from_slice(image);
+            shared.runtime_image_len = image.len();
+            shared.runtime_image_busy = true;
+            if !shared.commands.push(AudioCommand::PlayRuntimeClip) {
+                shared.runtime_image_busy = false;
+                shared.runtime_image_len = 0;
+                return false;
+            }
+            true
+        });
+        if !accepted {
+            AudioAtomicStats::inc(&AUDIO_STATS.command_drops, 1);
+            self.record_drop();
+        }
+        accepted
     }
 
     pub fn stop_bgm(&mut self) {
@@ -634,6 +742,7 @@ impl PicoAudioBackend {
     }
 
     pub fn stop(&mut self) {
+        PCM_STREAM_ACTIVE.store(false, Ordering::Relaxed);
         critical_section::with(|cs| {
             let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
             shared.high_priority = AudioCommand::StopAll;
@@ -701,7 +810,13 @@ impl PicoAudioBackend {
 /// exactly 16 kHz. The worker only *fills* the ring ahead of the DMA read
 /// position on a coarse ~1 ms pass, so a multi-millisecond service render burst
 /// never disturbs sample timing (the CPU-paced first cut audibly did).
-fn run_audio_worker(mut pwm: Pwm<'static>, service: Option<&'static mut PicoAudioService>) -> ! {
+fn run_audio_worker(
+    mut pwm: Pwm<'static>,
+    service: Option<&'static mut PicoAudioService>,
+    runtime_bgm: &'static mut RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>,
+    runtime_sfx: &'static mut [RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS],
+    runtime_clip: &'static mut OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>,
+) -> ! {
     configure_pcm_output(&mut pwm);
     let Some(service) = service else {
         let _ = pwm.set_duty_cycle(IDLE_SILENCE_DUTY);
@@ -722,8 +837,13 @@ fn run_audio_worker(mut pwm: Pwm<'static>, service: Option<&'static mut PicoAudi
     let mut worker = PicoAudioWorker {
         _pwm: pwm,
         service,
+        runtime_bgm,
+        runtime_sfx,
+        runtime_clip,
+        runtime_sfx_cursor: 0,
         pending_sources: 0,
         underrun_latched: false,
+        raw_underrun_latched: false,
         // The pre-filled silence ring means the writer already leads the DMA
         // reader by one full ring.
         write_pos: DMA_RING_SAMPLES as u64,
@@ -737,9 +857,14 @@ struct PicoAudioWorker<'d> {
     /// register is written by DMA, not by this handle.
     _pwm: Pwm<'d>,
     service: &'static mut PicoAudioService,
+    runtime_bgm: &'static mut RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>,
+    runtime_sfx: &'static mut [RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS],
+    runtime_sfx_cursor: usize,
+    runtime_clip: &'static mut OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>,
     /// Active + queued service sources after the last command/tick.
     pending_sources: u32,
     underrun_latched: bool,
+    raw_underrun_latched: bool,
     /// Total duty words written into the DMA ring since start.
     write_pos: u64,
     /// Samples consumed by DMA in previous arm periods (see [`arm_audio_dma`]).
@@ -819,7 +944,7 @@ impl<'d> PicoAudioWorker<'d> {
     /// mixing the service output and the raw PCM stream into duty words.
     fn fill_dma_ring(&mut self) {
         let channel = pac::DMA.ch(AUDIO_DMA_CH);
-        let remaining = channel.trans_count().read();
+        let remaining = dma_transfer_count(&channel);
         if remaining == 0 {
             // The huge arm count ran out (days of audio); account for it and
             // re-trigger. The ring-wrapped read address carries on in place.
@@ -890,10 +1015,31 @@ impl<'d> PicoAudioWorker<'d> {
                 AudioAtomicStats::inc(&AUDIO_STATS.underruns, 1);
                 self.underrun_latched = true;
             }
+            if raw_len > 0 {
+                self.raw_underrun_latched = false;
+            }
+            if raw_len < needed
+                && PCM_STREAM_ACTIVE.load(Ordering::Relaxed)
+                && !self.raw_underrun_latched
+            {
+                AudioAtomicStats::inc(&AUDIO_STATS.underruns, 1);
+                self.raw_underrun_latched = true;
+            }
 
             for index in 0..needed {
                 let seq = if index < seq_len { seq_buf[index] } else { 0 };
                 let mut mixed = i32::from(seq);
+                if let DecodeResult::Sample(sample) = self.runtime_bgm.next_sample() {
+                    mixed = mixed.saturating_add(scale_runtime_sample(sample, 150));
+                }
+                for player in &mut *self.runtime_sfx {
+                    if let DecodeResult::Sample(sample) = player.next_sample() {
+                        mixed = mixed.saturating_add(scale_runtime_sample(sample, 200));
+                    }
+                }
+                if let DecodeResult::Sample(sample) = self.runtime_clip.next_sample() {
+                    mixed = mixed.saturating_add(scale_runtime_sample(sample, 200));
+                }
                 if index < raw_len {
                     mixed = mixed.saturating_add(i32::from(raw_buf[index]));
                 }
@@ -930,8 +1076,58 @@ impl<'d> PicoAudioWorker<'d> {
                 }
                 self.refresh_source_stats();
             }
+            AudioCommand::PlayRuntimeBgm => {
+                let ok = critical_section::with(|cs| {
+                    let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+                    let len = shared.runtime_image_len;
+                    let result = self.runtime_bgm.play_image(&shared.runtime_image[..len]);
+                    shared.runtime_image_len = 0;
+                    shared.runtime_image_busy = false;
+                    result.is_ok()
+                });
+                if ok {
+                    AudioAtomicStats::inc(&AUDIO_STATS.bgm_starts, 1);
+                } else {
+                    AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
+                }
+            }
+            AudioCommand::PlayRuntimeSfx => {
+                let slot = self
+                    .runtime_sfx
+                    .iter()
+                    .position(|player| !player.is_playing())
+                    .unwrap_or(self.runtime_sfx_cursor);
+                let ok = critical_section::with(|cs| {
+                    let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+                    let len = shared.runtime_image_len;
+                    let result = self.runtime_sfx[slot].play_image(&shared.runtime_image[..len]);
+                    shared.runtime_image_len = 0;
+                    shared.runtime_image_busy = false;
+                    result.is_ok()
+                });
+                self.runtime_sfx_cursor = (slot + 1) % self.runtime_sfx.len();
+                if !ok {
+                    AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
+                }
+            }
+            AudioCommand::PlayRuntimeClip => {
+                let ok = critical_section::with(|cs| {
+                    let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+                    let len = shared.runtime_image_len;
+                    let result = self
+                        .runtime_clip
+                        .play_image(&shared.runtime_image[..len], AudioLimits::v0_default());
+                    shared.runtime_image_len = 0;
+                    shared.runtime_image_busy = false;
+                    result.is_ok()
+                });
+                if !ok {
+                    AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
+                }
+            }
             AudioCommand::StopBgm => {
                 let _ = self.service.stop_bgm();
+                self.runtime_bgm.stop();
                 AudioAtomicStats::inc(&AUDIO_STATS.bgm_stops, 1);
                 self.refresh_source_stats();
             }
@@ -939,6 +1135,11 @@ impl<'d> PicoAudioWorker<'d> {
                 // Full bounded reset: sources, mixer, events, and both rings.
                 let _ = self.service.reset();
                 let _ = self.service.start();
+                self.runtime_bgm.stop();
+                for player in &mut *self.runtime_sfx {
+                    player.stop();
+                }
+                self.runtime_clip.stop();
                 critical_section::with(|cs| {
                     let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
                     shared.raw.clear();
@@ -963,6 +1164,10 @@ impl<'d> PicoAudioWorker<'d> {
             Ordering::Relaxed,
         );
     }
+}
+
+fn scale_runtime_sample(sample: i16, gain: u16) -> i32 {
+    (i32::from(sample) * i32::from(MixerVolume::new(gain).get())) / 256
 }
 
 /// A precomputed PWM compare word for both output channels (A|B) of slice 5.
@@ -1003,7 +1208,7 @@ fn arm_audio_dma(ring: &AlignedDmaRing) {
             .write_addr()
             .write_value(pac::PWM.ch(5).cc().as_ptr() as u32);
     }
-    channel.trans_count().write_value(DMA_ARM_COUNT);
+    set_dma_transfer_count(&channel, DMA_ARM_COUNT);
     channel.ctrl_trig().write(|w| {
         w.set_data_size(DataSize::SIZE_WORD);
         w.set_incr_read(true);
@@ -1015,6 +1220,30 @@ fn arm_audio_dma(ring: &AlignedDmaRing) {
         w.set_irq_quiet(true);
         w.set_en(true);
     });
+}
+
+#[cfg(feature = "mcu-rp2040")]
+#[inline]
+fn dma_transfer_count(channel: &pac::dma::Channel) -> u32 {
+    channel.trans_count().read()
+}
+
+#[cfg(feature = "mcu-rp235xa")]
+#[inline]
+fn dma_transfer_count(channel: &pac::dma::Channel) -> u32 {
+    channel.trans_count().read().count()
+}
+
+#[cfg(feature = "mcu-rp2040")]
+#[inline]
+fn set_dma_transfer_count(channel: &pac::dma::Channel, count: u32) {
+    channel.trans_count().write_value(count);
+}
+
+#[cfg(feature = "mcu-rp235xa")]
+#[inline]
+fn set_dma_transfer_count(channel: &pac::dma::Channel, count: u32) {
+    channel.trans_count().write(|w| w.set_count(count));
 }
 
 const fn gcd(mut left: u32, mut right: u32) -> u32 {

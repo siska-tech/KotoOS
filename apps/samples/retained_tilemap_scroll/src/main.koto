@@ -1,0 +1,123 @@
+// Retained tilemap scrolling sample.
+//
+// Arrow keys move a 20x20 viewport through an asset-loaded 32x24 world, one
+// 16-pixel tile at a time. The retained layer is configured only once.
+
+const WORLD_W = 32;
+const WORLD_H = 24;
+const WORLD_CELLS = 768;
+const MAP_RAW_BYTES = 816;
+const VIEW_W = 20;
+const VIEW_H = 20;
+const VIEW_CELLS = 400;
+const TILE_BYTES = 512;
+const KIM_HEADER = 8;
+const SHEET_BYTES = 2056;
+const UPLOAD_PER_FRAME = 50;
+
+fn glyph_tile(glyph: int) -> int {
+    if glyph == 35 { return 1; }
+    if glyph == 126 { return 2; }
+    if glyph == 64 { return 3; }
+    return 0;
+}
+
+fn map_eol(raw: int, raw_len: int, width: int, height: int) -> int {
+    let eol = 0;
+    if raw_len <= width { return -1; }
+    if heap_get_u8(raw + width) == 10 { eol = 1; }
+    else if raw_len > width + 1 && heap_get_u8(raw + width) == 13
+        && heap_get_u8(raw + width + 1) == 10 { eol = 2; }
+    else { return -1; }
+    let body = width * height + eol * (height - 1);
+    if raw_len != body && raw_len != body + eol { return -1; }
+    return eol;
+}
+
+fn map_glyph(raw: int, index: int, width: int, eol: int) -> int {
+    return heap_get_u8(raw + (index / width) * (width + eol) + index % width);
+}
+
+fn main() {
+    buf sheet[2056];
+    buf raw_world[816];
+    buf shown[400];
+
+    let map_loaded = 0;
+    let eol = 0;
+    let cam_x = 0;
+    let cam_y = 0;
+    let next_x = 0;
+    let next_y = 0;
+    let marker = 0;
+    let upload = 0;
+    let stop = 0;
+    let tile = 0;
+    let row = 0;
+    let x = 0;
+    let glyph = 0;
+    let world_cell = 0;
+    let intent = 0;
+
+    map_loaded = asset_load("maps/world.map", 14, raw_world, MAP_RAW_BYTES);
+    if map_loaded < 0 { exit(2); }
+    eol = map_eol(raw_world, map_loaded, WORLD_W, WORLD_H);
+    if eol < 0 { exit(2); }
+
+    while marker < WORLD_CELLS && map_glyph(raw_world, marker, WORLD_W, eol) != 64 {
+        marker = marker + 1;
+    }
+    cam_x = (marker % WORLD_W) - VIEW_W / 2;
+    cam_y = (marker / WORLD_W) - VIEW_H / 2;
+    if cam_x < 0 { cam_x = 0; }
+    if cam_y < 0 { cam_y = 0; }
+    if cam_x > WORLD_W - VIEW_W { cam_x = WORLD_W - VIEW_W; }
+    if cam_y > WORLD_H - VIEW_H { cam_y = WORLD_H - VIEW_H; }
+
+    asset_load("sprites/scroll_tiles.kim", 24, sheet, SHEET_BYTES);
+    game2d_configure_tilemap(0, VIEW_W, VIEW_H, 0, 0);
+
+    loop {
+        intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 { exit(0); }
+
+        next_x = cam_x;
+        next_y = cam_y;
+        if upload >= VIEW_CELLS {
+            if (intent & INTENT_LEFT) != 0 { next_x = cam_x - 1; }
+            else if (intent & INTENT_RIGHT) != 0 { next_x = cam_x + 1; }
+            else if (intent & INTENT_UP) != 0 { next_y = cam_y - 1; }
+            else if (intent & INTENT_DOWN) != 0 { next_y = cam_y + 1; }
+
+            if next_x < 0 { next_x = 0; }
+            if next_y < 0 { next_y = 0; }
+            if next_x > WORLD_W - VIEW_W { next_x = WORLD_W - VIEW_W; }
+            if next_y > WORLD_H - VIEW_H { next_y = WORLD_H - VIEW_H; }
+            if next_x != cam_x || next_y != cam_y {
+                cam_x = next_x;
+                cam_y = next_y;
+                upload = 0;
+            }
+        }
+
+        if upload < VIEW_CELLS {
+            stop = upload + UPLOAD_PER_FRAME;
+            if stop > VIEW_CELLS { stop = VIEW_CELLS; }
+            while upload < stop {
+                x = upload % VIEW_W;
+                row = upload / VIEW_W;
+                world_cell = (cam_y + row) * WORLD_W + cam_x + x;
+                tile = glyph_tile(map_glyph(raw_world, world_cell, WORLD_W, eol));
+                if shown[upload] != tile + 1 {
+                    game2d_set_tile(0, x, row,
+                        sheet + KIM_HEADER + tile * TILE_BYTES);
+                    shown[upload] = tile + 1;
+                }
+                upload = upload + 1;
+            }
+        }
+
+        game2d_present();
+        yield_frame();
+    }
+}

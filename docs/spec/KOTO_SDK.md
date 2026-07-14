@@ -43,8 +43,10 @@ Checked-in sample apps are documented in [KotoSDK Samples](SDK_SAMPLES.md).
 | `draw_text(x, y, buf, len)` | `draw_text` | status | Draws `len` UTF-8 bytes from `buf`. The host chooses the font/colour. |
 | `draw_text_color(x, y, buf, len, rgb565)` | `draw_text_color` | status | Like `draw_text`, but draws in the caller-chosen RGB565 colour. |
 | `draw_pixels(x, y, w, h, buf, len)` | `draw_pixels_rgb565` | status | Blits a `w`x`h` block of little-endian RGB565 pixels from `buf` (row-major, `len == w*h*2` bytes). The opaque tile/sprite primitive (PicoMings model); for sprite transparency, omit empty cells. |
+| `draw_pixels_persistent(x, y, w, h, buf, len)` | `draw_pixels_persistent_rgb565` | status | Commits an RGB565 block as a persistent LCD-GRAM update. Later frames do not erase it; intended for bounded-buffer streaming of full-screen art. |
 | `game2d_set_tile(layer, x, y, tile_ref)` | `game2d_set_tile` | status | Writes one cell of a host-retained 16x16-tile layer. `tile_ref` is the byte offset of a 16x16 RGB565 tile in the app heap (as passed to `draw_pixels`), or `< 0` to clear the cell. Write only the cells that change. |
 | `game2d_clear_layer(layer)` | `game2d_clear_layer` | status | Clears every cell of a tilemap `layer`. |
+| `game2d_configure_tilemap(layer, columns, rows, origin_x, origin_y)` | `game2d_configure_tilemap` | status | Clears and configures layer 0. `columns`/`rows` must each be 1..20; origin is the top-left pixel position. |
 | `game2d_present()` | `game2d_present` | status | Composites the retained layers for this frame in fixed z-order (static → tile → sprite → immediate). Call once per frame after updating retained state; on the simulator it must follow every `sprite_set` so the final sprite state is re-emitted. |
 | `game2d_static_begin()` | `game2d_static_begin` | status | Clears the retained static/background layer and routes subsequent `draw_rect`/`draw_text`/`draw_text_color`/`draw_pixels` into it until `game2d_static_end`. |
 | `game2d_static_end()` | `game2d_static_end` | status | Routes draw calls back to the per-frame immediate list. |
@@ -57,8 +59,11 @@ The Game2D tilemap (KOTO-0135) is the retained alternative to re-blitting a whol
 board with `draw_pixels` every frame: the host keeps the layer and repaints only
 cells whose `tile_ref` changed, so a still board costs nothing. Bake tile art in
 the app heap exactly as for `draw_pixels`, then name cells by their heap offset.
-Currently one 10x20 board layer (origin (8, 0), 16x16 cells) is supported; layer
-must be `0`. See [GAME2D_ABI.md](GAME2D_ABI.md).
+One allocation-free layer with a 20x20 maximum is supported; layer must be `0`.
+Call `game2d_configure_tilemap` once before writing cells to select any active
+size up to 20x20 and its pixel origin. Tiles remain 16x16 RGB565. For backward
+compatibility an unconfigured layer uses 10x20 at `(8, 0)`. See
+[GAME2D_ABI.md](GAME2D_ABI.md).
 
 The Game2D static/background layer (KOTO-0136) is the retained alternative to
 re-emitting unchanging chrome — a full-screen background, panel frames, fixed
@@ -91,16 +96,16 @@ below the immediate `draw_*` list. See [GAME2D_ABI.md](GAME2D_ABI.md).
 
 ## Audio
 
-Audio synthesis is **host-owned**: apps trigger built-in effects by id and start
-package-local KotoMML with `play_bgm_asset`. The host synthesizes PCM, so no
-waveform data lives in the VM heap. `audio_submit` is a low-level escape hatch for
-apps that generate their own PCM.
+Audio synthesis and decoding are **host-owned**: apps trigger built-in effects
+by id and start package-local KotoMML or looping KACL with `play_bgm_asset`.
+Waveform data never lives in the VM heap; large clips stream from the package.
+`audio_submit` is a low-level escape hatch for apps that generate their own PCM.
 
 | Function | Host call | Returns | Notes |
 | :------- | :-------- | :------ | :---- |
 | `play_sfx(id)` | `play_sfx` | status | Triggers a one-shot sound effect (`SFX_*`). |
-| `play_sfx_asset(path, len)` | `play_sfx_asset` | status | Plays one-shot KotoMML from a package `audio/*.kmml` asset. |
-| `play_bgm_asset(path, len)` | `play_bgm_asset` | status | Starts looping KotoMML from a package `audio/*.kmml` asset. |
+| `play_sfx_asset(path, len)` | `play_sfx_asset` | status | Plays a one-shot Native cue (`.kmml`) or runtime-ready PCM16/SLD4 clip (`.kacl`) from the app KPA. Large KACL payloads stream through a bounded host ring. |
+| `play_bgm_asset(path, len)` | `play_bgm_asset` | status | Starts package background music from `audio/*.kmml`, or from a PCM16/SLD4 `.kacl` carrying whole-clip infinite-loop metadata. Large KACL assets stream through bounded host buffers. |
 | `stop_bgm()` | `stop_bgm` | status | Stops the looping background-music track. |
 | `audio_submit(buf, frames, channels)` | `audio_submit_i16` | frames accepted / `-1` | Submits `frames * channels` interleaved little-endian i16 PCM samples from `buf` (so `buf` holds `frames * channels * 2` bytes). Nonblocking; may accept fewer frames. Stereo is downmixed to mono. |
 
@@ -230,6 +235,32 @@ then blitting individual 16×16 tiles each frame with `draw_pixels`:
 buf sheet[9736];                                   // KIM1 header (8) + 19 * 512
 asset_load("sprites/tiles.kim", 17, sheet, 9736);  // load once
 draw_pixels(x, y, 16, 16, sheet + 8 + tile * 512, 512);  // blit tile `tile`
+```
+
+### Text map assets (`.map`)
+
+An `app.json` `maps` block declares an app-relative directory, logical `width`
+and `height`, and the allowed `glyphs`. `build_apps.py` validates every `*.map`
+file in that directory and adds it to the KPA as a read-only `data` asset at the
+same package-local path. Map contents are not generated into Koto source or KBC
+rodata.
+
+The source format is UTF-8 text with exactly `height` rows and `width` Unicode
+glyphs per row. Rows use LF or CRLF; a final row ending is optional. A bare CR,
+blank extra row, invalid UTF-8, undeclared glyph, or a start-marker count other
+than exactly one `@` fails the build. Runtime code must skip CR/LF explicitly or
+decode into a flat cell buffer before row-major indexing.
+
+For a fixed buffer, reserve at most
+`(width * max_utf8_bytes_per_allowed_glyph + 2) * height` bytes. The `+2`
+allows CRLF on every row, including the last. Check the `asset_load` result and
+the decoded cell count before reading the map:
+
+```koto
+buf raw_map[440]; // (20 * 1 + 2) * 20 for an ASCII 20x20 map
+let loaded = asset_load("maps/world.map", 14, raw_map, 440);
+if loaded < 0 { exit(2); }
+// Decode exactly 400 non-CR/LF bytes into a bounded flat cell buffer.
 ```
 
 ## Constants

@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "KotoOS app descriptor",
+  "description": "Per-app apps/<dir>/app.json: build recipe plus package fields (KOTO-0195). Discovered and consumed by harness/build_apps.py.",
+  "type": "object",
+  "required": ["app_id", "kind", "package", "name", "source"],
+  "additionalProperties": false,
+  "properties": {
+    "app_id": {
+      "type": "string",
+      "description": "Reverse-DNS app identity, e.g. dev.koto.games.kotorogue.",
+      "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$"
+    },
+    "kind": {
+      "description": "Build tool: koto = koto-compiler (high-level source), asm = kbc-asm (low-level IR).",
+      "enum": ["koto", "asm"]
+    },
+    "package": {
+      "type": "string",
+      "description": "Staging/archive stem: bytecode is package_inputs/bytecode/<package>.kbc and the packed archive is APPS/<package>.kpa.",
+      "pattern": "^[a-z0-9_]+$"
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name shown in the launcher."
+    },
+    "description": {
+      "type": "string",
+      "description": "One-line launcher description."
+    },
+    "category": {
+      "type": "string",
+      "description": "Launcher category label (e.g. ゲーム, アプリ)."
+    },
+    "runtime": {
+      "type": "string",
+      "description": "Runtime identifier (default: kotoruntime-bytecode).",
+      "default": "kotoruntime-bytecode"
+    },
+    "source": {
+      "type": "string",
+      "description": "App-relative path to the entry source (e.g. src/main.koto)."
+    },
+    "icon": {
+      "type": "string",
+      "description": "App-relative path to the 40x40 KICON1 launcher icon (default: icon.kicon).",
+      "default": "icon.kicon"
+    },
+    "shell_icon": {
+      "type": "object",
+      "description": "Launcher icon palette; the mask is recolored with these.",
+      "additionalProperties": false,
+      "properties": {
+        "style": { "enum": ["mask"] },
+        "background": { "$ref": "#/definitions/color" },
+        "primary": { "$ref": "#/definitions/color" },
+        "secondary": { "$ref": "#/definitions/color" },
+        "accent": { "$ref": "#/definitions/color" },
+        "highlight": { "$ref": "#/definitions/color" },
+        "shadow": { "$ref": "#/definitions/color" }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "description": "Declared per-app memory budget.",
+      "additionalProperties": false,
+      "properties": {
+        "sram_work_bytes": { "type": "integer", "minimum": 0 },
+        "psram_cache_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fs": { "enum": ["sandbox", "none"] },
+        "network": { "type": "boolean" }
+      }
+    },
+    "codegen": {
+      "type": "object",
+      "description": "Per-app koto-compiler code-window layout opt-ins (KOTO-0156/0169). Off by default; changing these changes committed bytecode.",
+      "additionalProperties": false,
+      "properties": {
+        "comment": { "type": "string" },
+        "relocate_preamble": { "type": "boolean" },
+        "outline_cold_blocks": { "type": "boolean" },
+        "legacy_compare_templates": { "type": "boolean" }
+      }
+    },
+    "maps": {
+      "type": "object",
+      "description": "Validate and package *.map tilemaps as read-only data assets.",
+      "required": ["dir", "width", "height", "glyphs"],
+      "additionalProperties": false,
+      "properties": {
+        "dir": { "type": "string", "description": "App-relative maps directory." },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "glyphs": { "type": "string", "description": "Allowed tilemap characters." },
+        "tileset": { "type": "string", "pattern": "^.*\\.kspr$", "description": "Optional app-relative .kspr used by the graphical tilemap editor." },
+        "tiles": {
+          "type": "object",
+          "description": "Map glyph to .kspr tile ID mapping.",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "allOf": [
+        { "if": { "required": ["tileset"] }, "then": { "required": ["tiles"] } },
+        { "if": { "required": ["tiles"] }, "then": { "required": ["tileset"] } }
+      ]
+    },
+    "images": {
+      "type": "array",
+      "description": ".kspr sprite sheets or exact-layout 320x320 PNG tile graphics compiled to KIM1 package assets.",
+      "items": { "$ref": "#/definitions/imageAsset" }
+    },
+    "audio": {
+      "type": "array",
+      "description": "Native KotoAudio sources staged/compiled into the package.",
+      "items": { "$ref": "#/definitions/asset" }
+    }
+  },
+  "definitions": {
+    "color": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$",
+      "description": "RRGGBB hex color."
+    },
+    "asset": {
+      "type": "object",
+      "required": ["source", "output"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "description": "App-relative source path." },
+        "output": { "type": "string", "description": "Package-local staged path, e.g. audio/foo.kmml." }
+      }
+    },
+    "imageAsset": {
+      "type": "object",
+      "required": ["source", "output"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "description": "App-relative .kspr or PNG source path." },
+        "output": { "type": "string", "description": "Package-local KIM1 path." },
+        "full_color_image": { "type": "boolean", "description": "Convert a 320x320 PNG to a normal row-major RGB565 KIM1 image." }
+      }
+    }
+  }
+}

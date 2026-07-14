@@ -158,6 +158,10 @@ const VERIFIED_SMALL_READ_ADDRS: [u32; 5] = [0, 1, 15, 16, 257];
 const BANNER: &[u8] = concat!(
     "KotoOS KOTO-0132 psram-diag v",
     env!("CARGO_PKG_VERSION"),
+    " board=",
+    env!("KOTO_BOARD_ID"),
+    " mcu=",
+    env!("KOTO_MCU_ID"),
     "\r\n"
 )
 .as_bytes();
@@ -2981,15 +2985,15 @@ fn embassy_falling_edge_fudge_origin16_program() -> pio::Program<32> {
     entry = "cortex_m_rt::entry"
 )]
 async fn main(_spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    let p = koto_pico::board::split_peripherals(embassy_rp::init(Default::default()));
 
     let mut uart_config = UartConfig::default();
     uart_config.baudrate = 115_200;
-    let mut uart = UartTx::new_blocking(p.UART0, p.PIN_0, uart_config);
+    let mut uart = UartTx::new_blocking(p.uart, p.uart_tx, uart_config);
     Timer::after_secs(1).await;
     let _ = uart.blocking_write(BANNER);
 
-    let mut pio = Pio::new(p.PIO1, Irqs);
+    let mut pio = Pio::new(p.psram_pio, Irqs);
 
     #[cfg(feature = "psram_qpi_backend_diag")]
     {
@@ -3003,12 +3007,12 @@ async fn main(_spawner: Spawner) {
         match PicoCalcQpiPsram::new(
             &mut pio.common,
             pio.sm0,
-            p.PIN_20,
-            p.PIN_21,
-            p.PIN_2,
-            p.PIN_3,
-            p.PIN_4,
-            p.PIN_5,
+            p.psram_cs,
+            p.psram_sck,
+            p.psram_sio0,
+            p.psram_sio1,
+            p.psram_sio2,
+            p.psram_sio3,
         ) {
             Ok(mut hal) => {
                 log_qpi_init(&mut uart, &mut line, true);
@@ -3117,10 +3121,10 @@ async fn main(_spawner: Spawner) {
         let mut hal = PicoCalcPsram::new(
             &mut pio.common,
             pio.sm0,
-            p.PIN_20,
-            p.PIN_21,
-            p.PIN_2,
-            p.PIN_3,
+            p.psram_cs,
+            p.psram_sck,
+            p.psram_sio0,
+            p.psram_sio1,
         );
 
         let mut lb = LineBuffer::new();

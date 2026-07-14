@@ -481,8 +481,10 @@ fn host_call_id(name: &str) -> Option<u8> {
         "draw_text" => host_call::DRAW_TEXT,
         "draw_text_color" => host_call::DRAW_TEXT_COLOR,
         "draw_pixels_rgb565" => host_call::DRAW_PIXELS_RGB565,
+        "draw_pixels_persistent_rgb565" => host_call::DRAW_PIXELS_PERSISTENT_RGB565,
         "game2d_set_tile" => host_call::GAME2D_SET_TILE,
         "game2d_clear_layer" => host_call::GAME2D_CLEAR_LAYER,
+        "game2d_configure_tilemap" => host_call::GAME2D_CONFIGURE_TILEMAP,
         "game2d_present" => host_call::GAME2D_PRESENT,
         "game2d_static_begin" => host_call::GAME2D_STATIC_BEGIN,
         "game2d_static_end" => host_call::GAME2D_STATIC_END,
@@ -506,6 +508,7 @@ fn host_call_id(name: &str) -> Option<u8> {
         "file_write" => host_call::FILE_WRITE,
         "file_close" => host_call::FILE_CLOSE,
         "asset_load" => host_call::ASSET_LOAD,
+        "asset_load_range" => host_call::ASSET_LOAD_RANGE,
         "ime_feed_key" => host_call::IME_FEED_KEY,
         "ime_convert" => host_call::IME_CONVERT,
         "ime_query_line" => host_call::IME_QUERY_LINE,
@@ -843,7 +846,7 @@ mod tests {
     #[test]
     fn memo_assembly_fixture_assembles_and_verifies() {
         // `apps/memo/memo.kbc.asm` is the assembler's reference fixture. The
-        // shipped `sdcard_mock/bytecode/memo.kbc` is now compiled from the
+        // shipped `package_inputs/bytecode/memo.kbc` is now compiled from the
         // high-level `apps/memo/src/main.koto` (see the build loop), so this only
         // checks the assembly fixture still assembles to verifier-valid bytecode.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

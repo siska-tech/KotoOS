@@ -1,17 +1,11 @@
 //! Offline generator for the Pico primary-audio cue tables (KOTO-0165).
 //!
 //! Scans `apps/*/audio/*.kmml`, parses each source with the koto-audio-tools MML
-//! frontend, converts the **legacy KotoMML dialect** (0-15 `V` volumes, legacy
-//! synth `@` instrument ids) to the KotoAudio builtin-instrument model, and emits
-//! one vendored Rust module of `SequenceEvent` statics plus the per-app route
+//! frontend using the native KotoAudio instrument, volume, and drum model, and
+//! emits one vendored Rust module of `SequenceEvent` statics plus the per-app route
 //! arrays consumed by `koto_pico::firmware::audio_cues`.
 //!
-//! KotoBlocks is special-cased for SIM parity: its BGM is generated from the same
-//! `examples/mml/blocks_like_bgm.mml` source (native dialect, no conversion) that
-//! produced the SIM `BLOCKS_LIKE_BGM_COMPACT` table, and its SFX cues are the
-//! hand-authored statics in `audio_cues.rs`, so they are skipped here.
-//!
-//! Regeneration (from the KotoOS repo root, sibling `koto-audio` checkout):
+//! Regeneration (from the KotoOS repo root):
 //!
 //! ```console
 //! cargo run -p koto-audio-gen -- src/koto-pico/src/firmware/audio_cues_generated.rs
@@ -19,59 +13,15 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use koto_audio::{
-    AudioLimits, CompactEvent, MixerVolume, PolyphonicSequence, PolyphonicSequenceVoice, Sequence,
-    SequenceEvent, BUILTIN_INSTRUMENT_CLOSED_HI_HAT, BUILTIN_INSTRUMENT_SAW,
-    BUILTIN_INSTRUMENT_SQUARE, BUILTIN_INSTRUMENT_SQUARE_FAST, BUILTIN_INSTRUMENT_TRIANGLE,
-    BUILTIN_SEQUENCE_INSTRUMENTS, MAX_SEQUENCE_VOICES, SEQUENCE_REPEAT_INFINITE,
+    AudioLimits, MixerVolume, PolyphonicSequence, PolyphonicSequenceVoice, Sequence, SequenceEvent,
+    BUILTIN_SEQUENCE_INSTRUMENTS, MAX_SEQUENCE_VOICES,
 };
-use koto_audio_tools::mml::{parse_mml_to_compact_sequence_table_with_options, MmlParseOptions};
-use koto_audio_tools::CompactSequenceTable;
+use koto_audio_gen::{convert_mml_text, ConvertedTrack};
 
-/// Which MML dialect a source file was authored in.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Dialect {
-    /// Legacy KotoOS `.kmml`: `V` is 0-15, `@` ids name the legacy Pico synth
-    /// voices, quarter-note resolution assumed 96 ticks (matches the removed
-    /// runtime parser exactly, including dotted lengths).
-    Legacy,
-    /// koto-audio-tools native MML: `V` is 0-127, `@` ids are builtin ids.
-    Native,
-}
-
-/// Maps a legacy Pico synth `@` id to the closest KotoAudio builtin instrument.
-///
-/// Legacy voices (see the removed `pico_instrument` table): 0 square, 1 pulse25,
-/// 2/8 triangle, 3 saw, 4 noise, 5 pulse12, 6 warm saw lead, 7 warm pulse bass,
-/// 9 short noise. Custom `.kwt` instruments occupied ids 6-31 per app; the
-/// shipped apps used 6 (lead), 7 (bass), and 9 (drum), mapped to the same
-/// builtin timbres as their synth fallbacks. There is no pulse or pitched-noise
-/// builtin, so pulses become squares and noise becomes the closed hi-hat.
-fn map_legacy_instrument(id: u8) -> u8 {
-    match id {
-        0 => BUILTIN_INSTRUMENT_SQUARE,
-        1 | 5 => BUILTIN_INSTRUMENT_SQUARE_FAST,
-        2 | 7 | 8 => BUILTIN_INSTRUMENT_TRIANGLE,
-        3 | 6 => BUILTIN_INSTRUMENT_SAW,
-        4 | 9 => BUILTIN_INSTRUMENT_CLOSED_HI_HAT,
-        other => {
-            if usize::from(other) < BUILTIN_SEQUENCE_INSTRUMENTS.len() {
-                other
-            } else {
-                BUILTIN_INSTRUMENT_SQUARE
-            }
-        }
-    }
-}
-
-/// Rescales a legacy 0-15 `V` volume onto the 0-255 note-volume scale.
-fn rescale_legacy_volume(volume: u8) -> u8 {
-    volume.saturating_mul(17)
-}
-
-/// One asset to convert: the MML source, its routing key, and its dialect.
+/// One asset to convert: the MML source and its routing key.
 struct AssetSpec {
     source: PathBuf,
     /// Routing key as apps declare it (`audio/<app>_<name>.kmml`).
@@ -79,13 +29,6 @@ struct AssetSpec {
     /// Generated static symbol base (`KOTOMINES_MOVE`).
     symbol: String,
     is_bgm: bool,
-    dialect: Dialect,
-}
-
-/// A converted track ready to emit: adapted events plus voice gain.
-struct EmitTrack {
-    events: Vec<SequenceEvent>,
-    gain: u16,
 }
 
 /// A converted asset ready to emit.
@@ -94,7 +37,7 @@ struct EmitAsset {
     symbol: String,
     is_bgm: bool,
     tick_rate_hz: u16,
-    tracks: Vec<EmitTrack>,
+    tracks: Vec<ConvertedTrack>,
 }
 
 fn main() -> ExitCode {
@@ -112,23 +55,19 @@ fn main() -> ExitCode {
 
 fn run() -> Result<String, String> {
     let mut root = PathBuf::from(".");
-    let mut koto_audio_root = PathBuf::from("../koto-audio");
     let mut output: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => root = PathBuf::from(args.next().ok_or("missing --root value")?),
-            "--koto-audio" => {
-                koto_audio_root = PathBuf::from(args.next().ok_or("missing --koto-audio value")?)
-            }
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}")),
             _ if output.is_none() => output = Some(PathBuf::from(arg)),
             _ => return Err("expected exactly one output path".to_string()),
         }
     }
-    let output = output.ok_or("usage: koto-audio-gen [--root DIR] [--koto-audio DIR] OUTPUT.rs")?;
+    let output = output.ok_or("usage: koto-audio-gen [--root DIR] OUTPUT.rs")?;
 
-    let specs = collect_specs(&root, &koto_audio_root)?;
+    let specs = collect_specs(&root)?;
     let mut assets = Vec::new();
     for spec in &specs {
         assets.push(convert_asset(spec)?);
@@ -138,6 +77,14 @@ fn run() -> Result<String, String> {
     let rendered = render_module(&assets);
     std::fs::write(&output, rendered)
         .map_err(|error| format!("failed to write {}: {error}", output.display()))?;
+    let status = Command::new("rustfmt")
+        .args(["--edition", "2021"])
+        .arg(&output)
+        .status()
+        .map_err(|error| format!("failed to run rustfmt on {}: {error}", output.display()))?;
+    if !status.success() {
+        return Err(format!("rustfmt failed for {}", output.display()));
+    }
 
     let bgm_count = assets.iter().filter(|asset| asset.is_bgm).count();
     Ok(format!(
@@ -149,25 +96,8 @@ fn run() -> Result<String, String> {
     ))
 }
 
-fn collect_specs(root: &Path, koto_audio_root: &Path) -> Result<Vec<AssetSpec>, String> {
+fn collect_specs(root: &Path) -> Result<Vec<AssetSpec>, String> {
     let mut specs = Vec::new();
-
-    // KotoBlocks BGM: the same native-dialect source that generated the SIM
-    // `BLOCKS_LIKE_BGM_COMPACT` table, so SIM and device play identical cues.
-    let blocks_like = koto_audio_root.join("examples/mml/blocks_like_bgm.mml");
-    if !blocks_like.is_file() {
-        return Err(format!(
-            "missing {} (pass --koto-audio pointing at the sibling koto-audio checkout)",
-            blocks_like.display()
-        ));
-    }
-    specs.push(AssetSpec {
-        source: blocks_like,
-        key: "audio/koto_blocks_bgm.kmml".to_string(),
-        symbol: "KOTO_BLOCKS_BGM".to_string(),
-        is_bgm: true,
-        dialect: Dialect::Native,
-    });
 
     let apps_dir = root.join("apps");
     let mut app_dirs: Vec<PathBuf> = std::fs::read_dir(&apps_dir)
@@ -183,11 +113,6 @@ fn collect_specs(root: &Path, koto_audio_root: &Path) -> Result<Vec<AssetSpec>, 
             .and_then(|name| name.to_str())
             .ok_or_else(|| format!("non-UTF8 app dir {}", app_dir.display()))?
             .to_string();
-        // KotoBlocks SFX are the hand-authored statics in `audio_cues.rs`
-        // (SIM-parity envelopes/drums the compact MML path cannot express).
-        if app == "koto_blocks" {
-            continue;
-        }
         let mut files: Vec<PathBuf> = std::fs::read_dir(app_dir.join("audio"))
             .map_err(|error| format!("failed to read {}/audio: {error}", app_dir.display()))?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -204,7 +129,6 @@ fn collect_specs(root: &Path, koto_audio_root: &Path) -> Result<Vec<AssetSpec>, 
                 key: format!("audio/{app}_{name}.kmml"),
                 symbol: format!("{}_{}", app.to_uppercase(), name.to_uppercase()),
                 is_bgm: name.starts_with("bgm"),
-                dialect: Dialect::Legacy,
                 source: file,
             });
         }
@@ -215,123 +139,22 @@ fn collect_specs(root: &Path, koto_audio_root: &Path) -> Result<Vec<AssetSpec>, 
 fn convert_asset(spec: &AssetSpec) -> Result<EmitAsset, String> {
     let source = std::fs::read_to_string(&spec.source)
         .map_err(|error| format!("failed to read {}: {error}", spec.source.display()))?;
-    let options = match spec.dialect {
-        // 96 ticks per quarter mirrors the removed legacy runtime parser exactly
-        // (L32 and dotted lengths stay integral); defaults match its initial
-        // state (T120 V10 O4 L4 @0).
-        Dialect::Legacy => MmlParseOptions {
-            ticks_per_beat: 96,
-            default_volume: 10,
-            default_octave: 4,
-            ..MmlParseOptions::default()
-        },
-        Dialect::Native => MmlParseOptions::default(),
-    };
-    let table = parse_mml_to_compact_sequence_table_with_options(&source, options)
-        .map_err(|error| format!("{}: parse failed: {error:?}", spec.source.display()))?;
-
-    let mut tracks = convert_tracks(&table, spec.dialect);
-    if !spec.is_bgm && tracks.len() > 1 {
-        // The legacy SFX path played track 0 only; keep that behavior.
-        tracks.truncate(1);
-    }
-    if spec.is_bgm {
-        for track in &mut tracks {
-            ensure_infinite_loop(&mut track.events);
-        }
+    // The native conversion and BGM infinite-loop policy live in the crate
+    // library so the audition CLI (koto-mml, KOTO-0188) shares them.
+    let mut score = convert_mml_text(&source, spec.is_bgm)
+        .map_err(|error| format!("{}: {error}", spec.source.display()))?;
+    if !spec.is_bgm && score.tracks.len() > 1 {
+        // SFX are monophonic in the primary cue model.
+        score.tracks.truncate(1);
     }
 
     Ok(EmitAsset {
         key: spec.key.clone(),
         symbol: spec.symbol.clone(),
         is_bgm: spec.is_bgm,
-        tick_rate_hz: table.tempo.tick_rate_hz,
-        tracks,
+        tick_rate_hz: score.tick_rate_hz,
+        tracks: score.tracks,
     })
-}
-
-/// Adapts compact tracks to `SequenceEvent`s against the builtin instrument
-/// table, applying the legacy-dialect conversions where requested. This mirrors
-/// `CompactTrack::adapt_to_sequence` (instrument volume is 255 in every table
-/// the MML frontend emits, so note volumes pass through unscaled).
-fn convert_tracks(table: &CompactSequenceTable, dialect: Dialect) -> Vec<EmitTrack> {
-    table
-        .tracks
-        .iter()
-        .map(|track| EmitTrack {
-            gain: track.gain.get(),
-            events: track
-                .events
-                .iter()
-                .map(|event| convert_event(*event, table, dialect))
-                .collect(),
-        })
-        .collect()
-}
-
-fn convert_event(
-    event: CompactEvent,
-    table: &CompactSequenceTable,
-    dialect: Dialect,
-) -> SequenceEvent {
-    match event {
-        CompactEvent::Note {
-            pitch,
-            duration_ticks,
-            volume,
-            instrument_id,
-        } => {
-            let builtin_id = table
-                .instruments
-                .get(usize::from(instrument_id))
-                .map_or(BUILTIN_INSTRUMENT_SQUARE, |instrument| {
-                    instrument.builtin_id
-                });
-            let (volume, instrument_id) = match dialect {
-                Dialect::Legacy => (
-                    rescale_legacy_volume(volume),
-                    map_legacy_instrument(builtin_id),
-                ),
-                Dialect::Native => (volume, builtin_id),
-            };
-            SequenceEvent::Note {
-                pitch,
-                duration_ticks,
-                volume,
-                instrument_id,
-            }
-        }
-        CompactEvent::Rest { duration_ticks } => SequenceEvent::Rest { duration_ticks },
-        CompactEvent::LoopStart => SequenceEvent::LoopStart,
-        CompactEvent::LoopEnd { repeat_count } => SequenceEvent::LoopEnd { repeat_count },
-        CompactEvent::End => SequenceEvent::End,
-    }
-}
-
-/// BGM must loop forever like the removed legacy player did even without `[ ]`:
-/// wrap the whole track when the source has no loop region, and force finite
-/// loop regions to infinite.
-fn ensure_infinite_loop(events: &mut Vec<SequenceEvent>) {
-    let mut has_loop = false;
-    for event in events.iter_mut() {
-        if let SequenceEvent::LoopEnd { repeat_count } = event {
-            *repeat_count = SEQUENCE_REPEAT_INFINITE;
-            has_loop = true;
-        }
-    }
-    if !has_loop {
-        let end = events
-            .iter()
-            .position(|event| matches!(event, SequenceEvent::End))
-            .unwrap_or(events.len());
-        events.insert(
-            end,
-            SequenceEvent::LoopEnd {
-                repeat_count: SEQUENCE_REPEAT_INFINITE,
-            },
-        );
-        events.insert(0, SequenceEvent::LoopStart);
-    }
 }
 
 /// Rebuilds each emitted asset in memory and runs the runtime validators, so a
@@ -386,8 +209,7 @@ fn render_module(assets: &[EmitAsset]) -> String {
         "//! Generated primary-audio cue tables for the Pico firmware (KOTO-0165).\n\
          //!\n\
          //! GENERATED FILE - DO NOT EDIT. Produced by `tools/koto-audio-gen` from the\n\
-         //! per-app `apps/*/audio/*.kmml` sources (legacy-dialect conversion) and the\n\
-         //! koto-audio `examples/mml/blocks_like_bgm.mml` KotoBlocks BGM source.\n\
+         //! native KotoAudio `apps/*/audio/*.kmml` sources.\n\
          //! Regenerate from the KotoOS repo root with:\n\
          //!\n\
          //! ```console\n\
@@ -495,7 +317,8 @@ mod tests {
     use super::*;
     use koto_audio::{
         AudioBackend, AudioPolicy, BackendReport, BackendResult, BackendState, DefaultAudioService,
-        MixerBlock, DEFAULT_MIXER_BLOCK_FRAMES,
+        MixerBlock, BUILTIN_INSTRUMENT_BASS_DRUM, BUILTIN_INSTRUMENT_CLOSED_HI_HAT,
+        DEFAULT_MIXER_BLOCK_FRAMES,
     };
 
     /// Capture backend: records whether any submitted block was non-silent.
@@ -537,17 +360,16 @@ mod tests {
     }
 
     /// End-to-end conversion check against a real shipped app source: a
-    /// legacy-dialect `.kmml` converts, validates, and renders non-silent
+    /// native KotoAudio `.kmml` converts, validates, and renders non-silent
     /// output through the same koto-audio service shape the Pico worker runs.
     #[test]
-    fn converted_legacy_bgm_renders_non_silent_audio() {
+    fn converted_native_bgm_renders_non_silent_audio() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let spec = AssetSpec {
             source: root.join("apps/kotomines/audio/bgm.kmml"),
             key: "audio/kotomines_bgm.kmml".to_string(),
             symbol: "KOTOMINES_BGM".to_string(),
             is_bgm: true,
-            dialect: Dialect::Legacy,
         };
         let asset = convert_asset(&spec).expect("shipped BGM converts");
         validate_assets(std::slice::from_ref(&asset)).expect("shipped BGM validates");
@@ -594,56 +416,30 @@ mod tests {
     }
 
     #[test]
-    fn legacy_instrument_map_targets_valid_builtins() {
-        for id in 0..=u8::MAX {
-            let mapped = map_legacy_instrument(id);
-            assert!(usize::from(mapped) < BUILTIN_SEQUENCE_INSTRUMENTS.len());
-        }
-    }
+    fn every_koto_blocks_cue_uses_the_generic_per_app_scan() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let specs = collect_specs(&root).expect("shipped audio sources scan");
+        let bgm = specs
+            .iter()
+            .find(|spec| spec.key == "audio/koto_blocks_bgm.kmml")
+            .expect("KotoBlocks BGM is generated");
 
-    #[test]
-    fn legacy_volume_rescale_spans_full_note_volume() {
-        assert_eq!(rescale_legacy_volume(0), 0);
-        assert_eq!(rescale_legacy_volume(10), 170);
-        assert_eq!(rescale_legacy_volume(15), 255);
-    }
-
-    #[test]
-    fn missing_loop_region_is_wrapped_infinite() {
-        let mut events = vec![
-            SequenceEvent::Note {
-                pitch: 440,
-                duration_ticks: 4,
-                volume: 200,
-                instrument_id: 3,
-            },
-            SequenceEvent::End,
-        ];
-        ensure_infinite_loop(&mut events);
-        assert!(matches!(events[0], SequenceEvent::LoopStart));
-        assert!(matches!(
-            events[2],
-            SequenceEvent::LoopEnd {
-                repeat_count: SEQUENCE_REPEAT_INFINITE
-            }
-        ));
-        assert!(matches!(events[3], SequenceEvent::End));
-    }
-
-    #[test]
-    fn finite_loop_regions_are_forced_infinite() {
-        let mut events = vec![
-            SequenceEvent::LoopStart,
-            SequenceEvent::Rest { duration_ticks: 4 },
-            SequenceEvent::LoopEnd { repeat_count: 3 },
-            SequenceEvent::End,
-        ];
-        ensure_infinite_loop(&mut events);
-        assert!(matches!(
-            events[2],
-            SequenceEvent::LoopEnd {
-                repeat_count: SEQUENCE_REPEAT_INFINITE
-            }
-        ));
+        assert_eq!(bgm.source, root.join("apps/koto_blocks/audio/bgm.kmml"));
+        let asset = convert_asset(bgm).expect("native KotoBlocks BGM converts");
+        assert_eq!(asset.tracks.len(), 4);
+        let drum_events = &asset.tracks[3].events;
+        assert!(drum_events.iter().any(|event| matches!(
+            event,
+            SequenceEvent::Note { instrument_id, .. }
+                if *instrument_id == BUILTIN_INSTRUMENT_BASS_DRUM
+        )));
+        assert!(drum_events.iter().any(|event| matches!(
+            event,
+            SequenceEvent::Note { instrument_id, .. }
+                if *instrument_id == BUILTIN_INSTRUMENT_CLOSED_HI_HAT
+        )));
+        assert!(specs
+            .iter()
+            .any(|spec| spec.key == "audio/koto_blocks_move.kmml"));
     }
 }

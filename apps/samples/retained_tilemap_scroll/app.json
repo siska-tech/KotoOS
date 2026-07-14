@@ -1,0 +1,38 @@
+{
+  "app_id": "dev.koto.samples.retained-tilemap-scroll",
+  "kind": "koto",
+  "package": "sample_retained_tilemap_scroll",
+  "name": "SDK Tilemap Scroll",
+  "description": "Scrolls a retained 20x20 viewport through an editor-authored map.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "maps": {
+    "dir": "maps",
+    "width": 32,
+    "height": 24,
+    "glyphs": ".#~@",
+    "tileset": "sprites/tiles.kspr",
+    "tiles": {
+      ".": 0,
+      "#": 1,
+      "~": 2,
+      "@": 3
+    }
+  },
+  "images": [
+    {
+      "source": "sprites/tiles.kspr",
+      "output": "sprites/scroll_tiles.kim"
+    }
+  ]
+}

@@ -40,6 +40,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage: koto-sim [--script PATH] [--image PATH] [--font PATH] [--window] [--memo-validation]\n\
                  \x20               [--app APP_ID] [--app-script PATH] [--inspect] [--budget] [--audio PATH]\n\
+                 \x20               [--watch DIR] [--watch-replay PATH]\n\
                  \x20               [--golden-frames] [--splash] [--system-view]\n\
                  \x20               [--save-list] [--save-clear APP_ID]\n\
                  \x20               [--battery PERCENT] [--charging] [--voltage MV] [--power-unknown]"
@@ -72,19 +73,28 @@ fn main() -> ExitCode {
         return render_splash_cli(&args.font, image_path);
     }
 
-    if let Some(app_id) = &args.app {
-        if let Some(audio_path) = &args.audio {
-            return run_app_audio_cli(app_id, args.app_script.as_deref(), audio_path);
+    // `--window --app` launches the app directly inside window mode (with the
+    // optional KOTO-0191 watch loop); only headless `--app` runs dispatch here.
+    if !args.window {
+        if let Some(app_id) = &args.app {
+            if let Some(audio_path) = &args.audio {
+                return run_app_audio_cli(app_id, args.app_script.as_deref(), audio_path);
+            }
+            if let Some(image_path) = &args.image {
+                return run_app_image_cli(
+                    app_id,
+                    args.app_script.as_deref(),
+                    &args.font,
+                    image_path,
+                );
+            }
+            return run_app_cli(
+                app_id,
+                args.app_script.as_deref(),
+                args.inspect,
+                args.budget,
+            );
         }
-        if let Some(image_path) = &args.image {
-            return run_app_image_cli(app_id, args.app_script.as_deref(), &args.font, image_path);
-        }
-        return run_app_cli(
-            app_id,
-            args.app_script.as_deref(),
-            args.inspect,
-            args.budget,
-        );
     }
 
     let packages = match load_packages("sdcard_mock") {
@@ -143,7 +153,13 @@ fn main() -> ExitCode {
     }
 
     if args.window {
-        return run_window_mode(shell, &args.font);
+        return run_window_mode(
+            shell,
+            &args.font,
+            args.app.as_deref(),
+            args.watch.as_deref(),
+            args.watch_replay.as_deref(),
+        );
     }
 
     if let Some(path) = &args.script {
@@ -522,7 +538,13 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(feature = "window")]
-fn run_window_mode(mut shell: ShellState, font_path: &str) -> ExitCode {
+fn run_window_mode(
+    mut shell: ShellState,
+    font_path: &str,
+    app: Option<&str>,
+    watch: Option<&str>,
+    watch_replay: Option<&str>,
+) -> ExitCode {
     let font_bytes = match load_font_bytes(font_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -532,7 +554,12 @@ fn run_window_mode(mut shell: ShellState, font_path: &str) -> ExitCode {
     };
     // Restore persisted favorites / sort / category for the interactive session.
     koto_sim::apply_shell_prefs(&mut shell, "sdcard_mock");
-    match koto_sim::window::run(shell, &font_bytes, Path::new("sdcard_mock")) {
+    let direct = app.map(|app_id| koto_sim::window::DirectApp {
+        app_id: app_id.to_string(),
+        watch_dir: watch.map(PathBuf::from),
+        replay: watch_replay.map(PathBuf::from),
+    });
+    match koto_sim::window::run(shell, &font_bytes, Path::new("sdcard_mock"), direct) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("window error: {error:?}");
@@ -542,7 +569,13 @@ fn run_window_mode(mut shell: ShellState, font_path: &str) -> ExitCode {
 }
 
 #[cfg(not(feature = "window"))]
-fn run_window_mode(_shell: ShellState, _font_path: &str) -> ExitCode {
+fn run_window_mode(
+    _shell: ShellState,
+    _font_path: &str,
+    _app: Option<&str>,
+    _watch: Option<&str>,
+    _watch_replay: Option<&str>,
+) -> ExitCode {
     eprintln!("--window requires building with the `window` feature:");
     eprintln!("    cargo run -p koto-sim --features window -- --window");
     ExitCode::FAILURE
@@ -596,6 +629,8 @@ struct CliArgs {
     splash: bool,
     audio: Option<String>,
     system_view: bool,
+    watch: Option<String>,
+    watch_replay: Option<String>,
 }
 
 impl CliArgs {
@@ -619,6 +654,8 @@ impl CliArgs {
         let mut splash = false;
         let mut audio = None;
         let mut system_view = false;
+        let mut watch = None;
+        let mut watch_replay = None;
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
@@ -641,6 +678,8 @@ impl CliArgs {
                 "--splash" => splash = true,
                 "--audio" => audio = Some(Self::value(&mut args, "--audio")?),
                 "--system-view" => system_view = true,
+                "--watch" => watch = Some(Self::value(&mut args, "--watch")?),
+                "--watch-replay" => watch_replay = Some(Self::value(&mut args, "--watch-replay")?),
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -675,6 +714,12 @@ impl CliArgs {
         if splash && (window || app.is_some() || script.is_some() || golden_frames) {
             return Err("--splash only combines with --image/--font".to_string());
         }
+        if watch.is_some() && (!window || app.is_none()) {
+            return Err("--watch requires --window and --app".to_string());
+        }
+        if watch_replay.is_some() && watch.is_none() {
+            return Err("--watch-replay requires --watch".to_string());
+        }
 
         let power_state = Self::resolve_power_state(battery, charging, voltage, power_unknown)?;
 
@@ -695,6 +740,8 @@ impl CliArgs {
             splash,
             audio,
             system_view,
+            watch,
+            watch_replay,
         })
     }
 

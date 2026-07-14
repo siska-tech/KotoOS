@@ -1,26 +1,31 @@
 //! The `VmHost` adapter the device presents to a running app: bounded draw
 //! commands, sandboxed file handles, and the memo IME bridge (KOTO-0129).
 
-use core::fmt::Write;
+use core::{cell::UnsafeCell, fmt::Write};
 
 use embassy_time::Instant;
-use embedded_sdmmc::{BlockDevice, LfnBuffer, Mode, ShortFileName, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{
+    BlockDevice, LfnBuffer, Mode, RawFile, RawVolume, ShortFileName, VolumeIdx, VolumeManager,
+};
+use koto_audio::{
+    AudioLimits, ClipAssetHeader, ClipLoop, CodecId, LoopCount, StreamingClipDecoder,
+    CLIP_ASSET_HEADER_SIZE,
+};
 use koto_core::runtime::{host_call, ime_key};
 use koto_core::{
     CellMetrics, HostCallOutcome, HostErrorCode, KotoMemoIme, MemoEditor, MemoImeKey, MemoImeLine,
     MemoImeMode, MemoMove, PixelFormat, RenderSurface, SkkError, SkkLeadingIndex, SkkRead,
-    TextLayout, VmHost, VmInputSnapshot, WindowedDict, SKK_LOOKUP_WINDOW_BYTES,
+    TextLayout, VmHost, VmInputSnapshot, WindowedDict, MAX_VIRTUAL_PATH_LEN,
+    SKK_LOOKUP_WINDOW_BYTES,
 };
 
 use crate::dashboard::LineBuffer;
-use crate::firmware::audio::{PcmSubmitError, PicoAudioBackend};
-use crate::firmware::audio_cues::{
-    builtin_bgm_cue, primary_audio_route, sfx_id_cue, PicoPrimaryCue,
-};
+use crate::firmware::audio::{PcmSubmitError, PicoAudioBackend, RUNTIME_CLIP_IMAGE_CAPACITY};
+use crate::firmware::audio_cues::{builtin_bgm_cue, sfx_id_cue};
 use crate::firmware::config::{
     DiagClass, FirmwareClock, DEVICE_CELL_HEIGHT, DEVICE_CELL_WIDTH, DIAG_PROFILE,
-    GAME2D_BOARD_CELLS, GAME2D_MAX_SPRITES, GAME2D_MAX_STAMPS, GAME2D_MAX_TEXT_ITEMS,
-    MANIFEST_LFN_BYTES, MAX_APP_DRAW_COMMANDS, MAX_APP_TEXT_BYTES, MAX_DEVICE_OPEN_FILES,
+    GAME2D_MAX_SPRITES, GAME2D_MAX_STAMPS, GAME2D_MAX_TEXT_ITEMS, MANIFEST_LFN_BYTES,
+    MAX_APP_DRAW_COMMANDS, MAX_APP_TEXT_BYTES, MAX_DEVICE_OPEN_FILES,
 };
 
 // The retained Game2D layer data model — the POD layout of the immediate command
@@ -33,7 +38,9 @@ pub use koto_gfx::AppStaticLayer;
 // The static-layer fingerprint shadow (GFX-0013) is `pub` for the same reason as
 // `AppStaticLayer`: the binary holds the instance in its own `StaticCell`.
 pub use koto_gfx::StaticLayerShadow;
-pub(crate) use koto_gfx::{AppDrawCommand, Game2dBoard, Game2dSprite, Game2dStampDef, Game2dText};
+pub(crate) use koto_gfx::{
+    AppDrawCommand, Game2dSprite, Game2dStampDef, Game2dText, Game2dTilemap,
+};
 
 // `pub` (not `pub(crate)`) so the binary target can hold the two draw-command
 // lists in a `StaticCell` and pass them in by reference, keeping these ~30 KiB
@@ -49,7 +56,7 @@ pub struct DeviceRuntimeHost {
     // detects board changes by diffing it cell-by-cell, with no separate dirty
     // bitset. The present path composites it as a background layer beneath the
     // immediate command list (see `app_render::paint_app_commands`).
-    pub(crate) board: Game2dBoard,
+    pub(crate) board: Game2dTilemap,
     // Retained Game2D sprite/stamp layer (KOTO-0140). Like `board`, these persist
     // across frames (`clear_frame` does NOT reset them) and ride the two-list
     // delta: stamps are session-stable descriptors, sprites are diffed by stable
@@ -80,7 +87,7 @@ impl DeviceRuntimeHost {
         Self {
             commands: [AppDrawCommand::Empty; MAX_APP_DRAW_COMMANDS],
             len: 0,
-            board: [-1; GAME2D_BOARD_CELLS],
+            board: Game2dTilemap::legacy(),
             stamps: [Game2dStampDef::undefined(); GAME2D_MAX_STAMPS],
             sprites: [Game2dSprite::hidden(); GAME2D_MAX_SPRITES],
             text_items: [Game2dText::hidden(); GAME2D_MAX_TEXT_ITEMS],
@@ -128,6 +135,36 @@ pub(crate) struct DeviceOpenFile {
     name: ShortFileName,
     offset: u32,
     mode: i32,
+}
+
+#[derive(Clone, Copy)]
+struct PackageAssetRangeCache {
+    path: [u8; MAX_VIRTUAL_PATH_LEN],
+    path_len: u8,
+    start: u32,
+    size: u32,
+}
+
+impl PackageAssetRangeCache {
+    fn new(path: &str, start: u32, size: u32) -> Option<Self> {
+        let path_len = u8::try_from(path.len()).ok()?;
+        if path.len() > MAX_VIRTUAL_PATH_LEN {
+            return None;
+        }
+        let mut cached = Self {
+            path: [0; MAX_VIRTUAL_PATH_LEN],
+            path_len,
+            start,
+            size,
+        };
+        cached.path[..path.len()].copy_from_slice(path.as_bytes());
+        Some(cached)
+    }
+
+    fn range_for(&self, path: &str) -> Option<(u32, u32)> {
+        (usize::from(self.path_len) == path.len() && self.path[..path.len()] == *path.as_bytes())
+            .then_some((self.start, self.size))
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -200,7 +237,14 @@ where
     audio: &'a mut PicoAudioBackend,
     capturing_static: bool,
     volume_mgr: &'a VolumeManager<D, FirmwareClock>,
+    // Keep the launched KPA open for the whole app session. Range-based image
+    // and audio streaming interleave seeks on this one handle instead of
+    // reopening the FAT volume/directories/file for every chunk. Field order is
+    // intentional: Rust drops the file before the volume.
+    package_stream_file: Option<RawFile>,
+    package_stream_volume: Option<RawVolume>,
     app_id: &'a str,
+    package_file: ShortFileName,
     files: [Option<DeviceOpenFile>; MAX_DEVICE_OPEN_FILES],
     editor: MemoEditor<1024>,
     ime: KotoMemoIme,
@@ -231,6 +275,67 @@ where
     // `vm_us`, so this is not DIAG-profile-gated.
     hostcall_started: Instant,
     host_us: u64,
+    pending_audio_assets: [Option<AudioAssetRequest>; PENDING_AUDIO_ASSET_CAPACITY],
+    pending_audio_asset_len: usize,
+    audio_stream: Option<PackageAudioStream>,
+    // The VM commonly reads one large image/audio asset in consecutive ranges.
+    // Resolving a KPA path walks its table and string pool, so retain the most
+    // recent exact path/range across frames and pay that cost only once.
+    asset_range_cache: Option<PackageAssetRangeCache>,
+}
+
+#[derive(Clone, Copy)]
+struct PackageAudioStream {
+    decoder: StreamingClipDecoder,
+    pass_header: ClipAssetHeader,
+    codec: CodecId,
+    payload_offset: u32,
+    payload_size: u32,
+    payload_cursor: u32,
+    looping: bool,
+    bgm: bool,
+}
+
+struct AudioStreamScratch {
+    encoded: [u8; AUDIO_STREAM_PCM16_BYTES],
+    decoded: [i16; AUDIO_STREAM_DECODE_FRAMES],
+}
+
+struct Cpu0AudioStreamScratch(UnsafeCell<AudioStreamScratch>);
+unsafe impl Sync for Cpu0AudioStreamScratch {}
+static AUDIO_STREAM_SCRATCH: Cpu0AudioStreamScratch =
+    Cpu0AudioStreamScratch(UnsafeCell::new(AudioStreamScratch {
+        encoded: [0; AUDIO_STREAM_PCM16_BYTES],
+        decoded: [0; AUDIO_STREAM_DECODE_FRAMES],
+    }));
+
+/// Refill half of the 256 ms PCM ring at a time. Device measurements showed
+/// that reopening and seeking the KPA for a 1024-frame refill could consume the
+/// entire 64 ms lead. A 2048-frame refill leaves 128 ms of audio queued and
+/// reduces the open/seek frequency by two without the 24 KiB SRAM increase of
+/// the larger 8192-frame experiment.
+const AUDIO_STREAM_REFILL_FRAMES: usize = 2048;
+/// Reused four times per refill so the full 2048-frame decoded block never
+/// needs to exist in SRAM at once.
+const AUDIO_STREAM_DECODE_FRAMES: usize = 512;
+const AUDIO_STREAM_PCM16_BYTES: usize = AUDIO_STREAM_REFILL_FRAMES * 2;
+const AUDIO_STREAM_SLD4_BYTES: usize = AUDIO_STREAM_REFILL_FRAMES / 2;
+
+/// A frame may legitimately start a one-shot cue and BGM together. Four slots
+/// also cover a short SFX burst without making package I/O re-entrant.
+const PENDING_AUDIO_ASSET_CAPACITY: usize = 4;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AudioAssetRequest {
+    path: [u8; MAX_VIRTUAL_PATH_LEN],
+    len: usize,
+    pub(crate) bgm: bool,
+}
+
+impl AudioAssetRequest {
+    pub(crate) fn path(&self) -> &str {
+        core::str::from_utf8(&self.path[..self.len]).unwrap_or("")
+    }
 }
 
 impl<'a, D> DeviceHost<'a, D>
@@ -245,18 +350,20 @@ where
         draw: &'a mut DeviceRuntimeHost,
         static_layer: &'a mut AppStaticLayer,
         audio: &'a mut PicoAudioBackend,
+        package_file: ShortFileName,
     ) -> Self {
         // The shared StaticCells may carry stale state (the boot pixel diagnostic
         // borrows the same draw buffer; a prior app left its board/static layer);
         // start each app clean. The tilemap and static layer survive `clear_frame`,
         // so reset them here too (KOTO-0135 / KOTO-0136).
         draw.clear_frame();
-        draw.board.fill(-1);
+        draw.board = Game2dTilemap::legacy();
         draw.stamps = [Game2dStampDef::undefined(); GAME2D_MAX_STAMPS];
         draw.sprites = [Game2dSprite::hidden(); GAME2D_MAX_SPRITES];
         draw.text_items = [Game2dText::hidden(); GAME2D_MAX_TEXT_ITEMS];
         static_layer.len = 0;
         static_layer.rebuilt = false;
+        audio.set_pcm_stream_active(false);
         let surface = RenderSurface::new(320, 320, PixelFormat::Rgb565);
         let layout = TextLayout::new(
             surface,
@@ -273,7 +380,10 @@ where
             audio,
             capturing_static: false,
             volume_mgr,
+            package_stream_file: None,
+            package_stream_volume: None,
             app_id,
+            package_file,
             files: core::array::from_fn(|_| None),
             editor: MemoEditor::new(layout),
             ime: KotoMemoIme::new(),
@@ -286,7 +396,24 @@ where
             audio_events: 0,
             hostcall_started: Instant::MIN,
             host_us: 0,
+            pending_audio_assets: [None; PENDING_AUDIO_ASSET_CAPACITY],
+            pending_audio_asset_len: 0,
+            audio_stream: None,
+            asset_range_cache: None,
         }
+    }
+
+    fn cached_package_asset_range(&mut self, path: &str) -> Result<(u32, u32), HostErrorCode> {
+        if let Some(range) = self
+            .asset_range_cache
+            .as_ref()
+            .and_then(|cached| cached.range_for(path))
+        {
+            return Ok(range);
+        }
+        let (start, size) = self.package_asset_range(path)?;
+        self.asset_range_cache = PackageAssetRangeCache::new(path, start, size);
+        Ok((start, size))
     }
 
     /// Route a draw command to the static layer while a `game2d_static_begin`
@@ -320,7 +447,339 @@ where
     }
 
     pub(crate) fn service_audio(&mut self) {
+        self.service_audio_stream();
         self.audio.service();
+    }
+
+    /// Starts host-managed streaming for a KACL too large for the owned fast path.
+    /// Returns `Ok(false)` when the complete asset still fits that fast path.
+    pub(crate) fn start_streaming_audio_asset(
+        &mut self,
+        path: &str,
+        bgm: bool,
+    ) -> Result<bool, HostErrorCode> {
+        let (asset_offset, asset_size) = self.package_asset_range(path)?;
+        if asset_size as usize <= RUNTIME_CLIP_IMAGE_CAPACITY {
+            self.audio_stream = None;
+            self.audio.set_pcm_stream_active(false);
+            return Ok(false);
+        }
+        let mut bytes = [0u8; CLIP_ASSET_HEADER_SIZE];
+        self.read_package_range(asset_offset, &mut bytes)?;
+        let header = ClipAssetHeader::decode(&bytes).map_err(|_| HostErrorCode::BAD_ARGUMENT)?;
+        let total_size = u32::from(header.header_size)
+            .checked_add(header.payload_size)
+            .ok_or(HostErrorCode::BAD_ARGUMENT)?;
+        if total_size != asset_size {
+            return Err(HostErrorCode::BAD_ARGUMENT);
+        }
+        let looping = match header
+            .loop_metadata()
+            .map_err(|_| HostErrorCode::BAD_ARGUMENT)?
+        {
+            ClipLoop::None => false,
+            ClipLoop::Whole {
+                count: LoopCount::Infinite,
+            } => true,
+            _ => return Err(HostErrorCode::BAD_ARGUMENT),
+        };
+        let mut pass_header = header;
+        pass_header.loop_start = 0;
+        pass_header.loop_end = 0;
+        pass_header.loop_count = 0;
+        let decoder = StreamingClipDecoder::from_header(pass_header, AudioLimits::v0_default())
+            .map_err(|_| HostErrorCode::BAD_ARGUMENT)?;
+        self.audio_stream = Some(PackageAudioStream {
+            decoder,
+            pass_header,
+            codec: header.codec,
+            payload_offset: asset_offset.saturating_add(u32::from(header.header_size)),
+            payload_size: header.payload_size,
+            payload_cursor: 0,
+            looping,
+            bgm,
+        });
+        // Enabled after the first refill so startup I/O is not reported as an
+        // underrun before any PCM was promised to CPU1.
+        self.audio.set_pcm_stream_active(false);
+        Ok(true)
+    }
+
+    fn service_audio_stream(&mut self) {
+        let Some(mut stream) = self.audio_stream else {
+            return;
+        };
+        let free = self.audio.pcm_free_frames();
+        if free < AUDIO_STREAM_REFILL_FRAMES {
+            return;
+        }
+        if stream.decoder.is_finished() {
+            self.audio_stream = None;
+            self.audio.set_pcm_stream_active(false);
+            return;
+        }
+        let remaining = stream.payload_size.saturating_sub(stream.payload_cursor) as usize;
+        if remaining == 0 {
+            self.audio.record_drop();
+            self.audio_stream = None;
+            self.audio.set_pcm_stream_active(false);
+            return;
+        }
+
+        // CPU0 is the sole accessor; keeping these buffers in BSS avoids growing
+        // the async main-task future by ~5 KiB. The small decoded buffer is
+        // reused while draining one encoded SD read into the PCM ring.
+        let scratch = unsafe { &mut *AUDIO_STREAM_SCRATCH.0.get() };
+        let codec_bytes = match stream.codec {
+            CodecId::Pcm16 => AUDIO_STREAM_PCM16_BYTES,
+            CodecId::Sldpcm4 => AUDIO_STREAM_SLD4_BYTES,
+            CodecId::Unsupported(_) => 0,
+        };
+        let encoded_len = remaining.min(codec_bytes);
+        if self
+            .read_package_range(
+                stream.payload_offset.saturating_add(stream.payload_cursor),
+                &mut scratch.encoded[..encoded_len],
+            )
+            .is_err()
+        {
+            self.audio.record_drop();
+            self.audio_stream = None;
+            self.audio.set_pcm_stream_active(false);
+            return;
+        }
+        let mut encoded_cursor = 0usize;
+        let mut decoded_frames = 0usize;
+        let mut failed = false;
+        while decoded_frames < AUDIO_STREAM_REFILL_FRAMES && !stream.decoder.is_finished() {
+            let output_len =
+                (AUDIO_STREAM_REFILL_FRAMES - decoded_frames).min(scratch.decoded.len());
+            let (consumed, written) = stream.decoder.decode_chunk(
+                &scratch.encoded[encoded_cursor..encoded_len],
+                &mut scratch.decoded[..output_len],
+            );
+            if consumed == 0 && written == 0 {
+                failed = true;
+                break;
+            }
+            encoded_cursor = encoded_cursor.saturating_add(consumed);
+            stream.payload_cursor = stream.payload_cursor.saturating_add(consumed as u32);
+            decoded_frames = decoded_frames.saturating_add(written);
+            if !matches!(
+                self.audio
+                    .submit_pcm_mono_i16(16_000, &scratch.decoded[..written]),
+                Ok(accepted) if accepted as usize == written
+            ) {
+                failed = true;
+                break;
+            }
+        }
+        if failed {
+            self.audio.record_drop();
+            self.audio_stream = None;
+            self.audio.set_pcm_stream_active(false);
+            return;
+        }
+        if stream.decoder.is_finished() && stream.looping {
+            let Ok(decoder) =
+                StreamingClipDecoder::from_header(stream.pass_header, AudioLimits::v0_default())
+            else {
+                self.audio.record_drop();
+                self.audio_stream = None;
+                self.audio.set_pcm_stream_active(false);
+                return;
+            };
+            stream.decoder = decoder;
+            stream.payload_cursor = 0;
+        }
+        let active = !stream.decoder.is_finished();
+        self.audio_stream = if active { Some(stream) } else { None };
+        self.audio.set_pcm_stream_active(active);
+    }
+
+    fn ensure_package_stream(&mut self) -> Result<(), HostErrorCode> {
+        if self.package_stream_file.is_some() {
+            return Ok(());
+        }
+        let manager = self.volume_mgr;
+        let volume = manager
+            .open_raw_volume(VolumeIdx(0))
+            .map_err(|_| HostErrorCode::IO_ERROR)?;
+        let root = match manager.open_root_dir(volume) {
+            Ok(root) => root,
+            Err(_) => {
+                let _ = manager.close_volume(volume);
+                return Err(HostErrorCode::IO_ERROR);
+            }
+        };
+        let apps = match manager.open_dir(root, "APPS") {
+            Ok(apps) => apps,
+            Err(_) => {
+                let _ = manager.close_dir(root);
+                let _ = manager.close_volume(volume);
+                return Err(HostErrorCode::IO_ERROR);
+            }
+        };
+        let file = match manager.open_file_in_dir(apps, &self.package_file, Mode::ReadOnly) {
+            Ok(file) => file,
+            Err(_) => {
+                let _ = manager.close_dir(apps);
+                let _ = manager.close_dir(root);
+                let _ = manager.close_volume(volume);
+                return Err(HostErrorCode::IO_ERROR);
+            }
+        };
+        if manager.close_dir(apps).is_err() || manager.close_dir(root).is_err() {
+            let _ = manager.close_file(file);
+            let _ = manager.close_volume(volume);
+            return Err(HostErrorCode::IO_ERROR);
+        }
+        self.package_stream_file = Some(file);
+        self.package_stream_volume = Some(volume);
+        Ok(())
+    }
+
+    pub(crate) fn close_package_stream(&mut self) {
+        if let Some(file) = self.package_stream_file.take() {
+            let _ = self.volume_mgr.close_file(file);
+        }
+        if let Some(volume) = self.package_stream_volume.take() {
+            let _ = self.volume_mgr.close_volume(volume);
+        }
+    }
+
+    fn package_asset_range(&mut self, path: &str) -> Result<(u32, u32), HostErrorCode> {
+        self.ensure_package_stream()?;
+        let file = self
+            .package_stream_file
+            .as_ref()
+            .copied()
+            .ok_or(HostErrorCode::IO_ERROR)?;
+        let read_exact = |dst: &mut [u8]| -> Result<(), HostErrorCode> {
+            let mut total = 0;
+            while total < dst.len() {
+                match self.volume_mgr.read(file, &mut dst[total..]) {
+                    Ok(0) | Err(_) => return Err(HostErrorCode::IO_ERROR),
+                    Ok(count) => total += count,
+                }
+            }
+            Ok(())
+        };
+        let mut header = [0u8; 64];
+        self.volume_mgr
+            .file_seek_from_start(file, 0)
+            .map_err(|_| HostErrorCode::IO_ERROR)?;
+        read_exact(&mut header)?;
+        if &header[..4] != b"KPA1" {
+            return Err(HostErrorCode::IO_ERROR);
+        }
+        let entry_count = u32::from_le_bytes(header[16..20].try_into().unwrap_or([0; 4]));
+        let table_offset = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0; 4]));
+        let strings_offset = u32::from_le_bytes(header[24..28].try_into().unwrap_or([0; 4]));
+        let mut record = [0u8; 64];
+        let mut entry_path = [0u8; MAX_VIRTUAL_PATH_LEN];
+        for index in 0..entry_count {
+            self.volume_mgr
+                .file_seek_from_start(file, table_offset.saturating_add(index.saturating_mul(64)))
+                .map_err(|_| HostErrorCode::IO_ERROR)?;
+            read_exact(&mut record)?;
+            let path_offset = u32::from_le_bytes(record[0..4].try_into().unwrap_or([0; 4]));
+            let path_len = u32::from_le_bytes(record[4..8].try_into().unwrap_or([0; 4])) as usize;
+            if path_len > entry_path.len() {
+                continue;
+            }
+            self.volume_mgr
+                .file_seek_from_start(file, strings_offset.saturating_add(path_offset))
+                .map_err(|_| HostErrorCode::IO_ERROR)?;
+            read_exact(&mut entry_path[..path_len])?;
+            if entry_path[..path_len] == *path.as_bytes() {
+                return Ok((
+                    u32::from_le_bytes(record[16..20].try_into().unwrap_or([0; 4])),
+                    u32::from_le_bytes(record[20..24].try_into().unwrap_or([0; 4])),
+                ));
+            }
+        }
+        Err(HostErrorCode::PERMISSION_DENIED)
+    }
+
+    fn read_package_range(&mut self, offset: u32, dst: &mut [u8]) -> Result<(), HostErrorCode> {
+        self.ensure_package_stream()?;
+        let file = self
+            .package_stream_file
+            .as_ref()
+            .copied()
+            .ok_or(HostErrorCode::IO_ERROR)?;
+        self.volume_mgr
+            .file_seek_from_start(file, offset)
+            .map_err(|_| HostErrorCode::IO_ERROR)?;
+        let mut total = 0;
+        while total < dst.len() {
+            match self.volume_mgr.read(file, &mut dst[total..]) {
+                Ok(0) | Err(_) => return Err(HostErrorCode::IO_ERROR),
+                Ok(count) => total += count,
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_audio_asset_request(&mut self) -> Option<AudioAssetRequest> {
+        if self.pending_audio_asset_len == 0 {
+            return None;
+        }
+        let request = self.pending_audio_assets[0].take();
+        for index in 1..self.pending_audio_asset_len {
+            self.pending_audio_assets[index - 1] = self.pending_audio_assets[index].take();
+        }
+        self.pending_audio_asset_len -= 1;
+        self.pending_audio_assets[self.pending_audio_asset_len] = None;
+        request
+    }
+
+    pub(crate) fn read_audio_asset(
+        &mut self,
+        path: &str,
+        dst: &mut [u8],
+    ) -> Result<usize, HostErrorCode> {
+        match <Self as VmHost>::asset_load(self, path, dst) {
+            HostCallOutcome::Ok1(len) => usize::try_from(len).map_err(|_| HostErrorCode::IO_ERROR),
+            HostCallOutcome::Err(error) => Err(error),
+            _ => Err(HostErrorCode::IO_ERROR),
+        }
+    }
+
+    pub(crate) fn play_loaded_audio_image(&mut self, image: &[u8], bgm: bool) -> bool {
+        if image.starts_with(b"KACL") {
+            self.audio.play_runtime_clip(image)
+        } else {
+            self.audio.play_runtime_cue(image, bgm)
+        }
+    }
+
+    pub(crate) fn audio_asset_diag(&mut self, reason: &str, path: &str) {
+        self.diag.clear();
+        let _ = write!(
+            self.diag,
+            "phase=258 audio-asset-fail reason={} path={}\r\n",
+            reason, path
+        );
+    }
+
+    fn queue_audio_asset(&mut self, path: &str, bgm: bool) -> HostCallOutcome {
+        if self.pending_audio_asset_len >= self.pending_audio_assets.len()
+            || path.len() > MAX_VIRTUAL_PATH_LEN
+        {
+            self.audio.record_drop();
+            return HostCallOutcome::Err(HostErrorCode::NO_MEMORY);
+        }
+        let mut request = AudioAssetRequest {
+            path: [0; MAX_VIRTUAL_PATH_LEN],
+            len: path.len(),
+            bgm,
+        };
+        request.path[..path.len()].copy_from_slice(path.as_bytes());
+        self.pending_audio_assets[self.pending_audio_asset_len] = Some(request);
+        self.pending_audio_asset_len += 1;
+        HostCallOutcome::Ok0
     }
 
     pub(crate) fn audio_stats(&self) -> AudioHostStats {
@@ -601,6 +1060,42 @@ where
         })
     }
 
+    fn draw_pixels_persistent_rgb565(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        pixels: &[u8],
+    ) -> HostCallOutcome {
+        if w <= 0
+            || h <= 0
+            || (w as usize)
+                .checked_mul(h as usize)
+                .and_then(|cells| cells.checked_mul(2))
+                != Some(pixels.len())
+        {
+            return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
+        }
+        let Some(offset) = (pixels.as_ptr() as usize).checked_sub(self.heap_base) else {
+            return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
+        };
+        if offset
+            .checked_add(pixels.len())
+            .is_none_or(|end| end > self.heap_len)
+        {
+            return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
+        }
+        self.push_draw(AppDrawCommand::Pixels {
+            x,
+            y,
+            w,
+            h,
+            off: offset as u32 | koto_gfx::APP_DRAW_PERSISTENT_BIT,
+            len: pixels.len() as u32,
+        })
+    }
+
     fn game2d_set_tile(&mut self, layer: i32, x: i32, y: i32, tile_ref: i32) -> HostCallOutcome {
         let heap_len = self.heap_len;
         map_game2d_result(
@@ -611,6 +1106,20 @@ where
 
     fn game2d_clear_layer(&mut self, layer: i32) -> HostCallOutcome {
         map_game2d_result(self.game2d_scene().clear_layer(layer))
+    }
+
+    fn game2d_configure_tilemap(
+        &mut self,
+        layer: i32,
+        columns: i32,
+        rows: i32,
+        origin_x: i32,
+        origin_y: i32,
+    ) -> HostCallOutcome {
+        map_game2d_result(
+            self.game2d_scene()
+                .configure_tilemap(layer, columns, rows, origin_x, origin_y),
+        )
     }
 
     fn game2d_present(&mut self, _heap: &[u8]) -> HostCallOutcome {
@@ -779,62 +1288,56 @@ where
 
     fn play_bgm_asset(&mut self, path: &str) -> HostCallOutcome {
         self.audio_events = self.audio_events.saturating_add(1);
-        if !path.starts_with("audio/") || !path.ends_with(".kmml") {
+        if !path.starts_with("audio/") || !(path.ends_with(".kmml") || path.ends_with(".kacl")) {
             self.audio.record_drop();
             self.log_audio_result(host_call::PLAY_BGM_ASSET, -1, 0, 0, 0, "dropped");
             return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
         }
-        // Primary audio path (KOTO-0164/0165): the asset path is a routing key
-        // into the compiled cue tables; the payload is never read. With the
-        // legacy SD-load + MML chain removed, an unrouted path is a routing miss
-        // and plays nothing (safe drop, `unrouted` in the trace).
-        match primary_audio_route(path) {
-            Some(PicoPrimaryCue::Bgm(sequence)) => {
-                self.audio.play_bgm_cue(sequence);
-                self.log_audio_result(host_call::PLAY_BGM_ASSET, -1, 0, 0, 0, "seq-bgm");
-                HostCallOutcome::Ok0
-            }
-            Some(PicoPrimaryCue::Sfx(_)) | None => {
-                self.audio.record_unsupported();
-                self.log_audio_result(host_call::PLAY_BGM_ASSET, -1, 0, 0, 0, "unrouted");
-                HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
-            }
-        }
+        let outcome = self.queue_audio_asset(path, true);
+        self.log_audio_result(
+            host_call::PLAY_BGM_ASSET,
+            -1,
+            0,
+            0,
+            0,
+            if path.ends_with(".kacl") {
+                "kpa-kacl-bgm"
+            } else {
+                "sd-kmml"
+            },
+        );
+        outcome
     }
 
     fn play_sfx_asset(&mut self, path: &str) -> HostCallOutcome {
         self.audio_events = self.audio_events.saturating_add(1);
-        if !path.starts_with("audio/") || !path.ends_with(".kmml") {
+        if !path.starts_with("audio/") || !(path.ends_with(".kmml") || path.ends_with(".kacl")) {
             self.audio.record_drop();
             self.log_audio_result(host_call::PLAY_SFX_ASSET, -1, 0, 0, 0, "dropped");
             return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
         }
-        // Primary audio path (KOTO-0164/0165): route the path to a one-shot
-        // sequence on the KotoAudio SFX bus. See `play_bgm_asset` for the
-        // routing-miss policy.
-        match primary_audio_route(path) {
-            Some(PicoPrimaryCue::Sfx(sequence)) => {
-                self.audio.play_sfx_cue(sequence);
-                self.log_audio_result(
-                    host_call::PLAY_SFX_ASSET,
-                    self.audio.sample_rate_hz() as i32,
-                    0,
-                    1,
-                    0,
-                    "seq-sfx",
-                );
-                HostCallOutcome::Ok0
-            }
-            Some(PicoPrimaryCue::Bgm(_)) | None => {
-                self.audio.record_unsupported();
-                self.log_audio_result(host_call::PLAY_SFX_ASSET, -1, 0, 0, 0, "unrouted");
-                HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
-            }
-        }
+        let outcome = self.queue_audio_asset(path, false);
+        self.log_audio_result(
+            host_call::PLAY_SFX_ASSET,
+            self.audio.sample_rate_hz() as i32,
+            0,
+            1,
+            0,
+            if path.ends_with(".kacl") {
+                "kpa-kacl"
+            } else {
+                "kpa-kaq1"
+            },
+        );
+        outcome
     }
 
     fn stop_bgm(&mut self) -> HostCallOutcome {
         self.audio_events = self.audio_events.saturating_add(1);
+        if self.audio_stream.is_some_and(|stream| stream.bgm) {
+            self.audio_stream = None;
+            self.audio.set_pcm_stream_active(false);
+        }
         self.audio.stop_bgm();
         self.log_audio_result(host_call::STOP_BGM, -1, 0, 0, 0, "ok");
         HostCallOutcome::Ok0
@@ -957,19 +1460,6 @@ where
     }
 
     fn asset_load(&mut self, path: &str, dst: &mut [u8]) -> HostCallOutcome {
-        // Only "dir/file" (one-level) paths are supported (KOTO-0130).
-        let (dir_name, file_name) = match path.rfind('/') {
-            Some(idx) => (&path[..idx], &path[idx + 1..]),
-            None => {
-                self.diag.clear();
-                let _ = write!(
-                    self.diag,
-                    "phase=258 asset-load-fail reason=no-dir path={}\r\n",
-                    path
-                );
-                return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
-            }
-        };
         let Ok(volume) = self.volume_mgr.open_volume(VolumeIdx(0)) else {
             self.diag.clear();
             let _ = write!(
@@ -988,37 +1478,16 @@ where
             );
             return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
         };
-        let Ok(sub) = root.open_dir(dir_name) else {
+        let Ok(apps) = root.open_dir("APPS") else {
             self.diag.clear();
             let _ = write!(
                 self.diag,
-                "phase=258 asset-load-fail reason=dir path={}\r\n",
+                "phase=258 asset-load-fail reason=apps-dir path={}\r\n",
                 path
             );
             return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
         };
-        // Resolve LFN → 8.3 short name (mirrors storage.rs KOTO-0121 pattern).
-        let mut lfn_storage = [0u8; MANIFEST_LFN_BYTES];
-        let mut short: Option<ShortFileName> = None;
-        let mut lfn = LfnBuffer::new(&mut lfn_storage);
-        let _ = sub.iterate_dir_lfn(&mut lfn, |entry, long_name| {
-            if short.is_none()
-                && !entry.attributes.is_directory()
-                && long_name.is_some_and(|n| n.eq_ignore_ascii_case(file_name))
-            {
-                short = Some(entry.name.clone());
-            }
-        });
-        let Some(short_name) = short else {
-            self.diag.clear();
-            let _ = write!(
-                self.diag,
-                "phase=258 asset-load-fail reason=not-found path={}\r\n",
-                path
-            );
-            return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
-        };
-        let Ok(file) = sub.open_file_in_dir(&short_name, Mode::ReadOnly) else {
+        let Ok(file) = apps.open_file_in_dir(&self.package_file, Mode::ReadOnly) else {
             self.diag.clear();
             let _ = write!(
                 self.diag,
@@ -1027,7 +1496,61 @@ where
             );
             return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
         };
-        let cap = dst.len().min(file.length() as usize);
+        let read_exact = |dst: &mut [u8]| -> Result<(), ()> {
+            let mut total = 0usize;
+            while total < dst.len() {
+                match file.read(&mut dst[total..]) {
+                    Ok(0) => return Err(()),
+                    Ok(count) => total += count,
+                    Err(_) => return Err(()),
+                }
+            }
+            Ok(())
+        };
+        let mut header = [0u8; 64];
+        if read_exact(&mut header).is_err() || &header[..4] != b"KPA1" {
+            return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
+        }
+        let entry_count = u32::from_le_bytes(header[16..20].try_into().unwrap_or([0; 4]));
+        let table_offset = u32::from_le_bytes(header[20..24].try_into().unwrap_or([0; 4]));
+        let strings_offset = u32::from_le_bytes(header[24..28].try_into().unwrap_or([0; 4]));
+        let mut record = [0u8; 64];
+        let mut entry_range = None;
+        let mut entry_path = [0u8; MAX_VIRTUAL_PATH_LEN];
+        for index in 0..entry_count {
+            if file
+                .seek_from_start(table_offset.saturating_add(index.saturating_mul(64)))
+                .is_err()
+                || read_exact(&mut record).is_err()
+            {
+                return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
+            }
+            let path_offset = u32::from_le_bytes(record[0..4].try_into().unwrap_or([0; 4]));
+            let path_len = u32::from_le_bytes(record[4..8].try_into().unwrap_or([0; 4])) as usize;
+            if path_len > entry_path.len() {
+                continue;
+            }
+            if file
+                .seek_from_start(strings_offset.saturating_add(path_offset))
+                .is_err()
+                || read_exact(&mut entry_path[..path_len]).is_err()
+            {
+                return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
+            }
+            if entry_path[..path_len] == *path.as_bytes() {
+                let offset = u32::from_le_bytes(record[16..20].try_into().unwrap_or([0; 4]));
+                let size = u32::from_le_bytes(record[20..24].try_into().unwrap_or([0; 4]));
+                entry_range = Some((offset, size));
+                break;
+            }
+        }
+        let Some((offset, size)) = entry_range else {
+            return HostCallOutcome::Err(HostErrorCode::PERMISSION_DENIED);
+        };
+        if file.seek_from_start(offset).is_err() {
+            return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
+        }
+        let cap = dst.len().min(size as usize);
         let mut total = 0;
         while total < cap {
             match file.read(&mut dst[total..cap]) {
@@ -1051,6 +1574,24 @@ where
             total, path
         );
         HostCallOutcome::Ok1(total as i32)
+    }
+
+    fn asset_load_range(&mut self, path: &str, offset: usize, dst: &mut [u8]) -> HostCallOutcome {
+        let (asset_start, asset_size) = match self.cached_package_asset_range(path) {
+            Ok(range) => range,
+            Err(error) => return HostCallOutcome::Err(error),
+        };
+        if offset > asset_size as usize {
+            return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
+        }
+        let count = dst.len().min(asset_size as usize - offset);
+        let Some(read_start) = asset_start.checked_add(offset as u32) else {
+            return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
+        };
+        if let Err(error) = self.read_package_range(read_start, &mut dst[..count]) {
+            return HostCallOutcome::Err(error);
+        }
+        HostCallOutcome::Ok1(count as i32)
     }
 
     fn ime_feed_key(&mut self, kind: i32, codepoint: i32) -> HostCallOutcome {

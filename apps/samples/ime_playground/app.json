@@ -1,0 +1,19 @@
+{
+  "app_id": "dev.koto.samples.ime-playground",
+  "kind": "koto",
+  "package": "sample_ime_playground",
+  "name": "SDK IME Playground",
+  "description": "Experiments with the Japanese IME.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

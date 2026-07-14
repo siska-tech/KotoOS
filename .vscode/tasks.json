@@ -1,0 +1,50 @@
+{
+  "version": "2.0.0",
+  "options": {
+    "cwd": "${workspaceFolder}"
+  },
+  "tasks": [
+    {
+      "label": "Koto: build apps",
+      "type": "shell",
+      "command": "python harness/build_apps.py",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": "$koto"
+    },
+    {
+      "label": "Koto: run current app (headless report)",
+      "type": "shell",
+      "command": "python harness/dev_app.py run ${file}",
+      "problemMatcher": "$koto"
+    },
+    {
+      "label": "Koto: screenshot current app",
+      "type": "shell",
+      "command": "python harness/dev_app.py screenshot ${file}",
+      "problemMatcher": "$koto"
+    },
+    {
+      "label": "Koto: watch current app (live reload)",
+      "type": "shell",
+      "command": "python harness/dev_app.py watch ${file}",
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "Koto: sim window",
+      "type": "shell",
+      "command": "cargo run -p koto-sim --features window -- --window",
+      "problemMatcher": []
+    },
+    {
+      "label": "Koto: check all",
+      "type": "shell",
+      "command": "python harness/check_all.py",
+      "group": "test",
+      "problemMatcher": "$koto"
+    }
+  ]
+}

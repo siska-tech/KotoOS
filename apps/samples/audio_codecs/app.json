@@ -1,0 +1,29 @@
+{
+  "app_id": "dev.koto.samples.audio-codecs",
+  "kind": "koto",
+  "package": "sample_audio_codecs",
+  "name": "KotoAudio PCM16 / SLD4",
+  "description": "Plays runtime-ready PCM16 and SLD4 KACL assets from its KPA.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "audio": [
+    {
+      "source": "audio/pcm16.kacl",
+      "output": "audio/sample_audio_pcm16.kacl"
+    },
+    {
+      "source": "audio/sld4.kacl",
+      "output": "audio/sample_audio_sld4.kacl"
+    }
+  ]
+}

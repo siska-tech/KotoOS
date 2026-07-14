@@ -62,8 +62,8 @@ static PAINTED_TOP: AtomicUsize = AtomicUsize::new(0);
 
 /// Base of RAM (`ORIGIN(RAM)` in memory.x).
 pub const SRAM_ORIGIN: usize = 0x2000_0000;
-/// Total on-chip SRAM (`LENGTH(RAM)` = 264 KiB).
-pub const SRAM_TOTAL: usize = 264 * 1024;
+/// Total on-chip SRAM from the selected board profile.
+pub const SRAM_TOTAL: usize = crate::board::SRAM_BYTES;
 
 #[inline]
 fn region_bottom() -> usize {

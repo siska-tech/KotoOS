@@ -194,6 +194,10 @@ fn main() {
     let full = 0;
     let steps = 0;
 
+    // KOTO-0199: explicitly select the legacy KotoBlocks geometry on the now
+    // generic retained tilemap (10x20 cells at pixel origin 8,0).
+    game2d_configure_tilemap(0, 10, 20, 8, 0);
+
     // Seed the next-piece queue.
     rng = rng * 75 + 74; rng = rng % 65537; nx1 = rng % 7;
     rng = rng * 75 + 74; rng = rng % 65537; nx2 = rng % 7;

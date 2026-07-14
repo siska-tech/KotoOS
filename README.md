@@ -1,13 +1,34 @@
-# KotoOS
+# KotoOS v0.2
 
-KotoOS is a lightweight Japanese PDA environment and small-app runtime for the
-ClockworkPi PicoCalc (RP2040), written in Rust.
+KotoOS is a lightweight Japanese PDA environment, game platform, and small-app
+runtime for the ClockworkPi PicoCalc, written in Rust. Version 0.2 supports
+both the original RP2040 Pico profile and the RP2350A Pico 2 W profile on real
+hardware.
 
 It ships a portable shell, a bytecode app runtime with its own compiler
 toolchain, an SKK-based Japanese IME, a retained-mode graphics pipeline, and a
 two-core audio service — all running both on real PicoCalc hardware
 (`koto-pico` firmware) and in a desktop simulator (KotoSim) that shares the
 same core crates.
+
+## Version 0.2 Highlights
+
+- **Pico 2 W support:** RP2350A firmware, linker/UF2 profiles, PicoCalc LCD,
+  keyboard, audio, SD, power, and external PSRAM paths are hardware-validated.
+- **KotoIDE tooling:** the repository includes a VS Code extension with Koto
+  syntax highlighting, live diagnostics and definitions through `koto-lsp`,
+  app scaffolding, and custom sprite, icon, tilemap, and KotoMML editors.
+- **Retained graphics and full-color assets:** apps can use retained tilemaps
+  and stream full-resolution 320×320 RGB565 images without palette or spatial
+  reduction. The sample gallery includes fades, wipes, and looping SLD4 music.
+- **Native KotoAudio path:** package audio assets, KotoMML audition tooling,
+  encoded SLD4 streaming, and the two-core device audio service share one
+  runtime model across PicoCalc and KotoSim.
+- **Faster SD storage:** cards are initialized with a bounded low-speed retry
+  sequence and promoted through a CRC-validated transfer-clock ladder up to
+  25 MHz. The validated RP2350A card reached 915 KiB/s.
+
+See [CHANGELOG.md](CHANGELOG.md) for the release summary.
 
 ## Screenshots
 
@@ -32,6 +53,7 @@ most important source documents are:
 - [Architecture](docs/architecture/ARCHITECTURE.md)
 - [HAL API Draft](docs/architecture/HAL_API.md)
 - [RP2040 Bring-Up Plan](docs/hardware/RP2040_BRINGUP.md)
+- [RP2350 / Pico 2 Support Roadmap](docs/planning/RP2350_SUPPORT_ROADMAP.md)
 - [Implementation Status](docs/planning/IMPLEMENTATION_STATUS.md)
 - [KPA Package Format](docs/spec/KPA_FORMAT.md)
 - [Bytecode App Development Roadmap](docs/planning/BYTECODE_APP_DEV_ROADMAP.md)
@@ -41,10 +63,13 @@ most important source documents are:
 
 ## Current Development Stance
 
-- Target the constrained RP2040 first.
+- Keep the constrained RP2040 as the lower-bound profile while treating the
+  Pico 2 W/RP2350A artifact as a hardware-validated release target.
 - Use Rust as the primary implementation language.
 - Keep core logic portable between KotoSim and PicoCalc.
 - Treat PSRAM as block-transfer storage on RP2040, not memory-mapped RAM.
+- Use Pico Plus 2(W) onboard PSRAM behind the same bounded HAL contract so
+  mapped pointers and board addresses do not leak into portable core code.
 - Prefer measurable harnesses before hardware-specific optimization.
 - Keep completed simulator baseline work separate from active embedded bring-up
   and cleanup issues in [Issues](docs/ISSUES_main.md).
@@ -65,13 +90,23 @@ Run only the dependency-free project harness when iterating on repository metada
 python harness\check_project.py
 ```
 
-The simulator currently scans package manifests from `sdcard_mock/apps/*.kpa.json`.
+The simulator scans binary packages from `sdcard_mock/apps/*.kpa`; each archive embeds its manifest, bytecode, icon, sprites/images, audio, and declared data assets.
 
-## RP2040 Bootstrap Build
+Run KotoSim with the committed package set:
 
-The PicoCalc backend is an explicit embedded workspace member, but it is not a
-default member. Normal host `cargo test`, Clippy, and KotoSim commands therefore
-do not compile embedded dependencies.
+```powershell
+cargo run -p koto-sim
+```
+
+The source-install instructions for the KotoIDE VS Code extension are in
+[`tools/vscode-koto/README.md`](tools/vscode-koto/README.md).
+
+## PicoCalc Firmware Builds
+
+The embedded backend is an explicit workspace member but not a default member,
+so ordinary host tests do not compile Pico dependencies.
+
+### RP2040 / Pico
 
 Install the RP2040 target and UF2 converter once:
 
@@ -80,83 +115,62 @@ rustup target add thumbv6m-none-eabi
 cargo install elf2uf2-rs
 ```
 
-Build the minimal bootstrap probe:
+Build the product firmware:
 
 ```powershell
-cargo build -p koto-pico --bin bootstrap --target thumbv6m-none-eabi
+cargo build -p koto-pico --bin koto_firmware `
+  --target thumbv6m-none-eabi --release
 ```
 
-To create a UF2 without flashing it automatically:
+Create a UF2 without flashing it automatically:
 
 ```powershell
-elf2uf2-rs target\thumbv6m-none-eabi\debug\bootstrap `
-  target\thumbv6m-none-eabi\debug\bootstrap.uf2
+elf2uf2-rs target\thumbv6m-none-eabi\release\koto_firmware `
+  target\thumbv6m-none-eabi\release\koto_firmware-picocalc-pico-rp2040.uf2
 ```
 
-Copy `bootstrap.uf2` to the PicoCalc module in BOOTSEL mode. `cargo run` uses
-the configured `elf2uf2-rs -d` runner when a mounted RP2040 BOOTSEL volume is
-available. The bootstrap only initializes the RP2040 and waits; blink and
-USB-CDC logging belong to KOTO-0065.
+Copy the generated UF2 to the module in BOOTSEL mode.
 
-Build the blink and USB-CDC probe:
+### RP2350A / Pico 2 W
+
+Pico 2 W is the first RP2350 hardware target (KOTO-0204). Install its Rust
+target and Raspberry Pi's official `picotool` 2.x, then build the board-named
+UF2:
 
 ```powershell
-cargo build -p koto-pico --bin blink_cdc --target thumbv6m-none-eabi
+rustup target add thumbv8m.main-none-eabihf
+$env:PICOTOOL = "C:\path\to\picotool.exe"
+tools\build-rp2350a.ps1
 ```
 
-After flashing, the standard Pico 1H LED on GP25 should blink once per second.
-Open the enumerated USB serial port at any baud rate; the firmware emits a
-version banner and a heartbeat every two seconds. Record physical results in
-[the hardware bring-up log](docs/hardware/PICO_HARDWARE_LOG.md).
+The output is
+`target/thumbv8m.main-none-eabihf/release/koto_firmware-picocalc-pico2w-rp2350a.uf2`.
+The build selects `board-picocalc-pico2w` (which owns the internal
+`mcu-rp235xa` selection), uses the Pico 2 W 4 MiB flash / 520 KiB SRAM
+linker profile, identifies itself as `picocalc-pico2w-rp2350a` in the UART
+banner, and leaves wireless initialization disabled. The product firmware and
+retained peripheral probes have passed the PicoCalc hardware validation gate.
 
-For a Pico W / Pico WH module, use the CYW43-backed variant instead:
+To cross-check every retained embedded binary for RP2040 and RP2350A:
 
 ```powershell
-cargo build -p koto-pico --bin blink_cdc_pico_w --target thumbv6m-none-eabi
+python harness\check_embedded.py
 ```
 
-The Pico W firmware controls the onboard LED through the wireless chip rather
-than GP25 directly. Its USB product name is `KotoOS Pico W probe`.
-
-Build the PicoCalc LCD fill probe:
+For the KOTO-0205 device gate, generate the product image, every retained
+peripheral probe, and the forced PSRAM-fallback image together:
 
 ```powershell
-cargo build -p koto-pico --bin lcd_fill --target thumbv6m-none-eabi
+tools\build-rp2350a.ps1 -ValidationBundle
 ```
 
-After flashing, open its USB serial port to start the probe. It logs the
-selected `ili9488-spi` profile, cycles red/green/blue/black fills, then leaves
-corner markers, a centered rectangle, and a cyan scanline band visible for
-orientation and address-window inspection. Record the observed panel behavior
-in [the hardware bring-up log](docs/hardware/PICO_HARDWARE_LOG.md).
+Run and record them in the order defined by
+[`RP2350A_PICOCALC_VALIDATION.md`](docs/hardware/RP2350A_PICOCALC_VALIDATION.md).
 
-Build the consolidated device probe dashboard:
-
-```powershell
-cargo build -p koto-pico --bin device_probe --target thumbv6m-none-eabi
-```
-
-The dashboard reports LCD, keyboard I2C, SD-detect, PSRAM readiness, and the
-bounded SRAM working set over USB CDC. When LCD initialization succeeds it also
-shows color-coded subsystem rows plus live raw/normalized keyboard activity.
-PSRAM remains explicitly `pending` until its PIO block-transfer driver lands;
-the dashboard never treats it as pointer-addressable memory or allocates a full
-framebuffer.
-
-Build the first product-firmware slice:
-
-```powershell
-cargo build -p koto-pico --bin koto_firmware --target thumbv6m-none-eabi
-```
-
-The firmware initializes the validated LCD, keyboard, and SD paths, runs a
-bounded 16 ms frame loop, and feeds PicoCalc key transitions into the portable
-`ShellState`. It mounts `APPS/`, reads bounded `.kpa.json` manifests, and shows
-the same launcher grid, details pane, status strip, and command bar as KotoSim.
-Arrow keys navigate the package list and Z/Enter confirms the selection.
-Rendering reuses `ShellState::paint` with the M+ font in 16-line RGB565 strips,
-converts them to the panel's RGB666 wire format, and does not allocate a
-full-screen framebuffer.
+The retained single-peripheral probes are `probe_lcd`, `probe_keyboard`,
+`probe_sd`, `probe_psram`, `probe_power`, and `probe_audio`. See
+[`src/koto-pico/README.md`](src/koto-pico/README.md) for their purpose and build
+commands.
 
 ## License
 
@@ -173,6 +187,19 @@ Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0
 license, shall be dual licensed as above, without any additional terms or
 conditions.
+
+### Acknowledgements
+
+- JBlanked's [Picoware](https://github.com/jblanked/Picoware/) project
+  provided a valuable reference for PicoCalc-specific PSRAM initialization
+  behavior and QPI performance experiments. Parts of KotoOS's earlier
+  in-tree QPI PSRAM experiments and diagnostic code were informed by
+  Picoware.
+
+- KotoOS's current default PSRAM backend uses the vendored Rust
+  [koto-psram](https://github.com/siska-tech/koto-psram) crate, which was
+  developed separately, retained under `src/koto-psram`, and integrated
+  through `psram_ext`.
 
 ### Bundled assets
 

@@ -97,8 +97,10 @@ fn intrinsic(name: &str) -> Option<Intrinsic> {
         "draw_text" => ("draw_text", 4, ResultKind::Status),
         "draw_text_color" => ("draw_text_color", 5, ResultKind::Status),
         "draw_pixels" => ("draw_pixels_rgb565", 6, ResultKind::Status),
+        "draw_pixels_persistent" => ("draw_pixels_persistent_rgb565", 6, ResultKind::Status),
         "game2d_set_tile" => ("game2d_set_tile", 4, ResultKind::Status),
         "game2d_clear_layer" => ("game2d_clear_layer", 1, ResultKind::Status),
+        "game2d_configure_tilemap" => ("game2d_configure_tilemap", 5, ResultKind::Status),
         "game2d_present" => ("game2d_present", 0, ResultKind::Status),
         "game2d_static_begin" => ("game2d_static_begin", 0, ResultKind::Status),
         "game2d_static_end" => ("game2d_static_end", 0, ResultKind::Status),
@@ -114,6 +116,7 @@ fn intrinsic(name: &str) -> Option<Intrinsic> {
         "play_bgm_asset" => ("play_bgm_asset", 2, ResultKind::Status),
         "play_sfx_asset" => ("play_sfx_asset", 2, ResultKind::Status),
         "stop_bgm" => ("stop_bgm", 0, ResultKind::Status),
+        "asset_load_range" => ("asset_load_range", 5, ResultKind::Value),
         "input_held" => ("input_snapshot", 0, ResultKind::Value2First),
         "input_pressed" => ("input_snapshot", 0, ResultKind::Value2Second),
         "text_input" => ("text_input", 0, ResultKind::Value2First),
@@ -258,7 +261,7 @@ struct Codegen<'a> {
     /// post-reuse physical user-slot usage, the primary local-budget metric.
     max_slot: usize,
     /// KOTO-0156 codegen layout options. Both transforms are **off by default**
-    /// ([`CodegenOptions::default`]) and opt-in per app (apps.json `codegen` block →
+    /// ([`CodegenOptions::default`]) and opt-in per app (app.json `codegen` block →
     /// build_apps → CLI flags); the shipped default keeps every other app's bytecode
     /// byte-identical. See [`CodegenOptions`] and
     /// docs/devlog/KOTO_KOTOBLOCKS_COLD_BLOCK_OUTLINING.md.

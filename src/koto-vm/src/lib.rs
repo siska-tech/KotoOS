@@ -13,7 +13,7 @@ pub const KBC_HEADER_SIZE: usize = 64;
 pub const KBC_VERSION_MAJOR: u16 = 1;
 pub const KBC_VERSION_MINOR: u16 = 0;
 pub const HOST_ABI_MAJOR: u16 = 1;
-pub const HOST_ABI_MINOR: u16 = 15;
+pub const HOST_ABI_MINOR: u16 = 17;
 /// Size of the VM local register file. Locals are shared across all of an app's
 /// functions (the compiler gives each function a non-overlapping `slot_base`),
 /// so this is the ceiling on *total* named locals a program may declare, less the
@@ -144,6 +144,12 @@ pub mod host_call {
     pub const INPUT_SNAPSHOT: u8 = 0x20;
     /// Frame-stable typed-character input. Returns `(codepoint, intent_bits)`.
     pub const TEXT_INPUT: u8 = 0x21;
+    /// Configure retained tilemap layer 0. Args
+    /// `(layer, columns, rows, origin_x, origin_y)` (KOTO-0199).
+    pub const GAME2D_CONFIGURE_TILEMAP: u8 = 0x22;
+    /// Blit RGB565 pixels as a persistent LCD-GRAM update. Args match
+    /// `DRAW_PIXELS_RGB565`; later frames do not erase the written pixels.
+    pub const DRAW_PIXELS_PERSISTENT_RGB565: u8 = 0x23;
     pub const AUDIO_SUBMIT_I16: u8 = 0x30;
     /// Trigger a one-shot host sound effect by id (host ABI minor 8). Arg `(id)`.
     pub const PLAY_SFX: u8 = 0x31;
@@ -164,6 +170,9 @@ pub mod host_call {
     /// Read a read-only package asset fully into a heap buffer in one shot.
     /// Args `(path_ptr, path_len, dst_ptr, dst_max)`; returns bytes copied / `-1`.
     pub const ASSET_LOAD: u8 = 0x44;
+    /// Read a range of a package asset. Args `(path_ptr, path_len, offset,
+    /// dst_ptr, dst_max)`; returns bytes copied / `-1`.
+    pub const ASSET_LOAD_RANGE: u8 = 0x45;
 
     // Text-composition / text-buffer service (host ABI minor 1). These keep the
     // VM neutral: the host owns the IME and editor models; bytecode drives them.
@@ -226,6 +235,7 @@ pub mod host_call {
             DRAW_TEXT => "draw_text",
             DRAW_TEXT_COLOR => "draw_text_color",
             DRAW_PIXELS_RGB565 => "draw_pixels_rgb565",
+            DRAW_PIXELS_PERSISTENT_RGB565 => "draw_pixels_persistent_rgb565",
             GAME2D_SET_TILE => "game2d_set_tile",
             GAME2D_CLEAR_LAYER => "game2d_clear_layer",
             GAME2D_PRESENT => "game2d_present",
@@ -238,6 +248,7 @@ pub mod host_call {
             GAME2D_TEXT_SET => "game2d_text_set",
             GAME2D_TEXT_HIDE => "game2d_text_hide",
             GAME2D_TEXT_CLEAR_ALL => "game2d_text_clear_all",
+            GAME2D_CONFIGURE_TILEMAP => "game2d_configure_tilemap",
             INPUT_SNAPSHOT => "input_snapshot",
             TEXT_INPUT => "text_input",
             AUDIO_SUBMIT_I16 => "audio_submit_i16",
@@ -251,6 +262,7 @@ pub mod host_call {
             FILE_WRITE => "file_write",
             FILE_CLOSE => "file_close",
             ASSET_LOAD => "asset_load",
+            ASSET_LOAD_RANGE => "asset_load_range",
             IME_FEED_KEY => "ime_feed_key",
             IME_CONVERT => "ime_convert",
             IME_QUERY_LINE => "ime_query_line",
@@ -1222,6 +1234,17 @@ pub trait VmHost {
         HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
     }
 
+    fn draw_pixels_persistent_rgb565(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        pixels: &[u8],
+    ) -> HostCallOutcome {
+        self.draw_pixels_rgb565(x, y, w, h, pixels)
+    }
+
     /// Write one cell of a host-retained tilemap `layer` (KOTO-0135). `tile_ref`
     /// is the app-heap byte offset of a 16x16 little-endian RGB565 tile (512
     /// bytes), or `< 0` to clear the cell. The host marks the cell so the next
@@ -1239,6 +1262,19 @@ pub trait VmHost {
 
     /// Clear every cell of a host-retained tilemap `layer` (KOTO-0135).
     fn game2d_clear_layer(&mut self, _layer: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Configure and clear a retained tilemap layer (KOTO-0199). Dimensions are
+    /// active cells within the host's fixed capacity; origin is in pixels.
+    fn game2d_configure_tilemap(
+        &mut self,
+        _layer: i32,
+        _columns: i32,
+        _rows: i32,
+        _origin_x: i32,
+        _origin_y: i32,
+    ) -> HostCallOutcome {
         HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
     }
 
@@ -1390,6 +1426,15 @@ pub trait VmHost {
     /// which target the per-app save sandbox, this reads the immutable package.
     /// The default host has no package, so it reports the asset as unavailable.
     fn asset_load(&mut self, _path: &str, _dst: &mut [u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn asset_load_range(
+        &mut self,
+        _path: &str,
+        _offset: usize,
+        _dst: &mut [u8],
+    ) -> HostCallOutcome {
         HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
     }
 
@@ -2100,6 +2145,19 @@ impl<const STACK: usize, const CALLS: usize> BytecodeVm<STACK, CALLS> {
                 self.push_host_outcome(host.draw_pixels_rgb565(x, y, w, h, pixels), 0)?;
                 Ok(StepOutcome::Continue)
             }
+            host_call::DRAW_PIXELS_PERSISTENT_RGB565 => {
+                let len = self.pop_usize()?;
+                let ptr = self.pop_usize()?;
+                let h = self.pop()?;
+                let w = self.pop()?;
+                let y = self.pop()?;
+                let x = self.pop()?;
+                let Some(pixels) = heap_slice(heap, ptr, len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                self.push_host_outcome(host.draw_pixels_persistent_rgb565(x, y, w, h, pixels), 0)?;
+                Ok(StepOutcome::Continue)
+            }
             host_call::GAME2D_SET_TILE => {
                 let tile_ref = self.pop()?;
                 let y = self.pop()?;
@@ -2111,6 +2169,18 @@ impl<const STACK: usize, const CALLS: usize> BytecodeVm<STACK, CALLS> {
             host_call::GAME2D_CLEAR_LAYER => {
                 let layer = self.pop()?;
                 self.push_host_outcome(host.game2d_clear_layer(layer), 0)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::GAME2D_CONFIGURE_TILEMAP => {
+                let origin_y = self.pop()?;
+                let origin_x = self.pop()?;
+                let rows = self.pop()?;
+                let columns = self.pop()?;
+                let layer = self.pop()?;
+                self.push_host_outcome(
+                    host.game2d_configure_tilemap(layer, columns, rows, origin_x, origin_y),
+                    0,
+                )?;
                 Ok(StepOutcome::Continue)
             }
             host_call::GAME2D_PRESENT => {
@@ -2382,6 +2452,38 @@ impl<const STACK: usize, const CALLS: usize> BytecodeVm<STACK, CALLS> {
                     return Err(VmError::MemoryOutOfBounds);
                 };
                 let outcome = host.asset_load(path, dst);
+                self.push_host_outcome(outcome, 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::ASSET_LOAD_RANGE => {
+                let max = self.pop_usize()?;
+                let dst_ptr = self.pop_usize()?;
+                let offset = self.pop_usize()?;
+                let path_len = self.pop_usize()?;
+                let path_ptr = self.pop_usize()?;
+                let mut path_buf = [0u8; MAX_ASSET_PATH_LEN];
+                if path_len > MAX_ASSET_PATH_LEN {
+                    self.push_host_outcome(HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT), 1)?;
+                    return Ok(StepOutcome::Continue);
+                }
+                let Some(path_bytes) = heap_slice(heap, path_ptr, path_len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                path_buf[..path_len].copy_from_slice(path_bytes);
+                let path = match core::str::from_utf8(&path_buf[..path_len]) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        self.push_host_outcome(
+                            HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT),
+                            1,
+                        )?;
+                        return Ok(StepOutcome::Continue);
+                    }
+                };
+                let Some(dst) = heap_slice_mut(heap, dst_ptr, max) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                let outcome = host.asset_load_range(path, offset, dst);
                 self.push_host_outcome(outcome, 1)?;
                 Ok(StepOutcome::Continue)
             }
@@ -2844,6 +2946,7 @@ fn known_host_call(id: u8) -> bool {
             | host_call::DRAW_TEXT
             | host_call::DRAW_TEXT_COLOR
             | host_call::DRAW_PIXELS_RGB565
+            | host_call::DRAW_PIXELS_PERSISTENT_RGB565
             | host_call::GAME2D_SET_TILE
             | host_call::GAME2D_CLEAR_LAYER
             | host_call::GAME2D_PRESENT
@@ -2856,6 +2959,7 @@ fn known_host_call(id: u8) -> bool {
             | host_call::GAME2D_TEXT_SET
             | host_call::GAME2D_TEXT_HIDE
             | host_call::GAME2D_TEXT_CLEAR_ALL
+            | host_call::GAME2D_CONFIGURE_TILEMAP
             | host_call::INPUT_SNAPSHOT
             | host_call::TEXT_INPUT
             | host_call::AUDIO_SUBMIT_I16
@@ -2869,6 +2973,7 @@ fn known_host_call(id: u8) -> bool {
             | host_call::FILE_WRITE
             | host_call::FILE_CLOSE
             | host_call::ASSET_LOAD
+            | host_call::ASSET_LOAD_RANGE
             | host_call::IME_FEED_KEY
             | host_call::IME_CONVERT
             | host_call::IME_QUERY_LINE
@@ -2905,6 +3010,7 @@ fn host_call_stack_effect(id: u8) -> (u16, u16) {
         host_call::DRAW_TEXT => (4, 1),
         host_call::DRAW_TEXT_COLOR => (5, 1),
         host_call::DRAW_PIXELS_RGB565 => (6, 1),
+        host_call::DRAW_PIXELS_PERSISTENT_RGB565 => (6, 1),
         host_call::GAME2D_SET_TILE => (4, 1),
         host_call::GAME2D_CLEAR_LAYER => (1, 1),
         host_call::GAME2D_PRESENT => (0, 1),
@@ -2917,6 +3023,7 @@ fn host_call_stack_effect(id: u8) -> (u16, u16) {
         host_call::GAME2D_TEXT_SET => (6, 1),
         host_call::GAME2D_TEXT_HIDE => (1, 1),
         host_call::GAME2D_TEXT_CLEAR_ALL => (0, 1),
+        host_call::GAME2D_CONFIGURE_TILEMAP => (5, 1),
         host_call::INPUT_SNAPSHOT => (0, 3),
         host_call::TEXT_INPUT => (0, 3),
         host_call::AUDIO_SUBMIT_I16 => (3, 2),
@@ -2930,6 +3037,7 @@ fn host_call_stack_effect(id: u8) -> (u16, u16) {
         host_call::FILE_WRITE => (3, 2),
         host_call::FILE_CLOSE => (1, 1),
         host_call::ASSET_LOAD => (4, 2),
+        host_call::ASSET_LOAD_RANGE => (5, 2),
         host_call::IME_FEED_KEY => (2, 1),
         host_call::IME_CONVERT => (0, 1),
         host_call::IME_QUERY_LINE => (2, 2),
@@ -3268,6 +3376,7 @@ mod tests {
         assets_requested: Vec<String>,
         /// Recorded `game2d_set_tile` calls: `(layer, x, y, tile_ref)`.
         tiles: Vec<(i32, i32, i32, i32)>,
+        tilemap_configs: Vec<(i32, i32, i32, i32, i32)>,
         /// Number of `game2d_present` calls, and the heap len seen on the last one.
         presents: usize,
         present_heap_len: usize,
@@ -3320,6 +3429,19 @@ mod tests {
 
         fn game2d_clear_layer(&mut self, _layer: i32) -> HostCallOutcome {
             self.tiles.clear();
+            HostCallOutcome::Ok0
+        }
+
+        fn game2d_configure_tilemap(
+            &mut self,
+            layer: i32,
+            columns: i32,
+            rows: i32,
+            origin_x: i32,
+            origin_y: i32,
+        ) -> HostCallOutcome {
+            self.tilemap_configs
+                .push((layer, columns, rows, origin_x, origin_y));
             HostCallOutcome::Ok0
         }
 
@@ -3771,9 +3893,15 @@ mod tests {
 
     #[test]
     fn vm_writes_tile_and_presents() {
-        // game2d_set_tile(layer=0, x=3, y=4, tile_ref=512) then game2d_present(),
-        // checking arg order off the stack and that present receives the heap.
+        // Configure, set a tile, then present; check argument order from the stack.
         let bytes = fixture(&[
+            insn(opcode::PUSH_I16, 0, 0),               // layer
+            insn(opcode::PUSH_I16, 0, 20),              // columns
+            insn(opcode::PUSH_I16, 0, 12),              // rows
+            insn(opcode::PUSH_I16, 0, (-16i16) as u16), // origin_x
+            insn(opcode::PUSH_I16, 0, 24),              // origin_y
+            insn(opcode::HOST_CALL, host_call::GAME2D_CONFIGURE_TILEMAP, 0),
+            insn(opcode::DROP, 0, 0),       // status
             insn(opcode::PUSH_I16, 0, 0),   // layer
             insn(opcode::PUSH_I16, 0, 3),   // x
             insn(opcode::PUSH_I16, 0, 4),   // y
@@ -3794,6 +3922,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, VmRunResult::Exited(0));
+        assert_eq!(host.tilemap_configs, [(0, 20, 12, -16, 24)]);
         assert_eq!(host.tiles, [(0, 3, 4, 512)]);
         assert_eq!(host.presents, 1);
         // `game2d_present` is handed the app heap so a draw-model host can re-read

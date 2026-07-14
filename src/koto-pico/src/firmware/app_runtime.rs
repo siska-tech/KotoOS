@@ -1,7 +1,7 @@
 //! Stage, verify, and run a launching app's bytecode (KOTO-0127), plus the
 //! keyboard FIFO read and per-frame input snapshot the app session consumes.
 
-use core::fmt::Write;
+use core::{cell::UnsafeCell, fmt::Write};
 
 use embassy_rp::i2c::I2c;
 use embassy_rp::peripherals;
@@ -32,7 +32,7 @@ use crate::firmware::app_host::{
 // formatters import unconditionally — a disabled profile branch is const-folded
 // away at the call site instead.
 use crate::firmware::app_render::log_command_sample;
-use crate::firmware::audio::PicoAudioBackend;
+use crate::firmware::audio::{PicoAudioBackend, RUNTIME_CUE_IMAGE_CAPACITY};
 use crate::firmware::config::{
     DiagClass, FirmwareClock, CODE_WINDOW_TOTAL_BYTES, DEVICE_CODE_CEILING, DEVICE_FRAME_FUEL,
     DEVICE_VM_CALL_DEPTH, DEVICE_VM_STACK_SLOTS, DIAG_PROFILE, KEYBOARD_REGISTER_SETTLE_US,
@@ -111,6 +111,47 @@ use crate::psram::{PSRAM_PIO_SYS_HZ, PSRAM_QPI_V2_READ_CLOCK_DIVIDER};
 use crate::psram_ext::{
     koto_psram_fast_code_window_snapshot, KotoPsramFastReadMode, PSRAM_FAST_CODE_WINDOW_CHUNK_BYTES,
 };
+
+const AUDIO_CUE_CACHE_ENTRIES: usize = 16;
+
+struct AudioLoadScratch {
+    image: [u8; RUNTIME_CUE_IMAGE_CAPACITY],
+}
+
+impl AudioLoadScratch {
+    const fn new() -> Self {
+        Self {
+            image: [0; RUNTIME_CUE_IMAGE_CAPACITY],
+        }
+    }
+}
+
+/// CPU0 is the sole accessor. Keeping this large scratch outside the embassy
+/// future avoids adding ~22 KiB to the main task and does not mask interrupts
+/// during SD I/O or KMML compilation.
+struct Cpu0AudioScratch(UnsafeCell<AudioLoadScratch>);
+unsafe impl Sync for Cpu0AudioScratch {}
+static AUDIO_LOAD_SCRATCH: Cpu0AudioScratch =
+    Cpu0AudioScratch(UnsafeCell::new(AudioLoadScratch::new()));
+
+#[derive(Clone, Copy)]
+struct AudioCueCacheEntry {
+    key: u64,
+    address: u32,
+    len: u16,
+    bgm: bool,
+    used: bool,
+}
+
+impl AudioCueCacheEntry {
+    const EMPTY: Self = Self {
+        key: 0,
+        address: 0,
+        len: 0,
+        bgm: false,
+        used: false,
+    };
+}
 
 #[cfg(all(
     feature = "psram_dma_read_code_window",
@@ -348,6 +389,8 @@ struct StagedApp {
     used_psram: bool,
     /// Base byte address where code is staged in PSRAM.
     code_base_addr: u32,
+    /// Resolved FAT short name of the authoritative APPS/*.kpa archive.
+    package_file: ShortFileName,
     #[cfg(all(
         feature = "psram_dma_read_code_window",
         feature = "psram_dma_read_code_window_diag"
@@ -473,7 +516,7 @@ pub async fn run_device_app<D>(
         uart_log(uart, "phase=251 launch-missing-entry\r\n");
         return;
     };
-    let Some(file_name) = entry.rsplit('/').next() else {
+    let Some(_file_name) = entry.rsplit('/').next() else {
         audio.stop();
         uart_log(uart, "phase=251 launch-missing-entry\r\n");
         return;
@@ -482,7 +525,7 @@ pub async fn run_device_app<D>(
     let Some(staged) = stage_app_code(
         volume_mgr,
         package.app_id(),
-        file_name,
+        entry,
         &mut header,
         psram.as_mut(),
         code_window,
@@ -521,14 +564,15 @@ pub async fn run_device_app<D>(
             staged.code_words,
             uart,
         );
-        // KOTO-0173: the production window is a two-tile MRU/LRU cache, so a
-        // `main`<->helper ping-pong across one tile boundary loads each tile
-        // once instead of refilling on every crossing.
-        let mut code = PsramCodeWindow::new_two_tile(
+        // The board profile selects the resident CodeWindow slot count: RP2040
+        // retains two slots while RP2350A can spend its additional SRAM on a
+        // three-slot working set without changing portable VM code.
+        let mut code = PsramCodeWindow::new_with_slots(
             psram,
             code_window,
             staged.code_base_addr,
             staged.code_words,
+            crate::firmware::config::CODE_WINDOW_TILES,
         );
         // Install a monotonic microsecond clock so the window times each PSRAM refill
         // (KOTO-0132 phase 1); the fallback SliceCode path never refills and reports 0.
@@ -541,6 +585,7 @@ pub async fn run_device_app<D>(
             staged.file_len,
             staged.code_size,
             staged.code_base_addr,
+            staged.package_file.clone(),
             limits,
             heap,
             keyboard,
@@ -565,6 +610,7 @@ pub async fn run_device_app<D>(
             staged.file_len,
             staged.code_size,
             staged.code_base_addr,
+            staged.package_file.clone(),
             limits,
             heap,
             keyboard,
@@ -593,12 +639,13 @@ async fn run_app_session<C, D>(
     code: &mut C,
     header: &[u8],
     file_len: usize,
-    _staged_code_size: usize,
+    staged_code_size: usize,
     #[cfg_attr(
         not(feature = "psram_qpi_code_window_counters"),
         allow(unused_variables)
     )]
     staged_code_base_addr: u32,
+    package_file: ShortFileName,
     limits: RuntimeLimits,
     heap: &mut [u8; MAX_DEVICE_HEAP_BYTES],
     keyboard: &mut I2c<'_, peripherals::I2C1, embassy_rp::i2c::Blocking>,
@@ -639,7 +686,7 @@ async fn run_app_session<C, D>(
                         code,
                         header,
                         file_len,
-                        _staged_code_size,
+                        staged_code_size,
                         _staged_code_base_addr,
                         uart,
                     );
@@ -682,7 +729,11 @@ async fn run_app_session<C, D>(
         &mut current_slot[0],
         static_layer,
         audio,
+        package_file,
     );
+    let mut audio_cache = [AudioCueCacheEntry::EMPTY; AUDIO_CUE_CACHE_ENTRIES];
+    let mut audio_next_address =
+        align_psram_address(staged_code_base_addr.saturating_add(staged_code_size as u32));
     host.load_skk();
     if !host.diag.as_bytes().is_empty() {
         uart_write_line(uart, &host.diag);
@@ -782,6 +833,7 @@ async fn run_app_session<C, D>(
     // Apps start with a clean surface. Incremental-drawing samples may only
     // repaint a narrow band and must never inherit KotoShell pixels.
     if lcd.fill(Rgb888::BLACK).await.is_err() {
+        host.close_package_stream();
         audio.stop();
         uart_log(uart, "phase=258 app-clear-error\r\n");
         return;
@@ -841,6 +893,13 @@ async fn run_app_session<C, D>(
         let cw_refill_us = code.cw_refill_us_total();
         let cw_refill_max_us = code.cw_refill_us_max();
         let cw_bytes = code.cw_refill_bytes();
+        service_pending_audio_asset(
+            &mut host,
+            code,
+            &mut audio_cache,
+            &mut audio_next_address,
+            uart,
+        );
         #[cfg(feature = "psram_qpi_code_window_counters")]
         cw_counters.record_refills(code_refills, cw_refill_us, cw_refill_max_us);
         // Drain any UART diagnostic buffered by a host call (e.g. asset_load).
@@ -856,6 +915,7 @@ async fn run_app_session<C, D>(
                 let mut line = LineBuffer::new();
                 let _ = write!(line, "phase=153 app-exited code={}\r\n", code);
                 uart_write_line(uart, &line);
+                host.close_package_stream();
                 audio.stop();
                 #[cfg(feature = "psram_dma_read_code_window")]
                 {
@@ -910,6 +970,7 @@ async fn run_app_session<C, D>(
                     );
                     uart_write_line(uart, &line);
                 }
+                host.close_package_stream();
                 return;
             }
         }
@@ -1041,6 +1102,7 @@ async fn run_app_session<C, D>(
                 .await;
             if result.is_err() {
                 uart_log(uart, "phase=258 app-draw-error\r\n");
+                host.close_package_stream();
                 return;
             }
             *previous_draw = *host.draw;
@@ -1571,7 +1633,139 @@ fn copy_around_fail(dst: &mut [u8; 16], bytes: &[u8], fail_off: usize) {
     dst[..len].copy_from_slice(&bytes[start..end]);
 }
 
+fn align_psram_address(address: u32) -> u32 {
+    address.saturating_add(255) & !255
+}
+
+fn audio_asset_key(path: &str, bgm: bool) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.bytes().chain(core::iter::once(u8::from(bgm))) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn service_pending_audio_asset<C, D>(
+    host: &mut DeviceHost<'_, D>,
+    code: &mut C,
+    cache: &mut [AudioCueCacheEntry; AUDIO_CUE_CACHE_ENTRIES],
+    next_address: &mut u32,
+    uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
+) where
+    C: CodeWindowVerifyExt,
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+{
+    let Some(request) = host.take_audio_asset_request() else {
+        return;
+    };
+    if request.path().ends_with(".kacl") {
+        match host.start_streaming_audio_asset(request.path(), request.bgm) {
+            Ok(true) => {
+                log_audio_asset_stage(uart, "streaming", request.path());
+                return;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                host.audio_asset_diag("stream-start", request.path());
+                return;
+            }
+        }
+    }
+    let key = audio_asset_key(request.path(), request.bgm);
+    // Safety: this routine runs only on CPU0, once between VM frames. CPU1
+    // receives a copy through AudioShared and never touches this scratch.
+    let scratch = unsafe { &mut *AUDIO_LOAD_SCRATCH.0.get() };
+
+    if let Some(entry) = cache.iter().find(|entry| entry.used && entry.key == key) {
+        let len = usize::from(entry.len);
+        log_audio_asset_stage(uart, "cache-read", request.path());
+        if code.asset_read(entry.address, &mut scratch.image[..len])
+            && host.play_loaded_audio_image(&scratch.image[..len], entry.bgm)
+        {
+            log_audio_asset_stage(uart, "queued", request.path());
+            return;
+        }
+        host.audio_asset_diag("psram-read", request.path());
+        return;
+    }
+
+    let image_len = match host.read_audio_asset(request.path(), &mut scratch.image) {
+        Ok(len) if len <= scratch.image.len() => len,
+        _ => {
+            host.audio_asset_diag("sd-read", request.path());
+            return;
+        }
+    };
+    let image = &mut scratch.image;
+    let magic = image.get(..4);
+    if image_len < 12 || !matches!(magic, Some(b"KAQ1") | Some(b"KACL")) {
+        host.audio_asset_diag("koto-audio-image", request.path());
+        return;
+    }
+    let Some(capacity) = code.asset_capacity() else {
+        host.audio_asset_diag("no-psram", request.path());
+        return;
+    };
+    let end = next_address.saturating_add(image_len as u32);
+    log_audio_asset_stage(uart, "psram-write", request.path());
+    if end > capacity || !code.asset_write(*next_address, &image[..image_len]) {
+        host.audio_asset_diag("psram-write", request.path());
+        return;
+    }
+    let Some(slot) = cache.iter_mut().find(|entry| !entry.used) else {
+        host.audio_asset_diag("cache-full", request.path());
+        return;
+    };
+    *slot = AudioCueCacheEntry {
+        key,
+        address: *next_address,
+        len: image_len as u16,
+        bgm: request.bgm,
+        used: true,
+    };
+    *next_address = align_psram_address(end);
+
+    // Read back through the same copy-only PSRAM API used on cache hits. This
+    // makes PSRAM, not the compile scratch, the authoritative playback image.
+    log_audio_asset_stage(uart, "psram-read", request.path());
+    if !code.asset_read(slot.address, &mut image[..image_len])
+        || !host.play_loaded_audio_image(&image[..image_len], request.bgm)
+    {
+        host.audio_asset_diag("audio-queue", request.path());
+    } else {
+        log_audio_asset_stage(uart, "queued", request.path());
+    }
+}
+
+fn log_audio_asset_stage(
+    uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
+    stage: &str,
+    path: &str,
+) {
+    let mut line = LineBuffer::new();
+    let _ = write!(
+        line,
+        "phase=158 audio-runtime-stage stage={} path={}\r\n",
+        stage, path
+    );
+    uart_write_line(uart, &line);
+}
+
 trait CodeWindowVerifyExt {
+    fn asset_capacity(&self) -> Option<u32> {
+        None
+    }
+
+    fn asset_read(&mut self, _address: u32, _dst: &mut [u8]) -> bool {
+        false
+    }
+
+    fn asset_write(&mut self, _address: u32, _src: &[u8]) -> bool {
+        false
+    }
+
     #[cfg_attr(not(feature = "psram_qpi_code_window_counters"), allow(dead_code))]
     fn log_qpi_code_window_verify<D: BlockDevice>(
         &mut self,
@@ -1600,6 +1794,18 @@ trait CodeWindowVerifyExt {
 impl CodeWindowVerifyExt for SliceCode<'_> {}
 
 impl<'a, 'b> CodeWindowVerifyExt for PsramCodeWindow<'a, FirmwarePsramHal<'b>> {
+    fn asset_capacity(&self) -> Option<u32> {
+        Some(self.psram_capacity())
+    }
+
+    fn asset_read(&mut self, address: u32, dst: &mut [u8]) -> bool {
+        self.psram_read(address, dst).is_ok()
+    }
+
+    fn asset_write(&mut self, address: u32, src: &[u8]) -> bool {
+        self.psram_write(address, src).is_ok()
+    }
+
     #[cfg_attr(
         all(
             feature = "psram_qpi_code_window_counters",
@@ -2286,7 +2492,7 @@ fn stage_app_code<D>(
         allow(unused_variables)
     )]
     app_id: &str,
-    file_name: &str,
+    entry_path: &str,
     header: &mut [u8; KBC_HEADER_SIZE],
     psram: Option<&mut PsramBlocks<FirmwarePsramHal<'_>>>,
     code_window: &mut [u8; CODE_WINDOW_TOTAL_BYTES],
@@ -2318,18 +2524,23 @@ where
         uart_log(uart, "phase=260 launch-root-open-error\r\n");
         return None;
     };
-    let Ok(bytecode_dir) = root.open_dir("BYTECODE") else {
+    let Ok(apps_dir) = root.open_dir("APPS") else {
         uart_log(uart, "phase=261 launch-bytecode-dir-open-error\r\n");
         return None;
     };
+    let file_name = entry_path.rsplit('/').next().unwrap_or(entry_path);
+    let stem = file_name.strip_suffix(".kbc").unwrap_or(file_name);
+    let mut package_name = LineBuffer::new();
+    let _ = write!(package_name, "{}.kpa", stem);
+    let package_name = core::str::from_utf8(package_name.as_bytes()).unwrap_or("");
     let mut short = None;
-    let short_target = ShortFileName::create_from_str(file_name).ok();
+    let short_target = ShortFileName::create_from_str(package_name).ok();
     let mut lfn = LfnBuffer::new(lfn_storage);
-    if bytecode_dir
+    if apps_dir
         .iterate_dir_lfn(&mut lfn, |entry, long_name| {
             if short.is_none()
                 && !entry.attributes.is_directory()
-                && (long_name.is_some_and(|name| name.eq_ignore_ascii_case(file_name))
+                && (long_name.is_some_and(|name| name.eq_ignore_ascii_case(package_name))
                     || short_target.as_ref() == Some(&entry.name))
             {
                 short = Some(entry.name.clone());
@@ -2344,16 +2555,74 @@ where
         uart_log(uart, "phase=252 launch-bytecode-missing\r\n");
         return None;
     };
-    let Ok(file) = bytecode_dir.open_file_in_dir(&short, Mode::ReadOnly) else {
+    let Ok(file) = apps_dir.open_file_in_dir(&short, Mode::ReadOnly) else {
         uart_log(uart, "phase=262 launch-bytecode-file-open-error\r\n");
         return None;
     };
-    let file_len = file.length() as usize;
+    let package_file = short.clone();
+    let read_exact = |dst: &mut [u8]| -> Result<(), ()> {
+        let mut total = 0usize;
+        while total < dst.len() {
+            match file.read(&mut dst[total..]) {
+                Ok(0) => return Err(()),
+                Ok(count) => total += count,
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(())
+    };
+    let mut kpa_header = [0u8; 64];
+    if read_exact(&mut kpa_header).is_err() || &kpa_header[..4] != b"KPA1" {
+        uart_log(uart, "phase=254 launch-package-invalid\r\n");
+        return None;
+    }
+    let entry_count = u32::from_le_bytes(kpa_header[16..20].try_into().unwrap_or([0; 4]));
+    let table_offset = u32::from_le_bytes(kpa_header[20..24].try_into().unwrap_or([0; 4]));
+    let strings_offset = u32::from_le_bytes(kpa_header[24..28].try_into().unwrap_or([0; 4]));
+    let mut record = [0u8; 64];
+    let mut path_buf = [0u8; 96];
+    let mut asset_range = None;
+    for index in 0..entry_count {
+        if file
+            .seek_from_start(table_offset.saturating_add(index.saturating_mul(64)))
+            .is_err()
+            || read_exact(&mut record).is_err()
+        {
+            return None;
+        }
+        let path_offset = u32::from_le_bytes(record[0..4].try_into().unwrap_or([0; 4]));
+        let path_len = u32::from_le_bytes(record[4..8].try_into().unwrap_or([0; 4])) as usize;
+        if path_len > path_buf.len() {
+            continue;
+        }
+        if file
+            .seek_from_start(strings_offset.saturating_add(path_offset))
+            .is_err()
+            || read_exact(&mut path_buf[..path_len]).is_err()
+        {
+            return None;
+        }
+        if path_buf[..path_len] == *entry_path.as_bytes() {
+            asset_range = Some((
+                u32::from_le_bytes(record[16..20].try_into().unwrap_or([0; 4])),
+                u32::from_le_bytes(record[20..24].try_into().unwrap_or([0; 4])),
+            ));
+            break;
+        }
+    }
+    let Some((asset_base, asset_size)) = asset_range else {
+        uart_log(uart, "phase=252 launch-bytecode-missing\r\n");
+        return None;
+    };
+    let file_len = asset_size as usize;
     if file_len < KBC_HEADER_SIZE {
         uart_log(uart, "phase=254 launch-bytecode-truncated\r\n");
         return None;
     }
 
+    if file.seek_from_start(asset_base).is_err() {
+        return None;
+    }
     // Read the resident header first; everything else is driven from it.
     let mut read = 0usize;
     while read < KBC_HEADER_SIZE {
@@ -2417,7 +2686,10 @@ where
             uart_log(uart, "phase=255 launch-rodata-range-error\r\n");
             return None;
         }
-        if file.seek_from_start(rodata_offset as u32).is_err() {
+        if file
+            .seek_from_start(asset_base.saturating_add(rodata_offset as u32))
+            .is_err()
+        {
             uart_log(uart, "phase=252 launch-bytecode-seek-error\r\n");
             return None;
         }
@@ -2437,7 +2709,10 @@ where
             return None;
         }
     }
-    if file.seek_from_start(code_offset as u32).is_err() {
+    if file
+        .seek_from_start(asset_base.saturating_add(code_offset as u32))
+        .is_err()
+    {
         uart_log(uart, "phase=252 launch-bytecode-seek-error\r\n");
         return None;
     }
@@ -2816,6 +3091,7 @@ where
                 code_words,
                 used_psram: true,
                 code_base_addr,
+                package_file,
                 #[cfg(all(
                     feature = "psram_dma_read_code_window",
                     feature = "psram_dma_read_code_window_diag"
@@ -2878,6 +3154,7 @@ where
                 code_words,
                 used_psram: false,
                 code_base_addr,
+                package_file,
                 #[cfg(all(
                     feature = "psram_dma_read_code_window",
                     feature = "psram_dma_read_code_window_diag"

@@ -68,9 +68,11 @@ build that every contributor would carry.
 ### RP2040 vs RP2350 stance
 
 Develop and validate on the standard-kit RP2040 (Pico 1H, 2MB flash, 264KB SRAM) first, because it
-is the binding constraint (REQUIREMENTS 3.3, HC-1). Compile-test the RP2350 target early via the
-`embassy-rp` feature flag so the second target does not bit-rot, but treat RP2350-only capabilities
-(QSPI PSRAM mapping, extra SRAM) as future headroom, never as a requirement.
+is the binding constraint (REQUIREMENTS 3.3, HC-1). RP2350 is now an active compatibility target,
+not only future headroom. Its board profiles, PicoCalc peripheral parity, and Pico Plus 2(W)
+onboard PSRAM work are defined in the
+[RP2350 / Pico 2 Support Roadmap](../planning/RP2350_SUPPORT_ROADMAP.md). RP2040 remains supported
+and continues to define the portable lower-bound memory profile.
 
 ## 3. HAL Trait Mapping
 

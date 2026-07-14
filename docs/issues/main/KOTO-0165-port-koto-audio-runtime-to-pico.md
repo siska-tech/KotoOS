@@ -51,23 +51,15 @@ matters, and ~50 % CPU1 load has 16 ms of hardware lead to hide bursts.
 
 ### 2. Compiled cue tables replace runtime parsing
 
-- `tools/koto-audio-gen` (new workspace tool): parses every `apps/*/audio/*.kmml`
-  with the koto-audio-tools MML frontend, converts the **legacy dialect** (0-15 `V`
-  volumes ×17 onto the 0-255 note scale; legacy synth/`.kwt` `@` ids remapped to the
-  closest built-in instruments; 96 ticks/quarter so `L32` and dotted lengths stay
-  integral), wraps BGM tracks in infinite loops, validates everything with the
-  runtime validators, and emits `SequenceEvent` statics.
-- `src/koto-pico/src/firmware/audio_cues_generated.rs` (vendored output): 42 cues —
-  9 BGM (`PolyphonicSequence`) and 33 SFX (`Sequence`) covering kotomines, kotorogue,
-  kotorun, kotoshogi, kotosnake, sokoban, and the KotoBlocks BGM — plus the two
-  route arrays. Regenerate with
-  `cargo run -p koto-audio-gen -- src/koto-pico/src/firmware/audio_cues_generated.rs`.
-- `src/koto-pico/src/firmware/audio_cues.rs` (hand-written): the KotoBlocks SFX as
-  verbatim ports of the SIM authored sequences (envelope/drum voices the compact
-  path cannot express), the `play_sfx(id)` blip cues and `play_bgm(id)` built-in
-  loops that replace the tone path, and the single `primary_audio_route` lookup.
-  The KotoBlocks BGM is generated from the same `blocks_like_bgm.mml` source as the
-  SIM table, so SIM and device stay cue-identical for the reference app.
+- `tools/koto-audio-gen` parses every `apps/*/audio/*.kmml` directly as native
+  KotoAudio (`V0`–`V127`, builtin instrument IDs, and native drum aliases), wraps
+  BGM tracks in infinite loops, validates them, and emits `SequenceEvent` statics.
+- `src/koto-pico/src/firmware/audio_cues_generated.rs` contains 48 cues — 9 BGM
+  (`PolyphonicSequence`) and 39 SFX (`Sequence`) — plus the two generic route
+  arrays. The normal `harness/build_apps.py` flow regenerates this table.
+- `src/koto-pico/src/firmware/audio_cues.rs` uses the generated arrays for every
+  app, including all KotoBlocks BGM and SFX. Only fixed numeric-hostcall blips stay
+  hand-written.
 
 ### 3. Host dispatch is route-only
 
@@ -112,10 +104,8 @@ tables, `AudioOutputMode::Tone` / `ToneOwner` and all tone commands,
   policy): pulse voices become squares, noise percussion becomes closed hi-hat, and
   the kotosnake `.kwt` lead/bass/drum instruments map to saw/triangle/hi-hat.
   Loudness maps V15 → 255 with the SIM bus gains (BGM 150/256, SFX 200/256).
-- **SIM is unchanged in this slice**: non-KotoBlocks apps still take the SIM legacy
-  MML synth, so SIM and device timbres differ for those apps until the SIM legacy
-  path is retired the same way (natural follow-up: route the SIM through the same
-  generated tables and delete `koto-sim/src/audio.rs`'s MML synth).
+- **SIM uses the same generated route arrays** as Pico, so all shipped app KMML
+  reaches the same native KotoAudio sequences on both targets.
 - `probe_audio` (KOTO-0114 hardware probe) is self-contained on `koto-core` and
   untouched.
 

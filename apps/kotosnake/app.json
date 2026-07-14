@@ -1,0 +1,66 @@
+{
+  "app_id": "dev.koto.games.kotosnake",
+  "kind": "koto",
+  "package": "kotosnake",
+  "name": "KotoSnake",
+  "description": "演出過剰なヘビゲーム。虹色のヘビ・粒子・画面シェイク、BGMはカスタム音色。",
+  "category": "ゲーム",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#0A0820",
+    "primary": "#2ACADC",
+    "secondary": "#F6C236",
+    "accent": "#E0489E",
+    "highlight": "#46BE69",
+    "shadow": "#0A0810"
+  },
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "codegen": {
+    "comment": "KOTO-0169 Stage 4: the compact boolean/comparison templates shrink this app's code just enough to slide a hot main<->helper pair across a code-window tile boundary - steady play regressed from the KOTO-0155 2-refill monotone walk to a 10-refill ping-pong in the sim tile profile. Pinned to the pre-Stage-4 templates (byte-identical layout) instead; kotosnake already ships without the KOTO-0156 pair for the same tile-layout fragility.",
+    "legacy_compare_templates": true
+  },
+  "audio": [
+    {
+      "source": "audio/bgm.kmml",
+      "output": "audio/kotosnake_bgm.kmml"
+    },
+    {
+      "source": "audio/bgm2.kmml",
+      "output": "audio/kotosnake_bgm2.kmml"
+    },
+    {
+      "source": "audio/bgm3.kmml",
+      "output": "audio/kotosnake_bgm3.kmml"
+    },
+    {
+      "source": "audio/eat.kmml",
+      "output": "audio/kotosnake_eat.kmml"
+    },
+    {
+      "source": "audio/turn.kmml",
+      "output": "audio/kotosnake_turn.kmml"
+    },
+    {
+      "source": "audio/over.kmml",
+      "output": "audio/kotosnake_over.kmml"
+    },
+    {
+      "source": "audio/start.kmml",
+      "output": "audio/kotosnake_start.kmml"
+    },
+    {
+      "source": "audio/level.kmml",
+      "output": "audio/kotosnake_level.kmml"
+    }
+  ]
+}

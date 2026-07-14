@@ -1,0 +1,64 @@
+{
+  "app_id": "dev.koto.games.kotoshogi",
+  "kind": "koto",
+  "package": "kotoshogi",
+  "name": "KotoShogi",
+  "description": "本将棋を端末で。合法手・持ち駒・成り・王手と盤上演出に対応。",
+  "category": "ゲーム",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#FAE8B4",
+    "primary": "#223052",
+    "secondary": "#FFFFFF",
+    "accent": "#C4302A",
+    "highlight": "#FADC96",
+    "shadow": "#D2972A"
+  },
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "codegen": {
+    "comment": "KOTO-0156 model: the steady play frame walked four 16 KiB code-window tiles and the 81-cell glyph loop straddled a tile boundary (hardware phase=160: refills=166, vm_us~230ms, fps=4). The title/victory scenes end in `continue` so outline_cold_blocks relocates them to the tail, and relocate_preamble pulls the loop start toward word 0, shrinking the steady play walk. KOTO-0169 Stage 4: the compact comparison templates re-broke that carefully tuned layout (sim tile profile regressed past the 2-refill floor), so this app also pins the pre-Stage-4 templates.",
+    "relocate_preamble": true,
+    "outline_cold_blocks": true,
+    "legacy_compare_templates": true
+  },
+  "audio": [
+    {
+      "source": "audio/bgm.kmml",
+      "output": "audio/kotoshogi_bgm.kmml"
+    },
+    {
+      "source": "audio/move.kmml",
+      "output": "audio/kotoshogi_move.kmml"
+    },
+    {
+      "source": "audio/rotate.kmml",
+      "output": "audio/kotoshogi_rotate.kmml"
+    },
+    {
+      "source": "audio/lock.kmml",
+      "output": "audio/kotoshogi_lock.kmml"
+    },
+    {
+      "source": "audio/clear.kmml",
+      "output": "audio/kotoshogi_clear.kmml"
+    },
+    {
+      "source": "audio/over.kmml",
+      "output": "audio/kotoshogi_over.kmml"
+    },
+    {
+      "source": "audio/tetris.kmml",
+      "output": "audio/kotoshogi_tetris.kmml"
+    }
+  ]
+}

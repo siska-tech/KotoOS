@@ -19,8 +19,8 @@
 use std::time::Instant;
 
 use koto_gfx::{
-    paint_app_commands, paint_command_list, AppDrawCommand, BitmapFont, Canvas, Game2dBoard,
-    Game2dSprite, Game2dStampDef, Game2dText, Rect, Rgb565, GAME2D_BOARD_CELLS,
+    paint_app_commands, paint_command_list, AppDrawCommand, BitmapFont, Canvas, Game2dSprite,
+    Game2dStampDef, Game2dText, Game2dTilemap, Rect, Rgb565,
 };
 
 const FONT_BYTES: &[u8] = include_bytes!("../../../assets/fonts/mplus12.kfont");
@@ -87,8 +87,8 @@ fn immediate_rects() -> Vec<AppDrawCommand> {
     // 58 small scattered rects (HUD cells, gauges, tokens).
     (0..58)
         .map(|i| {
-            let col = (i % 10) as i32;
-            let row = (i / 10) as i32;
+            let col = i % 10;
+            let row = i / 10;
             AppDrawCommand::Rect {
                 x: 8 + col * 30,
                 y: 40 + row * 24,
@@ -127,18 +127,19 @@ fn immediate_list() -> Vec<AppDrawCommand> {
     v
 }
 
-fn empty_board() -> Game2dBoard {
-    [-1; GAME2D_BOARD_CELLS]
+fn empty_board() -> Game2dTilemap {
+    Game2dTilemap::legacy()
 }
 
 /// One dirty-rect recomposite exactly as `present_app_delta` does it: a fresh
 /// viewport canvas over the rect, cleared to base, then the whole stack.
+#[allow(clippy::too_many_arguments)]
 fn recomposite(
     buf: &mut [u8],
     rect: Rect,
     font: &BitmapFont<'_>,
     statics: &[AppDrawCommand],
-    board: &Game2dBoard,
+    board: &Game2dTilemap,
     sprites: &[Game2dSprite],
     stamps: &[Game2dStampDef],
     texts: &[Game2dText],

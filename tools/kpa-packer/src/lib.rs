@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use koto_audio::{runtime_cue_max_encoded_len, RuntimeCue, RuntimeCueError};
 use koto_core::package::validate_entry_path;
 use koto_core::{ManifestFields, PackageIconStyle, PackageIconTheme, PackageManifest};
 use serde::Deserialize;
@@ -92,6 +93,10 @@ pub enum PackError {
         path: String,
         source: std::io::Error,
     },
+    AudioCompile {
+        path: String,
+        source: RuntimeCueError,
+    },
     Layout(LayoutError),
     SizeOverflow,
 }
@@ -135,6 +140,12 @@ impl fmt::Display for PackError {
             }
             Self::AssetRead { path, source } => {
                 write!(f, "failed to read asset {path}: {source}")
+            }
+            Self::AudioCompile { path, source } => {
+                write!(
+                    f,
+                    "failed to compile Native KotoAudio asset {path}: {source:?}"
+                )
             }
             Self::Layout(error) => write!(f, "invalid package layout: {error}"),
             Self::SizeOverflow => write!(f, "package exceeds KPA v1 32-bit size fields"),
@@ -234,10 +245,30 @@ fn read_asset(
     validate_entry_path(&asset.path)
         .map_err(|_| PackError::InvalidAssetPath(asset.path.clone()))?;
     let host_path = host_asset_path(assets_root, &asset.path);
-    let bytes = std::fs::read(&host_path).map_err(|source| PackError::AssetRead {
+    let mut bytes = std::fs::read(&host_path).map_err(|source| PackError::AssetRead {
         path: asset.path.clone(),
         source,
     })?;
+    if asset.asset_type == "audio" && !bytes.starts_with(b"KAQ1") && !bytes.starts_with(b"KACL") {
+        let source = std::str::from_utf8(&bytes).map_err(|_| PackError::AudioCompile {
+            path: asset.path.clone(),
+            source: RuntimeCueError::InvalidText,
+        })?;
+        let cue =
+            RuntimeCue::<272>::compile_kmml(source).map_err(|source| PackError::AudioCompile {
+                path: asset.path.clone(),
+                source,
+            })?;
+        let mut image = vec![0u8; runtime_cue_max_encoded_len::<272>()];
+        let len = cue
+            .encode(&mut image)
+            .map_err(|source| PackError::AudioCompile {
+                path: asset.path.clone(),
+                source,
+            })?;
+        image.truncate(len);
+        bytes = image;
+    }
     let mut flags = 0;
     if asset.sequential {
         flags |= FLAG_SEQUENTIAL;
@@ -578,5 +609,72 @@ mod tests {
             validate_layout(&layout),
             Err(LayoutError::NonMonotonicAsset { .. })
         ));
+    }
+
+    #[test]
+    fn audio_assets_are_compiled_to_pointer_free_kaq1_images() {
+        let root = std::env::temp_dir().join(format!("kpa-packer-audio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bytecode")).unwrap();
+        std::fs::create_dir_all(root.join("audio")).unwrap();
+        std::fs::write(root.join("bytecode/main.kbc"), b"KBC").unwrap();
+        std::fs::write(
+            root.join("audio/theme.kmml"),
+            b"#DIALECT KOTOAUDIO\n#TRACK drums\nT120 L8 [!bd !hh !sd]0\n",
+        )
+        .unwrap();
+        let manifest = br#"{
+            "format":"kpa-manifest","version":1,"app_id":"dev.koto.audio",
+            "name":"Audio","runtime":"kotoruntime-bytecode",
+            "entry":"bytecode/main.kbc",
+            "assets":[
+                {"path":"bytecode/main.kbc","type":"bytecode","sequential":true},
+                {"path":"audio/theme.kmml","type":"audio","sequential":true}
+            ]
+        }"#;
+        let package = pack_manifest(
+            manifest,
+            PackOptions {
+                assets_root: root.clone(),
+            },
+        )
+        .unwrap();
+        let audio = &package.layout()[1];
+        assert_eq!(
+            &package.bytes()[audio.data_offset as usize..audio.data_offset as usize + 4],
+            b"KAQ1"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_ready_kacl_audio_is_packaged_byte_for_byte() {
+        let root = std::env::temp_dir().join(format!("kpa-packer-kacl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bytecode")).unwrap();
+        std::fs::create_dir_all(root.join("audio")).unwrap();
+        std::fs::write(root.join("bytecode/main.kbc"), b"KBC").unwrap();
+        let kacl = b"KACLruntime-ready-payload";
+        std::fs::write(root.join("audio/clip.kacl"), kacl).unwrap();
+        let manifest = br#"{
+            "format":"kpa-manifest","version":1,"app_id":"dev.koto.kacl",
+            "name":"KACL","runtime":"kotoruntime-bytecode",
+            "entry":"bytecode/main.kbc",
+            "assets":[
+                {"path":"bytecode/main.kbc","type":"bytecode","sequential":true},
+                {"path":"audio/clip.kacl","type":"audio","sequential":true}
+            ]
+        }"#;
+        let package = pack_manifest(
+            manifest,
+            PackOptions {
+                assets_root: root.clone(),
+            },
+        )
+        .unwrap();
+        let audio = &package.layout()[1];
+        let start = audio.data_offset as usize;
+        assert_eq!(&package.bytes()[start..start + kacl.len()], kacl);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

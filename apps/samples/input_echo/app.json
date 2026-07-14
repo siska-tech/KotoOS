@@ -1,0 +1,19 @@
+{
+  "app_id": "dev.koto.samples.input-echo",
+  "kind": "koto",
+  "package": "sample_input_echo",
+  "name": "SDK Input Echo",
+  "description": "Echoes button and key input.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

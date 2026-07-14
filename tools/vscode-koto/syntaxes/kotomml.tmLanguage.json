@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "KotoMML",
+  "scopeName": "source.kotomml",
+  "patterns": [
+    {
+      "comment": "#TRACK directives before plain # comments",
+      "match": "(?i)^\\s*(#TRACK)\\b\\s*(\\S*)",
+      "captures": {
+        "1": { "name": "keyword.control.track.kotomml" },
+        "2": { "name": "entity.name.section.kotomml" }
+      }
+    },
+    {
+      "name": "comment.line.number-sign.kotomml",
+      "match": "#.*$"
+    },
+    {
+      "name": "keyword.other.instrument.kotomml",
+      "match": "(?i)@\\d+"
+    },
+    {
+      "name": "keyword.other.drum.kotomml",
+      "match": "(?i)!(bd|sd|hh|oh)\\b"
+    },
+    {
+      "comment": "Tempo/Volume/Octave/Length commands with their argument",
+      "name": "support.function.command.kotomml",
+      "match": "(?i)\\b[TVOL]\\d+"
+    },
+    {
+      "comment": "Notes with optional accidental; rests",
+      "name": "constant.language.note.kotomml",
+      "match": "(?i)\\b[A-G][#+-]?\\d*\\.?"
+    },
+    {
+      "name": "constant.language.rest.kotomml",
+      "match": "(?i)\\bR\\d*\\.?"
+    },
+    {
+      "name": "keyword.operator.loop.kotomml",
+      "match": "[\\[\\]]"
+    },
+    {
+      "name": "keyword.operator.octave-shift.kotomml",
+      "match": "[<>]"
+    }
+  ]
+}

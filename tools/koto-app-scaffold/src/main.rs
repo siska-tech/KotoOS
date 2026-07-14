@@ -23,12 +23,11 @@ fn main() -> ExitCode {
     }) {
         Ok(result) => {
             println!("created app {}", result.app_id);
+            println!("  descriptor: {}", result.descriptor.display());
             println!("  source: {}", result.source.display());
             println!("  helpers: {}", result.helpers.display());
-            println!("  manifest: {}", result.manifest.display());
             println!("  icon: {}", result.icon.display());
             println!("  scenario: {}", result.scenario.display());
-            println!("  registry: {}", result.registry.display());
             println!("build with: python harness\\build_apps.py");
             println!(
                 "run with: cargo run -p koto-sim -- --app {} --app-script {}",

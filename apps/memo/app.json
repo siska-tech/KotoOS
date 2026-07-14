@@ -1,0 +1,28 @@
+{
+  "app_id": "dev.koto.memo",
+  "kind": "koto",
+  "package": "memo",
+  "name": "Koto Memo",
+  "description": "テキストメモを作成・編集できます。",
+  "category": "アプリ",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#F8F5E8",
+    "primary": "#273752",
+    "secondary": "#FFFFFF",
+    "accent": "#D64A4A",
+    "highlight": "#F6D86B",
+    "shadow": "#5A8FCB"
+  },
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

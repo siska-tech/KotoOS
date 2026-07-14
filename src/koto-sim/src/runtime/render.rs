@@ -18,6 +18,7 @@ pub fn paint_app_session(
     font: &BitmapFont<'_>,
     session: &BytecodeAppSession,
 ) {
+    canvas.blit_rgb565(0, 0, 320, 320, session.persistent_pixels());
     for &(x, y, w, h, rgb565) in session.static_rects() {
         canvas.fill_rect(Rect { x, y, w, h }, Rgb565(rgb565 as u16));
     }

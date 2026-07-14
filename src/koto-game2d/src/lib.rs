@@ -36,8 +36,8 @@
 #![cfg_attr(not(test), no_std)]
 
 use koto_gfx::{
-    Game2dBoard, Game2dSprite, Game2dStampDef, Game2dText, GAME2D_BOARD_COLS, GAME2D_BOARD_ROWS,
-    GAME2D_TEXT_BYTES, GAME2D_TILE_BYTES,
+    Game2dSprite, Game2dStampDef, Game2dText, Game2dTilemap, GAME2D_TEXT_BYTES,
+    GAME2D_TILEMAP_MAX_COLS, GAME2D_TILEMAP_MAX_ROWS, GAME2D_TILE_BYTES,
 };
 
 /// Failure of a Game2D semantic operation. The firmware dispatch shim maps each
@@ -69,8 +69,8 @@ pub type Game2dResult = Result<(), Game2dError>;
 /// table is bounded correctly without this crate hard-coding its capacities.
 pub struct Game2dScene<'a> {
     /// The board tilemap: one `tile_ref` per cell (app-heap byte offset of a 16x16
-    /// RGB565 tile, or `-1` empty), row-major `cy * GAME2D_BOARD_COLS + cx`.
-    pub board: &'a mut Game2dBoard,
+    /// RGB565 tile, or `-1` empty), using the fixed maximum-width stride.
+    pub board: &'a mut Game2dTilemap,
     /// The stamp descriptor table, indexed by `stamp_id`.
     pub stamps: &'a mut [Game2dStampDef],
     /// The placed-sprite table, indexed by `inst_id`.
@@ -80,6 +80,38 @@ pub struct Game2dScene<'a> {
 }
 
 impl Game2dScene<'_> {
+    /// Configure and clear retained tilemap layer 0. Capacity is fixed at 20x20;
+    /// active dimensions and the pixel origin are app-defined (KOTO-0199).
+    pub fn configure_tilemap(
+        &mut self,
+        layer: i32,
+        columns: i32,
+        rows: i32,
+        origin_x: i32,
+        origin_y: i32,
+    ) -> Game2dResult {
+        if layer != 0
+            || !(1..=GAME2D_TILEMAP_MAX_COLS as i32).contains(&columns)
+            || !(1..=GAME2D_TILEMAP_MAX_ROWS as i32).contains(&rows)
+        {
+            return Err(Game2dError::BadArgument);
+        }
+        let (Ok(columns), Ok(rows), Ok(origin_x), Ok(origin_y)) = (
+            u8::try_from(columns),
+            u8::try_from(rows),
+            i16::try_from(origin_x),
+            i16::try_from(origin_y),
+        ) else {
+            return Err(Game2dError::BadArgument);
+        };
+        self.board.cells.fill(-1);
+        self.board.columns = columns;
+        self.board.rows = rows;
+        self.board.origin_x = origin_x;
+        self.board.origin_y = origin_y;
+        Ok(())
+    }
+
     /// `game2d_set_tile`: place (or clear, when `tile_ref < 0`) a tile in the
     /// single board layer (`layer 0`). A non-empty `tile_ref` is the app-heap byte
     /// offset of a 16x16 RGB565 tile; the whole tile must lie within `heap_len`
@@ -98,7 +130,7 @@ impl Game2dScene<'_> {
         let (Ok(cx), Ok(cy)) = (usize::try_from(x), usize::try_from(y)) else {
             return Err(Game2dError::BadArgument);
         };
-        if cx >= GAME2D_BOARD_COLS || cy >= GAME2D_BOARD_ROWS {
+        if cx >= usize::from(self.board.columns) || cy >= usize::from(self.board.rows) {
             return Err(Game2dError::BadArgument);
         }
         if tile_ref >= 0 {
@@ -112,7 +144,7 @@ impl Game2dScene<'_> {
         }
         // `tile_ref < 0` clears the cell; store it verbatim (the painter treats any
         // negative value as empty).
-        self.board[cy * GAME2D_BOARD_COLS + cx] = tile_ref;
+        self.board.cells[Game2dTilemap::cell_index(cx, cy)] = tile_ref;
         Ok(())
     }
 
@@ -121,7 +153,7 @@ impl Game2dScene<'_> {
         if layer != 0 {
             return Err(Game2dError::BadArgument);
         }
-        self.board.fill(-1);
+        self.board.cells.fill(-1);
         Ok(())
     }
 
@@ -279,7 +311,7 @@ pub fn present() -> Game2dResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use koto_gfx::{GAME2D_BOARD_CELLS, GAME2D_TILE_PX};
+    use koto_gfx::{Game2dTilemap, GAME2D_TILEMAP_MAX_COLS, GAME2D_TILE_PX};
 
     const MAX_STAMPS: usize = 32;
     const MAX_SPRITES: usize = 16;
@@ -289,7 +321,7 @@ mod tests {
     const HEAP_LEN: usize = GAME2D_TILE_BYTES * 4;
 
     struct Model {
-        board: Game2dBoard,
+        board: Game2dTilemap,
         stamps: [Game2dStampDef; MAX_STAMPS],
         sprites: [Game2dSprite; MAX_SPRITES],
         text_items: [Game2dText; MAX_TEXT_ITEMS],
@@ -298,7 +330,7 @@ mod tests {
     impl Model {
         fn new() -> Self {
             Self {
-                board: [-1; GAME2D_BOARD_CELLS],
+                board: Game2dTilemap::legacy(),
                 stamps: [Game2dStampDef::undefined(); MAX_STAMPS],
                 sprites: [Game2dSprite::hidden(); MAX_SPRITES],
                 text_items: [Game2dText::hidden(); MAX_TEXT_ITEMS],
@@ -319,10 +351,39 @@ mod tests {
     fn set_tile_places_then_clears() {
         let mut m = Model::new();
         assert_eq!(m.scene().set_tile(0, 1, 2, 0, HEAP_LEN), Ok(()));
-        assert_eq!(m.board[2 * GAME2D_BOARD_COLS + 1], 0);
+        assert_eq!(m.board.cells[Game2dTilemap::cell_index(1, 2)], 0);
         // Negative clears the cell verbatim.
         assert_eq!(m.scene().set_tile(0, 1, 2, -1, HEAP_LEN), Ok(()));
-        assert_eq!(m.board[2 * GAME2D_BOARD_COLS + 1], -1);
+        assert_eq!(m.board.cells[Game2dTilemap::cell_index(1, 2)], -1);
+    }
+
+    #[test]
+    fn configure_tilemap_sets_active_shape_origin_and_clears() {
+        let mut m = Model::new();
+        m.board.cells[5] = 42;
+        assert_eq!(m.scene().configure_tilemap(0, 20, 7, -16, 24), Ok(()));
+        assert_eq!((m.board.columns, m.board.rows), (20, 7));
+        assert_eq!((m.board.origin_x, m.board.origin_y), (-16, 24));
+        assert!(m.board.cells.iter().all(|&cell| cell == -1));
+        assert_eq!(m.scene().set_tile(0, 19, 6, 0, HEAP_LEN), Ok(()));
+    }
+
+    #[test]
+    fn configure_tilemap_rejects_invalid_capacity_layer_and_origin() {
+        let mut m = Model::new();
+        for args in [
+            (1, 10, 10, 0, 0),
+            (0, 0, 10, 0, 0),
+            (0, GAME2D_TILEMAP_MAX_COLS as i32 + 1, 10, 0, 0),
+            (0, 10, 21, 0, 0),
+            (0, 10, 10, i16::MAX as i32 + 1, 0),
+        ] {
+            assert_eq!(
+                m.scene()
+                    .configure_tilemap(args.0, args.1, args.2, args.3, args.4),
+                Err(Game2dError::BadArgument)
+            );
+        }
     }
 
     #[test]
@@ -337,8 +398,7 @@ mod tests {
             Err(Game2dError::BadArgument)
         );
         assert_eq!(
-            m.scene()
-                .set_tile(0, GAME2D_BOARD_COLS as i32, 0, 0, HEAP_LEN),
+            m.scene().set_tile(0, 10, 0, 0, HEAP_LEN),
             Err(Game2dError::BadArgument)
         );
         // A tile whose 16x16 RGB565 extent runs past the heap end is rejected.
@@ -353,9 +413,9 @@ mod tests {
     #[test]
     fn clear_layer_only_layer_zero() {
         let mut m = Model::new();
-        m.board[5] = 42;
+        m.board.cells[5] = 42;
         assert_eq!(m.scene().clear_layer(0), Ok(()));
-        assert!(m.board.iter().all(|&c| c == -1));
+        assert!(m.board.cells.iter().all(|&c| c == -1));
         assert_eq!(m.scene().clear_layer(1), Err(Game2dError::BadArgument));
     }
 

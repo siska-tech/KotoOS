@@ -11,15 +11,16 @@ use embassy_rp::uart::UartTx;
 use embassy_time::{Instant, Timer};
 use koto_core::{coalesce_dirty_tiles, BitmapFont, Canvas, Rect, TileBand};
 use koto_gfx::{
-    coalesce_then_decide, collect_immediate_dirty, decision_snapshot, push_dirty, DeltaDecision,
-    EditRegionShape, FullRepaintPolicy, FULL_REPAINT_RECTS, MAX_EDIT_REGION, STATIC_DAMAGE_CAP,
+    coalesce_then_decide, collect_immediate_dirty, collect_initial_scene_dirty, decision_snapshot,
+    has_retained_scene_content, push_dirty, DeltaDecision, EditRegionShape, FullRepaintPolicy,
+    Game2dTilemap, FULL_REPAINT_RECTS, MAX_EDIT_REGION, STATIC_DAMAGE_CAP,
 };
 
 use crate::dashboard::LineBuffer;
 use crate::firmware::app_host::{AppDrawCommand, AppStaticLayer, DeviceRuntimeHost};
 use crate::firmware::config::{
-    GAME2D_BOARD_COLS, GAME2D_BOARD_ROWS, GAME2D_MAX_SPRITES, GAME2D_MAX_TEXT_ITEMS,
-    GAME2D_TILE_PX, PRESENT_PIPELINE, RASTER_STRIP_BYTES, RASTER_STRIP_LINES, RGB666_STRIP_BYTES,
+    GAME2D_MAX_SPRITES, GAME2D_MAX_TEXT_ITEMS, GAME2D_TILE_PX, PRESENT_PIPELINE,
+    RASTER_STRIP_BYTES, RASTER_STRIP_LINES, RGB666_STRIP_BYTES,
 };
 use crate::firmware::diag::{
     uart_log, uart_write_line, DirtyRectGeometry, FullRepaintReason, PaintMetrics,
@@ -206,6 +207,33 @@ pub(crate) async fn present_app_commands(
         .await;
     }
 
+    // A missing full-screen base does not make a retained scene empty. The old
+    // first-present fallback below replays only immediate commands, so accepting
+    // a retained board/sprite/text/static state through it would omit those
+    // pixels and let the frame loop snapshot an image that never reached GRAM.
+    // Derive damage from the host-owned empty black surface and run the normal
+    // fixed-order compositor before the frame becomes the delta baseline.
+    if has_retained_scene_content(
+        &static_layer.commands[..static_layer.len],
+        &host.board,
+        &host.sprites,
+        &host.text_items,
+    ) {
+        return present_initial_retained_scene(
+            lcd,
+            font,
+            host,
+            static_layer,
+            heap,
+            strip,
+            scratch,
+            metrics,
+        )
+        .await;
+    }
+
+    // Preserve the legacy no-base immediate-only path. Its commands are already
+    // bounded partial transfers and do not need retained whole-stack composition.
     for command in &host.commands[..host.len] {
         match command {
             AppDrawCommand::Empty => {}
@@ -220,9 +248,8 @@ pub(crate) async fn present_app_commands(
                 let Some(rect) = clip_app_rect(*x, *y, *w, *h) else {
                     continue;
                 };
-                let Some(src) =
-                    heap.get(*off as usize..(*off as usize).saturating_add(*len as usize))
-                else {
+                let off = koto_gfx::pixel_heap_offset(*off) as usize;
+                let Some(src) = heap.get(off..off.saturating_add(*len as usize)) else {
                     continue;
                 };
                 // Compose the blit off-screen into a strip sized to the clipped
@@ -324,6 +351,95 @@ pub(crate) async fn present_app_commands(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn present_initial_retained_scene(
+    lcd: &mut PicoCalcLcd<'_>,
+    font: &BitmapFont<'_>,
+    host: &DeviceRuntimeHost,
+    static_layer: &AppStaticLayer,
+    heap: &[u8],
+    strip: &mut [u8; RASTER_STRIP_BYTES],
+    scratch: &mut [u8; RGB666_STRIP_BYTES],
+    metrics: &mut PaintMetrics,
+) -> Result<(), ()> {
+    let mut dirty = [Rect {
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+    }; DIRTY_RECT_PROBE_CAP];
+    let (mut len, mut area, mut overflow) = (0usize, 0u32, false);
+    collect_initial_scene_dirty(
+        &static_layer.commands[..static_layer.len],
+        &host.board,
+        &host.sprites,
+        &host.stamps,
+        &host.text_items,
+        &host.commands[..host.len],
+        heap,
+        320,
+        320,
+        &mut dirty,
+        &mut len,
+        &mut area,
+        &mut overflow,
+    );
+
+    let (decision_len, decision_overflow) = decision_snapshot(len, overflow, DIRTY_RECT_CAP);
+    let outcome = coalesce_then_decide(
+        FullRepaintPolicy::default(),
+        &mut dirty,
+        len,
+        area,
+        decision_len,
+        decision_overflow,
+        false,
+        overflow,
+        false,
+        DIRTY_COALESCE_MAX_WASTE,
+    );
+    match outcome.decision {
+        DeltaDecision::Skip => Ok(()),
+        DeltaDecision::Incremental => {
+            present_rects_pipelined(
+                lcd,
+                font,
+                host,
+                static_layer,
+                heap,
+                strip,
+                scratch,
+                &dirty[..outcome.coalesced_len],
+                0,
+                metrics,
+            )
+            .await
+        }
+        DeltaDecision::FullRepaint(reason) => {
+            metrics.mark_full_repaint(reason);
+            let full = [Rect {
+                x: 0,
+                y: 0,
+                w: 320,
+                h: 320,
+            }];
+            present_rects_pipelined(
+                lcd,
+                font,
+                host,
+                static_layer,
+                heap,
+                strip,
+                scratch,
+                &full,
+                0,
+                metrics,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn present_app_delta(
     lcd: &mut PicoCalcLcd<'_>,
     font: &BitmapFont<'_>,
@@ -397,16 +513,21 @@ pub(crate) async fn present_app_delta(
     // cap and escalate an incremental change to a full repaint. Merging adjacent
     // dirty cells into horizontal/vertical bands keeps a cleared row one band and a
     // contiguous collapse a handful, so line clears stay incremental.
+    let board_geometry_changed = !previous.board.geometry_eq(&current.board);
     let mut board_bands = [TileBand::default(); BOARD_BAND_CAP];
-    let board_band_count = coalesce_dirty_tiles(
-        GAME2D_BOARD_COLS,
-        GAME2D_BOARD_ROWS,
-        |col, row| {
-            let index = row * GAME2D_BOARD_COLS + col;
-            previous.board[index] != current.board[index]
-        },
-        &mut board_bands,
-    );
+    let board_band_count = if board_geometry_changed {
+        Some(0)
+    } else {
+        coalesce_dirty_tiles(
+            usize::from(current.board.columns),
+            usize::from(current.board.rows),
+            |col, row| {
+                let index = Game2dTilemap::cell_index(col, row);
+                previous.board.cells[index] != current.board.cells[index]
+            },
+            &mut board_bands,
+        )
+    };
     // `None` means the board fragmented past the band buffer; it cannot drop a
     // band, so treat it as a rect-count escalation (a full repaint covers all).
     let board_overflow = board_band_count.is_none();
@@ -487,8 +608,21 @@ pub(crate) async fn present_app_delta(
     // clear feeds a few band rects into the set instead of one rect per cell. A
     // board with no changes adds nothing, so free-fall frames stay incremental on
     // the command/sprite diff alone.
+    if board_geometry_changed {
+        for tilemap in [&previous.board, &current.board] {
+            if let Some(rect) = koto_gfx::tilemap_bounds_rect(tilemap, 320, 320) {
+                push_dirty(
+                    &mut dirty,
+                    &mut probe_len,
+                    &mut dirty_area,
+                    &mut probe_overflow,
+                    rect,
+                );
+            }
+        }
+    }
     for band in board_bands {
-        if let Some(rect) = board_band_rect(*band) {
+        if let Some(rect) = board_band_rect(*band, &current.board) {
             push_dirty(
                 &mut dirty,
                 &mut probe_len,
@@ -955,8 +1089,8 @@ fn full_screen_base_in(commands: &[AppDrawCommand]) -> Option<u16> {
 /// Pixel rect of a coalesced board band on the 320x320 surface, or `None` if it
 /// falls fully off-screen (KOTO-0135/0143). Dirty-derivation logic moved to
 /// koto-gfx (GFX-0003); the app surface is the fixed 320x320 panel.
-fn board_band_rect(band: TileBand) -> Option<Rect> {
-    koto_gfx::board_band_rect(band, 320, 320)
+fn board_band_rect(band: TileBand, tilemap: &Game2dTilemap) -> Option<Rect> {
+    koto_gfx::board_band_rect(band, tilemap, 320, 320)
 }
 
 /// Dirty rect for sprite `index`: the union of its old (previous-frame) and new

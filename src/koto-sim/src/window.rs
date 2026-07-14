@@ -5,7 +5,9 @@
 //! can be driven by hand. Compiled only when the `window` feature is enabled,
 //! keeping headless builds and CI dependency-free.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use koto_core::runtime::{audio_id, text_intent};
@@ -17,7 +19,22 @@ use koto_core::{
 use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 
 use crate::audio::{SimAudio, DEFAULT_SAMPLE_RATE};
-use crate::{framebuffer_to_argb, AppFailureSummary, BytecodeAppSession, Framebuffer};
+use crate::{
+    framebuffer_to_argb, parse_app_script, AppFailureSummary, BytecodeAppSession, Framebuffer,
+};
+
+/// Launch straight into an app instead of the shell (`--window --app`), with
+/// the optional KOTO-0191 live-reload loop.
+pub struct DirectApp {
+    pub app_id: String,
+    /// Directory tree to poll for changes (`--watch apps/<dir>`); a change
+    /// rebuilds the app (`python harness/build_apps.py --app <id>`) and
+    /// relaunches it in the same window.
+    pub watch_dir: Option<PathBuf>,
+    /// App input script replayed after every (re)launch (`--watch-replay`),
+    /// landing back at the scene being iterated on.
+    pub replay: Option<PathBuf>,
+}
 
 #[derive(Debug)]
 pub enum WindowError {
@@ -37,6 +54,7 @@ pub fn run(
     mut shell: ShellState,
     font_bytes: &[u8],
     root: &std::path::Path,
+    direct: Option<DirectApp>,
 ) -> Result<(), WindowError> {
     let font = BitmapFont::from_bytes(font_bytes).map_err(WindowError::Font)?;
 
@@ -86,6 +104,35 @@ pub fn run(
     shell.paint(&mut framebuffer.as_canvas(), &font);
     let mut mode = WindowMode::Shell;
 
+    // `--window --app`: skip the shell and start inside the app, optionally
+    // with the KOTO-0191 watch loop (rebuild + relaunch on source change).
+    let mut watcher = None;
+    if let Some(direct) = direct {
+        let name = shell
+            .packages()
+            .iter()
+            .find(|package| package.app_id() == direct.app_id)
+            .map(|package| package.name().to_string())
+            .unwrap_or_else(|| direct.app_id.clone());
+        println!("direct launch: {} ({})", name, direct.app_id);
+        let mut run = AppRun::launch(&name, &direct.app_id, &audio);
+        replay_script(&mut run, direct.replay.as_deref());
+        paint_app_run(&mut framebuffer, &font, &run);
+        mode = WindowMode::App(Box::new(run));
+        if let Some(dir) = direct.watch_dir {
+            println!(
+                "watching {} (save a file to rebuild + relaunch{})",
+                dir.display(),
+                if direct.replay.is_some() {
+                    " + replay"
+                } else {
+                    ""
+                }
+            );
+            watcher = Some(WatchState::new(direct.app_id, name, dir, direct.replay));
+        }
+    }
+
     println!(
         "KotoSim window: arrows move/cursor, Enter launch/newline, Backspace toggle details pane, \
          F2 favorite, F3 sort, F4 category, letters type, F1 IME on/off, Tab convert, \
@@ -94,6 +141,29 @@ pub fn run(
     );
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // KOTO-0191 watch loop: on the poll cadence, a change under the watched
+        // tree rebuilds the app and relaunches it in this window. A failed
+        // build keeps the running session (fix the source and save to retry);
+        // its diagnostics go to the console in the `$koto` matcher format.
+        if let Some(watch) = watcher.as_mut() {
+            if watch.poll_changed() {
+                println!("watch: change under {}, rebuilding...", watch.dir.display());
+                let started = std::time::Instant::now();
+                if watch.rebuild() {
+                    println!(
+                        "watch: rebuilt {} in {:.2?}; relaunching",
+                        watch.app_id,
+                        started.elapsed()
+                    );
+                    let mut run = AppRun::launch(&watch.name, &watch.app_id, &audio);
+                    replay_script(&mut run, watch.replay.as_deref());
+                    paint_app_run(&mut framebuffer, &font, &run);
+                    mode = WindowMode::App(Box::new(run));
+                } else {
+                    println!("watch: build failed; keeping the running app (save again to retry)");
+                }
+            }
+        }
         match &mut mode {
             WindowMode::Shell => {
                 // Function-key shell commands (favorite / sort / category) persist
@@ -173,6 +243,137 @@ enum WindowMode {
     // Boxed: a live session embeds the VM heap and editor buffers, so the variant
     // is several KB larger than `Shell`.
     App(Box<AppRun>),
+}
+
+/// Watch poll cadence in window frames (~250 ms at the 60 fps target).
+const WATCH_POLL_FRAMES: u32 = 15;
+
+/// KOTO-0191 watch loop state: an mtime snapshot of the app's source tree
+/// plus what it takes to rebuild and relaunch the app.
+struct WatchState {
+    app_id: String,
+    name: String,
+    dir: PathBuf,
+    replay: Option<PathBuf>,
+    snapshot: Vec<(PathBuf, SystemTime)>,
+    countdown: u32,
+}
+
+impl WatchState {
+    fn new(app_id: String, name: String, dir: PathBuf, replay: Option<PathBuf>) -> Self {
+        let snapshot = scan_tree_sorted(&dir);
+        Self {
+            app_id,
+            name,
+            dir,
+            replay,
+            snapshot,
+            countdown: WATCH_POLL_FRAMES,
+        }
+    }
+
+    /// Counts down on the window cadence; on the poll frame, rescans the tree
+    /// and reports whether anything changed (add / remove / modify).
+    fn poll_changed(&mut self) -> bool {
+        self.countdown = self.countdown.saturating_sub(1);
+        if self.countdown > 0 {
+            return false;
+        }
+        self.countdown = WATCH_POLL_FRAMES;
+        let current = scan_tree_sorted(&self.dir);
+        if current == self.snapshot {
+            return false;
+        }
+        self.snapshot = current;
+        true
+    }
+
+    /// Rebuild just this app through the registry build (bytecode, images,
+    /// maps, assets — `harness/build_apps.py --app`). Stdio is inherited so
+    /// compiler diagnostics keep their `file:line:col` shape for both plain
+    /// terminals and the VS Code `$koto` problem matcher.
+    fn rebuild(&self) -> bool {
+        match std::process::Command::new("python")
+            .args(["harness/build_apps.py", "--app", &self.app_id])
+            .status()
+        {
+            Ok(status) => status.success(),
+            Err(error) => {
+                eprintln!("watch: failed to run harness/build_apps.py: {error}");
+                false
+            }
+        }
+    }
+}
+
+/// Collect `(path, mtime)` for every file under `dir`, sorted for comparison.
+/// Unreadable entries are skipped: a transient editor lock shows up as a
+/// change on the next poll rather than an error.
+fn scan_tree_sorted(dir: &Path) -> Vec<(PathBuf, SystemTime)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, SystemTime)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                walk(&path, out);
+            } else if file_type.is_file() {
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((path, modified));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    files.sort();
+    files
+}
+
+/// Replay a recorded app script into a fresh session so a (re)launch lands
+/// back at the scene being iterated on. Script problems are reported and
+/// leave the session at whatever frame it reached; a trap during replay
+/// surfaces exactly like a live trap.
+fn replay_script(run: &mut AppRun, script: Option<&Path>) {
+    let Some(path) = script else {
+        return;
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("watch replay: {}: {error}", path.display());
+            return;
+        }
+    };
+    let inputs = match parse_app_script(&text) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            eprintln!("watch replay: {}: {error:?}", path.display());
+            return;
+        }
+    };
+    let mut failure = None;
+    if let Ok(session) = &mut run.session {
+        for input in inputs {
+            if session.has_exited() {
+                break;
+            }
+            if session.step_frame(input).is_err() {
+                failure = Some(AppFailureSummary::trap(session.diagnostic()));
+                break;
+            }
+        }
+    }
+    if let Some(failure) = failure {
+        run.session = Err(failure);
+    }
 }
 
 struct AppRun {

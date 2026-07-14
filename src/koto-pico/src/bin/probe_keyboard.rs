@@ -3,7 +3,8 @@
 //! Polls the keyboard bridge at I2C address 0x1F (FIFO register 0x09), reports
 //! raw press/release codes, per-poll latency against the 16.67 ms frame budget,
 //! and the normalized buttons each candidate mapping would detect. Output is
-//! JSONL over USB CDC. This is the canonical keyboard bring-up probe; the
+//! JSONL over UART0 and, when connected, USB CDC. This is the canonical
+//! keyboard bring-up probe; the
 //! one-time chord-matrix campaign that selected `arrow-zxas` is archived under
 //! `bringup/archive/keyboard_matrix.rs`.
 //!
@@ -20,6 +21,7 @@ use embassy_rp::{
     bind_interrupts,
     i2c::{Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler},
     peripherals,
+    uart::{Config as UartConfig, UartTx},
     usb::{Driver, InterruptHandler as UsbInterruptHandler},
 };
 use embassy_time::{Instant, Timer};
@@ -28,6 +30,7 @@ use embassy_usb::{
     Builder, Config,
 };
 use koto_pico::{
+    board::BOARD_ID,
     keyboard::{
         key_name, HeldKeys, KeyEvent, CANDIDATES, FIFO_CAPACITY, FIFO_REGISTER, FRAME_PERIOD_MS,
         STABLE_SAMPLE_COUNT,
@@ -53,6 +56,10 @@ const MAX_EVENTS_PER_FRAME: usize = 4;
 const BANNER: &[u8] = concat!(
     "KotoOS KOTO-0067 keyboard-i2c v",
     env!("CARGO_PKG_VERSION"),
+    " board=",
+    env!("KOTO_BOARD_ID"),
+    " mcu=",
+    env!("KOTO_MCU_ID"),
     "\r\n"
 )
 .as_bytes();
@@ -62,13 +69,23 @@ const BANNER: &[u8] = concat!(
     entry = "cortex_m_rt::entry"
 )]
 async fn main(_spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    let p = koto_pico::board::split_peripherals(embassy_rp::init(Default::default()));
 
     let mut i2c_config = I2cConfig::default();
     i2c_config.frequency = BUS_HZ;
-    let mut keyboard = I2c::new_async(p.I2C1, p.PIN_7, p.PIN_6, Irqs, i2c_config);
+    let mut keyboard = I2c::new_async(
+        p.keyboard_i2c,
+        p.keyboard_sda,
+        p.keyboard_scl,
+        Irqs,
+        i2c_config,
+    );
 
-    let driver = Driver::new(p.USB, Irqs);
+    let mut uart_config = UartConfig::default();
+    uart_config.baudrate = 115_200;
+    let mut uart = UartTx::new_blocking(p.uart, p.uart_tx, uart_config);
+
+    let driver = Driver::new(p.usb, Irqs);
     let mut usb_config = Config::new(0xc0de, 0x0067);
     usb_config.manufacturer = Some("KotoOS");
     usb_config.product = Some("KotoOS keyboard I2C probe");
@@ -98,91 +115,114 @@ async fn main(_spawner: Spawner) {
         let mut previous = held;
         let mut stable_samples = 0u8;
         let mut sequence = 0u32;
+        let mut usb_was_connected = false;
 
+        let _ = uart.blocking_write(BANNER);
+        let _ =
+            uart.blocking_write(b"log=uart0 tx=GP0 baud=115200 format=jsonl usb_cdc=optional\r\n");
+        write_headers_uart(&mut uart, &mut line);
+
+        // Polling starts immediately. Native USB CDC is mirrored when present,
+        // but PicoCalc's mainboard UART path never has to satisfy a USB wait.
         loop {
-            cdc.wait_connection().await;
-            if write_packets(&mut cdc, BANNER).await.is_err() {
-                continue;
+            let usb_connected = cdc.dtr();
+            if usb_connected && !usb_was_connected {
+                let _ = write_packets(&mut cdc, BANNER).await;
+                for candidate in CANDIDATES {
+                    format_header(&mut line, candidate.name);
+                    let _ = write_packets(&mut cdc, line.as_bytes()).await;
+                }
             }
-            for candidate in CANDIDATES {
+            usb_was_connected = usb_connected;
+
+            let frame_start = Instant::now();
+            let mut changed = false;
+            let mut read_error = None;
+            let mut events = 0usize;
+
+            while events < FIFO_CAPACITY && events < MAX_EVENTS_PER_FRAME {
+                match read_event(&mut keyboard).await {
+                    Ok(event) if event.is_empty() => break,
+                    Ok(event) => {
+                        changed |= held.apply(event);
+                        events += 1;
+                    }
+                    Err(operation) => {
+                        read_error = Some(operation);
+                        break;
+                    }
+                }
+            }
+
+            if held == previous {
+                stable_samples = stable_samples.saturating_add(1);
+            } else {
+                stable_samples = 1;
+                previous = held;
+                changed = true;
+            }
+            let stable = stable_samples >= STABLE_SAMPLE_COUNT;
+            let poll_us = frame_start.elapsed().as_micros();
+
+            if let Some(operation) = read_error {
                 line.clear();
                 let _ = write!(
                     line,
-                    "{{\"kind\":\"keyboard_matrix_v1\",\"board\":\"picocalc-rp2040\",\"firmware\":\"unknown\",\"bus_hz\":{},\"candidate\":\"{}\",\"git\":\"unknown\",\"frame_ms\":{},\"stable_samples\":{}}}\r\n",
-                    BUS_HZ, candidate.name, FRAME_PERIOD_MS, STABLE_SAMPLE_COUNT
+                    "{{\"kind\":\"error\",\"seq\":{},\"bus_hz\":{},\"operation\":\"{}\",\"poll_us\":{}}}\r\n",
+                    sequence, BUS_HZ, operation, poll_us
                 );
-                if write_packets(&mut cdc, line.as_bytes()).await.is_err() {
-                    continue;
+                emit(&mut uart, &mut cdc, line.as_bytes()).await;
+            } else if changed || stable_samples == STABLE_SAMPLE_COUNT {
+                for candidate in CANDIDATES {
+                    format_sample(
+                        &mut line,
+                        sequence,
+                        candidate.name,
+                        &held,
+                        candidate.detected(&held),
+                        stable,
+                        poll_us,
+                    );
+                    emit(&mut uart, &mut cdc, line.as_bytes()).await;
                 }
             }
 
-            loop {
-                let frame_start = Instant::now();
-                let mut changed = false;
-                let mut read_error = None;
-                let mut events = 0usize;
-
-                while events < FIFO_CAPACITY && events < MAX_EVENTS_PER_FRAME {
-                    match read_event(&mut keyboard).await {
-                        Ok(event) if event.is_empty() => break,
-                        Ok(event) => {
-                            changed |= held.apply(event);
-                            events += 1;
-                        }
-                        Err(operation) => {
-                            read_error = Some(operation);
-                            break;
-                        }
-                    }
-                }
-
-                if held == previous {
-                    stable_samples = stable_samples.saturating_add(1);
-                } else {
-                    stable_samples = 1;
-                    previous = held;
-                    changed = true;
-                }
-                let stable = stable_samples >= STABLE_SAMPLE_COUNT;
-                let poll_us = frame_start.elapsed().as_micros();
-
-                if let Some(operation) = read_error {
-                    line.clear();
-                    let _ = write!(
-                        line,
-                        "{{\"kind\":\"error\",\"seq\":{},\"bus_hz\":{},\"operation\":\"{}\",\"poll_us\":{}}}\r\n",
-                        sequence, BUS_HZ, operation, poll_us
-                    );
-                    if write_packets(&mut cdc, line.as_bytes()).await.is_err() {
-                        break;
-                    }
-                } else if changed || stable_samples == STABLE_SAMPLE_COUNT {
-                    for candidate in CANDIDATES {
-                        format_sample(
-                            &mut line,
-                            sequence,
-                            candidate.name,
-                            &held,
-                            candidate.detected(&held),
-                            stable,
-                            poll_us,
-                        );
-                        if write_packets(&mut cdc, line.as_bytes()).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-
-                sequence = sequence.wrapping_add(1);
-                let elapsed_ms = frame_start.elapsed().as_millis();
-                if elapsed_ms < FRAME_PERIOD_MS {
-                    Timer::after_millis(FRAME_PERIOD_MS - elapsed_ms).await;
-                }
+            sequence = sequence.wrapping_add(1);
+            let elapsed_ms = frame_start.elapsed().as_millis();
+            if elapsed_ms < FRAME_PERIOD_MS {
+                Timer::after_millis(FRAME_PERIOD_MS - elapsed_ms).await;
             }
         }
     };
 
     join(usb_task, probe_task).await;
+}
+
+fn format_header(line: &mut LineBuffer, candidate: &str) {
+    line.clear();
+    let _ = write!(
+        line,
+        "{{\"kind\":\"keyboard_matrix_v1\",\"board\":\"{}\",\"firmware\":\"unknown\",\"bus_hz\":{},\"candidate\":\"{}\",\"git\":\"unknown\",\"frame_ms\":{},\"stable_samples\":{}}}\r\n",
+        BOARD_ID, BUS_HZ, candidate, FRAME_PERIOD_MS, STABLE_SAMPLE_COUNT
+    );
+}
+
+fn write_headers_uart(uart: &mut UartTx<'_, embassy_rp::uart::Blocking>, line: &mut LineBuffer) {
+    for candidate in CANDIDATES {
+        format_header(line, candidate.name);
+        let _ = uart.blocking_write(line.as_bytes());
+    }
+}
+
+async fn emit<'a>(
+    uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
+    cdc: &mut CdcAcmClass<'a, Driver<'a, peripherals::USB>>,
+    bytes: &[u8],
+) {
+    let _ = uart.blocking_write(bytes);
+    if cdc.dtr() {
+        let _ = write_packets(cdc, bytes).await;
+    }
 }
 
 async fn read_event(

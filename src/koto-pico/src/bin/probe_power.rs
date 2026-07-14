@@ -33,6 +33,10 @@ const REGISTER_SETTLE_US: u64 = 16_000;
 const BANNER: &[u8] = concat!(
     "KotoOS KOTO-0115 battery-power-uart v",
     env!("CARGO_PKG_VERSION"),
+    " board=",
+    env!("KOTO_BOARD_ID"),
+    " mcu=",
+    env!("KOTO_MCU_ID"),
     "\r\n"
 )
 .as_bytes();
@@ -42,15 +46,15 @@ const BANNER: &[u8] = concat!(
     entry = "cortex_m_rt::entry"
 )]
 async fn main(_spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    let p = koto_pico::board::split_peripherals(embassy_rp::init(Default::default()));
 
     let mut uart_config = UartConfig::default();
     uart_config.baudrate = 115_200;
-    let mut uart = UartTx::new_blocking(p.UART0, p.PIN_0, uart_config);
+    let mut uart = UartTx::new_blocking(p.uart, p.uart_tx, uart_config);
 
     let mut i2c_config = I2cConfig::default();
     i2c_config.frequency = BUS_HZ;
-    let mut bridge = I2c::new_blocking(p.I2C1, p.PIN_7, p.PIN_6, i2c_config);
+    let mut bridge = I2c::new_blocking(p.keyboard_i2c, p.keyboard_sda, p.keyboard_scl, i2c_config);
 
     Timer::after_secs(2).await;
     let _ = uart.blocking_write(BANNER);
@@ -64,19 +68,19 @@ async fn main(_spawner: Spawner) {
         let mut line = LineBuffer::new();
         let version_raw = read_register(&mut bridge, VERSION_REGISTER);
         match version_raw {
-            Ok(raw) => match decode_version(raw) {
+            Ok((raw, attempts)) => match decode_version(raw) {
                 Some(version) => {
                     let _ = write!(
                         line,
-                        "firmware available=true register=0x01 raw=[0x{:02x},0x{:02x}] version={}.{}\r\n",
-                        raw[0], raw[1], version.major, version.minor
+                        "firmware available=true register=0x01 raw=[0x{:02x},0x{:02x}] version={}.{} attempts={}\r\n",
+                        raw[0], raw[1], version.major, version.minor, attempts
                     );
                 }
                 None => {
                     let _ = write!(
                         line,
-                        "firmware available=false register=0x01 raw=[0x{:02x},0x{:02x}] reason=unexpected_marker\r\n",
-                        raw[0], raw[1]
+                        "firmware available=false register=0x01 raw=[0x{:02x},0x{:02x}] attempts={} reason=unexpected_marker\r\n",
+                        raw[0], raw[1], attempts
                     );
                 }
             },
@@ -93,7 +97,7 @@ async fn main(_spawner: Spawner) {
         line.clear();
         let battery_raw = read_register(&mut bridge, BATTERY_REGISTER);
         match battery_raw {
-            Ok(raw) => match decode_battery(raw) {
+            Ok((raw, attempts)) => match decode_battery(raw) {
                 Some(state) => {
                     let percent = match state {
                         PowerState::Percent { percent, .. } => percent,
@@ -105,17 +109,18 @@ async fn main(_spawner: Spawner) {
                     };
                     let _ = write!(
                         line,
-                        "battery available=true register=0x0b raw=[0x{:02x},0x{:02x}] percent={} mapped={:?}\r\n",
-                        raw[0], raw[1], percent, state
+                        "battery available=true register=0x0b raw=[0x{:02x},0x{:02x}] percent={} mapped={:?} attempts={}\r\n",
+                        raw[0], raw[1], percent, state, attempts
                     );
                 }
                 None => {
                     let _ = write!(
                         line,
-                        "battery available=false register=0x0b raw=[0x{:02x},0x{:02x}] mapped={:?} reason=no_battery_or_firmware_unavailable\r\n",
+                        "battery available=false register=0x0b raw=[0x{:02x},0x{:02x}] mapped={:?} attempts={} reason=no_battery_or_firmware_unavailable\r\n",
                         raw[0],
                         raw[1],
-                        PowerState::unknown()
+                        PowerState::unknown(),
+                        attempts
                     );
                 }
             },
@@ -140,16 +145,28 @@ async fn main(_spawner: Spawner) {
 fn read_register(
     bridge: &mut I2c<'_, peripherals::I2C1, embassy_rp::i2c::Blocking>,
     register: u8,
-) -> Result<[u8; 2], &'static str> {
-    bridge
-        .blocking_write(KeyboardPins::I2C_ADDRESS, &[register])
-        .map_err(|_| "register_write")?;
-    block_for(Duration::from_micros(REGISTER_SETTLE_US));
-    let mut raw = [0u8; 2];
-    bridge
-        .blocking_read(KeyboardPins::I2C_ADDRESS, &mut raw)
-        .map_err(|_| "register_read")?;
-    Ok(raw)
+) -> Result<([u8; 2], u8), &'static str> {
+    let mut last_error = "register_write";
+    for attempt in 1..=3 {
+        if bridge
+            .blocking_write(KeyboardPins::I2C_ADDRESS, &[register])
+            .is_err()
+        {
+            last_error = "register_write";
+            block_for(Duration::from_millis(100));
+            continue;
+        }
+        block_for(Duration::from_micros(REGISTER_SETTLE_US));
+        let mut raw = [0u8; 2];
+        match bridge.blocking_read(KeyboardPins::I2C_ADDRESS, &mut raw) {
+            Ok(()) => return Ok((raw, attempt)),
+            Err(_) => {
+                last_error = "register_read";
+                block_for(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(last_error)
 }
 
 fn write_line(uart: &mut UartTx<'_, embassy_rp::uart::Blocking>, line: &LineBuffer) {

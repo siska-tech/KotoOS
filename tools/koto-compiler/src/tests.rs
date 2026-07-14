@@ -586,6 +586,7 @@ fn game2d_tilemap_wrappers_emit_host_calls() {
         "tiles.koto",
         "
         fn main() {
+            game2d_configure_tilemap(0, 20, 12, -8, 24);
             game2d_clear_layer(0);
             game2d_set_tile(0, 3, 4, 512);
             game2d_present();
@@ -597,6 +598,7 @@ fn game2d_tilemap_wrappers_emit_host_calls() {
     for call in [
         "host_call game2d_set_tile",
         "host_call game2d_clear_layer",
+        "host_call game2d_configure_tilemap",
         "host_call game2d_present",
     ] {
         assert!(asm.contains(call), "missing {call} in:\n{asm}");
@@ -1418,4 +1420,80 @@ fn slot_map_attributes_functions_to_their_defining_files() {
         text.contains("\nfn main params=0 locals=1 footprint=1 src=test.koto:2"),
         "{text}"
     );
+}
+
+// ---- KOTO-0193: editor-facing compilation values ------------------------
+
+#[test]
+fn compile_source_returns_bytecode_slots_and_definition_symbols() {
+    let source = "const LIMIT = 42;\nfn helper(value: int) -> int { return value; }\nfn main() { exit(helper(LIMIT)); }\n";
+    let result = compile_source(CompileRequest::new("api.koto", source), &mut loader(&[]));
+    assert!(result.succeeded(), "{:?}", result.diagnostics);
+    assert_eq!(
+        result.bytecode.as_deref(),
+        Some(compile("api.koto", source).expect("legacy API").as_slice()),
+        "value API must preserve bytecode"
+    );
+    assert!(result.assembly.is_some());
+    let slots = result.slot_map.expect("slot map");
+    assert_eq!(slots.functions[0].name, "helper");
+
+    let limit = result
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "LIMIT")
+        .expect("const symbol");
+    assert_eq!(limit.kind, SymbolKind::Constant);
+    assert_eq!(limit.definition.file, "api.koto");
+    assert_eq!(
+        (limit.definition.start.line, limit.definition.start.column),
+        (1, 7)
+    );
+    assert_eq!(limit.definition.end.column, 12);
+
+    let parameter = result
+        .symbols
+        .iter()
+        .find(|symbol| symbol.kind == SymbolKind::Parameter)
+        .expect("parameter symbol");
+    assert_eq!(parameter.name, "value");
+    assert_eq!(parameter.container.as_deref(), Some("helper"));
+}
+
+#[test]
+fn overlay_loader_compiles_unsaved_include_buffer() {
+    let root = "include \"util.koto\";\nfn main() { exit(answer()); }\n";
+    // The fallback models the saved file. The overlay models an unsaved edit.
+    let mut resolver = OverlayLoader::new(loader(&[(
+        "util.koto",
+        "fn answer() -> int { return 1; }\n",
+    )]));
+    resolver.insert("./util.koto", "fn answer() -> int { return 42; }\n");
+    let result = compile_source(CompileRequest::new("main.koto", root), &mut resolver);
+    assert!(result.succeeded(), "{:?}", result.diagnostics);
+    let (run_result, _) = run_bytecode(result.bytecode.as_deref().expect("bytecode"));
+    assert_eq!(run_result, VmRunResult::Exited(42));
+    let answer = result
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "answer")
+        .expect("included function symbol");
+    assert_eq!(answer.definition.file, "util.koto");
+    assert_eq!(answer.definition.start.line, 1);
+}
+
+#[test]
+fn compile_source_maps_structured_diagnostic_to_overlay_file() {
+    let root = "include \"util.koto\";\nfn main() { exit(0); }\n";
+    let mut resolver = OverlayLoader::new(loader(&[]));
+    resolver.insert("util.koto", "fn broken( { }\n");
+    let result = compile_source(CompileRequest::new("main.koto", root), &mut resolver);
+    assert!(!result.succeeded());
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
+    let span = diagnostic.span.as_ref().expect("source span");
+    assert_eq!(span.file, "util.koto");
+    assert_eq!(span.start.line, 1);
+    assert!(span.start.column > 0);
+    assert!(diagnostic.message.contains("expected"), "{diagnostic}");
 }

@@ -1,0 +1,37 @@
+[package]
+name = "koto-psram"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Pure Rust no_std QPI PSRAM driver foundation for RP2040/RP2350 PicoCalc"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+diag = []
+dma = []
+rp2040-embassy = [
+    "dep:cortex-m-rt",
+    "dep:embassy-rp",
+    "dep:embassy-time",
+    "embassy-rp/unstable-pac",
+    "embassy-rp/rp2040",
+]
+rp235xa-embassy = [
+    "dep:cortex-m-rt",
+    "dep:embassy-rp",
+    "dep:embassy-time",
+    "embassy-rp/unstable-pac",
+    "embassy-rp/rp235xa",
+]
+rp2040-embassy-u8-direct-probe = []
+psram_fast_read_clkdiv2 = []
+
+[dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+cortex-m-rt = { version = "0.7.5", optional = true }
+embassy-rp = { version = "0.10.0", default-features = false, features = ["critical-section-impl", "time-driver"], optional = true }
+embassy-time = { version = "0.5.1", optional = true }

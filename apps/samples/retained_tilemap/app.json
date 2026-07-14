@@ -1,0 +1,38 @@
+{
+  "app_id": "dev.koto.samples.retained-tilemap",
+  "kind": "koto",
+  "package": "sample_retained_tilemap",
+  "name": "SDK Retained Tilemap",
+  "description": "Displays an editor-authored 20x20 map with the retained tilemap API.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "maps": {
+    "dir": "maps",
+    "width": 20,
+    "height": 20,
+    "glyphs": ".#~@",
+    "tileset": "sprites/tiles.kspr",
+    "tiles": {
+      ".": 0,
+      "#": 1,
+      "~": 2,
+      "@": 3
+    }
+  },
+  "images": [
+    {
+      "source": "sprites/tiles.kspr",
+      "output": "sprites/static_tiles.kim"
+    }
+  ]
+}

@@ -21,7 +21,7 @@
 //!   the budget *would* admit/degrade/reject for a frame's immediate command list
 //!   (GFX-0006B observe mode). It still drops nothing; enforcement is not enabled.
 //! - The retained layer data model ([`AppDrawCommand`], [`Game2dSprite`],
-//!   [`Game2dStampDef`], [`Game2dText`], [`Game2dBoard`], [`AppStaticLayer`]) —
+//!   [`Game2dStampDef`], [`Game2dText`], [`Game2dTilemap`], [`AppStaticLayer`]) —
 //!   the POD layout of the Game2D layers (GFX-0002). The firmware still owns the
 //!   *instances* and the VM hostcall dispatch and re-exports these types, so no
 //!   field byte, hostcall ID, or behaviour changes.
@@ -70,18 +70,20 @@ pub use budget::{
 };
 pub use convert::convert_rgb565_to_rgb666;
 pub use derive::{
-    board_band_rect, collect_immediate_dirty, command_dirty_rect, is_full_screen_base,
-    probe_command_shift_coalesce, push_dirty, sprite_dirty_rect, sprite_footprint_rect, stamp_cell,
-    text_dirty_rect, text_footprint_rect, CommandShiftProbe, EditRegionShape, MAX_EDIT_REGION,
+    board_band_rect, collect_immediate_dirty, collect_initial_scene_dirty, command_dirty_rect,
+    has_retained_scene_content, is_full_screen_base, probe_command_shift_coalesce, push_dirty,
+    sprite_dirty_rect, sprite_footprint_rect, stamp_cell, text_dirty_rect, text_footprint_rect,
+    tilemap_bounds_rect, CommandShiftProbe, EditRegionShape, MAX_EDIT_REGION,
 };
 pub use diag_profile::{DiagClass, DiagProfile};
 pub use dirty::{coalesce_dirty_tiles, coalesce_rects, TileBand};
 pub use font::{BitmapFont, FontError, Glyph};
 pub use layer::{
-    AppDrawCommand, AppStaticLayer, Game2dBoard, Game2dSprite, Game2dStampDef, Game2dText,
-    LayerFull, GAME2D_BOARD_CELLS, GAME2D_BOARD_COLS, GAME2D_BOARD_ROWS, GAME2D_ORIGIN_X,
-    GAME2D_ORIGIN_Y, GAME2D_STATIC_CMD_CAP, GAME2D_TEXT_BYTES, GAME2D_TILE_BYTES, GAME2D_TILE_PX,
-    MAX_APP_TEXT_BYTES,
+    is_persistent_pixels, pixel_heap_offset, AppDrawCommand, AppStaticLayer, Game2dSprite,
+    Game2dStampDef, Game2dText, Game2dTilemap, LayerFull, APP_DRAW_PERSISTENT_BIT,
+    GAME2D_LEGACY_COLS, GAME2D_LEGACY_ORIGIN_X, GAME2D_LEGACY_ORIGIN_Y, GAME2D_LEGACY_ROWS,
+    GAME2D_STATIC_CMD_CAP, GAME2D_TEXT_BYTES, GAME2D_TILEMAP_MAX_CELLS, GAME2D_TILEMAP_MAX_COLS,
+    GAME2D_TILEMAP_MAX_ROWS, GAME2D_TILE_BYTES, GAME2D_TILE_PX, MAX_APP_TEXT_BYTES,
 };
 pub use observe::{classify_command, BudgetObservation};
 pub use paint::{

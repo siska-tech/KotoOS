@@ -60,6 +60,56 @@ and is tracked by KOTO-0185.
 | [KOTO-0185](issues/main/KOTO-0185-sokoban-broken.md)                        | todo   | Sokoban does not work correctly                          |
 | [KOTO-0186](issues/main/KOTO-0186-core1-audio-worker-stack-overflow.md)     | todo   | Core1 audio worker stack overflow under LTO (deferred to post-KOTO-0180) |
 
+### KotoIDE Toolset
+
+Filed 2026-07-13 from the [KotoIDE roadmap](planning/KOTOIDE_ROADMAP.md) —
+code/graphics/sound authoring, conversion, and audition tooling. Phase 1
+(KOTO-0187..0189) items are independent; Phase 2 builds on Phase 1; Phase 3
+(language intelligence) is deliberately last. The cue-table dry-run and
+retained-layer inspector candidates stay in KOTO-0184.
+
+| Issue                                                                  | Status | Title                                                  |
+| :--------------------------------------------------------------------- | :----- | :------------------------------------------------------ |
+| [KOTO-0187](issues/main/KOTO-0187-koto-img-sprite-converter.md)             | done   | koto-img — PNG ↔ .kspr sprite converter                  |
+| [KOTO-0188](issues/main/KOTO-0188-kmml-audition-cli.md)                     | done   | .kmml audition — render to WAV and play on the host      |
+| [KOTO-0189](issues/main/KOTO-0189-kwt-pcm16-bake.md)                        | done   | Bake Native KotoAudio phrases to PCM16 KACL clips |
+| [KOTO-0190](issues/main/KOTO-0190-vscode-extension-foundation.md)           | done   | VS Code extension foundation (grammars, tasks, matcher)  |
+| [KOTO-0191](issues/main/KOTO-0191-sim-watch-live-reload.md)                 | done   | koto-sim --watch — live reload on source/asset change    |
+| [KOTO-0192](issues/main/KOTO-0192-asset-custom-editors.md)                  | done   | VS Code custom editors for .kspr and .kmml               |
+| [KOTO-0193](issues/main/KOTO-0193-compiler-library-diagnostics.md)          | done   | koto-compiler library split with structured diagnostics  |
+| [KOTO-0194](issues/main/KOTO-0194-koto-lsp.md)                              | in-progress | koto-lsp — live diagnostics, definitions, budget inlays |
+| [KOTO-0195](issues/main/KOTO-0195-per-app-descriptor.md)                    | done   | Per-app app.json descriptor (split apps/apps.json)       |
+| [KOTO-0196](issues/main/KOTO-0196-app-json-schema-icon-editor.md)           | done   | app.json authoring + .kicon editor in VS Code            |
+| [KOTO-0197](issues/main/KOTO-0197-vscode-new-app-project-wizard.md)         | in-progress | VS Code new-app project wizard                       |
+| [KOTO-0198](issues/main/KOTO-0198-vscode-tilemap-editor.md)                 | in-progress | VS Code tilemap editor                               |
+| [KOTO-0199](issues/main/KOTO-0199-generic-retained-tilemap.md)              | done   | Generic 20x20 retained tilemap geometry                  |
+| [KOTO-0200](issues/main/KOTO-0200-retained-tilemap-samples.md)              | done   | Retained tilemap display and scrolling samples           |
+| [KOTO-0201](issues/main/KOTO-0201-retained-first-present-without-base.md)    | done   | Retained first present without a full-screen base         |
+| [KOTO-0202](issues/main/KOTO-0202-package-map-assets.md)                     | done   | Package-authored map assets                               |
+| [KOTO-0203](issues/main/KOTO-0203-vscode-tilemap-kspr-preview.md)             | done   | VS Code tilemap `.kspr` preview                           |
+
+### RP2350 / Pico 2 Compatibility
+
+Filed 2026-07-14 from PicoCalc community feedback. The available RP2350A Pico
+2 W is the first implementation and hardware-validation target. RP2350B and
+the Pico Plus 2(W) module-PSRAM backend follow after that gate. See the
+[RP2350 support roadmap](planning/RP2350_SUPPORT_ROADMAP.md).
+
+| Issue                                                                  | Status | Title                                                  |
+| :--------------------------------------------------------------------- | :----- | :----------------------------------------------------- |
+| [KOTO-0204](issues/main/KOTO-0204-rp2350-build-board-profiles.md)          | done   | RP2350A Pico 2 W build foundation                     |
+| [KOTO-0205](issues/main/KOTO-0205-rp2350-picocalc-peripheral-parity.md)    | in-progress | RP2350A Pico 2 W PicoCalc peripheral parity       |
+| [KOTO-0206](issues/main/KOTO-0206-pico-plus-2-onboard-psram.md)            | todo   | RP2350B Pico Plus 2(W) and onboard PSRAM backend      |
+
+### Storage Performance
+
+Filed 2026-07-14 after the full-color streaming sample exposed 1 MHz SD
+throughput and audio starvation during image loads.
+
+| Issue                                                                  | Status      | Title                                      |
+| :--------------------------------------------------------------------- | :---------- | :----------------------------------------- |
+| [KOTO-0207](issues/main/KOTO-0207-sd-spi-init-and-throughput.md)         | done        | SD SPI initialization and transfer throughput |
+
 ### Cleanup And Planning
 
 | Issue                                                          | Status | Title                                   |

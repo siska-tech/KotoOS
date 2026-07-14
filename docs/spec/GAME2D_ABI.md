@@ -68,6 +68,18 @@
 > tight CJK width metrics). `HOST_ABI_MINOR` → 15. The full `0x14`–`0x1F` Game2D
 > block is now implemented; immediate `draw_*` is debug/overlay/transition/fallback
 > only. See [KOTO-0141](../issues/main/KOTO-0141-retained-text-layer.md).
+>
+> **Status update (KOTO-0199, generic tilemap geometry).** Host ABI minor `16`
+> adds an explicit configuration call outside the full `0x14`–`0x1F` block:
+>
+> | ID | Name | Stack args | Effect |
+> | :-- | :--- | :--------- | :----- |
+> | `0x22` | `game2d_configure_tilemap` | `layer columns rows origin_x origin_y` | Clear/configure layer 0 with a 1..20 by 1..20 active grid and signed pixel origin. |
+>
+> Storage is a fixed 20x20 array with no runtime allocation; the active shape
+> controls bounds, painting, and dirty coalescing. Tiles remain 16x16 RGB565.
+> Geometry changes dirty both old and new clipped bounds. Legacy apps that never
+> call configure retain KotoBlocks' 10x20 origin `(8, 0)` behavior.
 
 The remainder of this document is the original **design** rationale, retained for
 the responsibility split and the not-yet-implemented sprite/tile-cache surface.

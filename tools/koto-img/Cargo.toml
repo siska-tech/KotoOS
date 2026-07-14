@@ -1,0 +1,9 @@
+[package]
+name = "koto-img"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Host-tool-only PNG codec (KOTO-0187); never linked into firmware or the sim.
+png = "0.17"

@@ -34,6 +34,8 @@ pub struct ConvertOptions {
     pub target_sample_rate_hz: u32,
     /// Reject non-mono or mismatched sample-rate input instead of converting it.
     pub strict_input: bool,
+    /// Optional cap applied after downmix/resampling. Useful for bounded one-shot assets.
+    pub max_output_samples: Option<usize>,
 }
 
 impl Default for ConvertOptions {
@@ -47,6 +49,7 @@ impl Default for ConvertOptions {
             output_codec: OutputCodec::Pcm16,
             target_sample_rate_hz: limits.sample_rate_hz,
             strict_input: false,
+            max_output_samples: None,
         }
     }
 }
@@ -602,7 +605,7 @@ pub fn convert_wav_to_clip_asset(
     let downmix_applied = wav.channels != u16::from(PCM16_MONO_CHANNELS);
     let resample_applied = wav.sample_rate_hz != options.target_sample_rate_hz;
     let mono_samples = wav_mono_samples(wav)?;
-    let reference_samples = if resample_applied {
+    let mut reference_samples = if resample_applied {
         resample_linear(
             &mono_samples,
             wav.sample_rate_hz,
@@ -611,6 +614,9 @@ pub fn convert_wav_to_clip_asset(
     } else {
         mono_samples
     };
+    if let Some(max_samples) = options.max_output_samples {
+        reference_samples.truncate(max_samples);
+    }
     let pcm16_payload = pcm16_payload_from_samples(&reference_samples);
     let sample_count = u32::try_from(reference_samples.len())
         .map_err(|_| ConvertError::UnsupportedWav("WAV is too large"))?;
@@ -2241,6 +2247,23 @@ mod tests {
         assert_eq!(output.report.source_channels, 2);
         assert_eq!(output.report.original_frame_count, 1);
         assert_eq!(output.report.output_sample_count, 1);
+    }
+
+    #[test]
+    fn converter_can_bound_a_one_shot_after_conversion() {
+        let payload = pcm16_payload(&[100, 200, 300, 400, 500]);
+        let input = wav(1, 16_000, 16, &payload);
+        let options = ConvertOptions {
+            max_output_samples: Some(3),
+            ..ConvertOptions::default()
+        };
+
+        let output = convert_wav_to_clip_asset("bounded.wav", &input, options).unwrap();
+        let clip = parse_clip_asset(&output.asset_bytes, AudioLimits::v0_default()).unwrap();
+        assert_eq!(clip.sample_count, 3);
+        assert_eq!(clip.payload, pcm16_payload(&[100, 200, 300]));
+        assert_eq!(output.report.original_frame_count, 5);
+        assert_eq!(output.report.output_sample_count, 3);
     }
 
     #[test]

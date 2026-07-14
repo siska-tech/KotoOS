@@ -31,7 +31,7 @@ use koto_pico::firmware::audio::{PicoAudioBackend, AUDIO_CORE1_STACK_BYTES};
 use koto_pico::firmware::config::{
     FirmwareClock, CODE_WINDOW_TILES, CODE_WINDOW_TOTAL_BYTES, KICON_BYTES, MANIFEST_LFN_BYTES,
     MAX_DEVICE_HEAP_BYTES, MAX_EVENTS_PER_FRAME, MAX_MANIFEST_BYTES, POWER_POLL_MS,
-    RASTER_STRIP_BYTES, RGB666_STRIP_BYTES, SD_FAST_SPI_HZ, SYSTEM_STATUS_RECT,
+    RASTER_STRIP_BYTES, RGB666_STRIP_BYTES, SD_ACQUIRE_SPI_HZ, SYSTEM_STATUS_RECT,
 };
 use koto_pico::firmware::diag::{log_paint_metrics, uart_log, uart_write_line};
 use koto_pico::firmware::power::poll_power_state;
@@ -44,6 +44,7 @@ use koto_pico::firmware::splash_render::{paint_splash, paint_splash_step};
 use koto_pico::firmware::stack_canary;
 use koto_pico::firmware::storage::{fill_fallback, initialize_sd_card, load_packages};
 use koto_pico::{
+    board::{BOARD_ID, MCU_ID},
     dashboard::LineBuffer,
     firmware::FirmwareInput,
     keyboard::{
@@ -158,15 +159,18 @@ async fn main(_spawner: Spawner) {
     // KOTO-0170 Stage 0: paint the free RAM gap before anything with a deep
     // call tree runs, so the phase=176 low-water scans measure the whole boot.
     stack_canary::paint();
-    let p = embassy_rp::init(Default::default());
+    let p = koto_pico::board::split_peripherals(embassy_rp::init(Default::default()));
 
     let mut uart_config = UartConfig::default();
     uart_config.baudrate = 115_200;
-    let mut uart = UartTx::new_blocking(p.UART0, p.PIN_0, uart_config);
+    let mut uart = UartTx::new_blocking(p.uart, p.uart_tx, uart_config);
     uart_log(
         &mut uart,
         "KotoOS firmware diagnostics KOTO-0119\r\nphase=10 uart-ready baud=115200 format=8N1\r\nphase=10 fw-tag=k0150-flashprobe-v1\r\n",
     );
+    let mut board_line = LineBuffer::new();
+    let _ = write!(board_line, "phase=10 board={} mcu={}\r\n", BOARD_ID, MCU_ID);
+    uart_write_line(&mut uart, &board_line);
     // The mainboard UART bridge may already be enumerated while the terminal
     // opens after reset. Repeat the banner long enough for it to be observed.
     for _ in 0..6 {
@@ -177,12 +181,14 @@ async fn main(_spawner: Spawner) {
 
     let mut spi_config = SpiConfig::default();
     spi_config.frequency = ILI9488_SPI.spi_hz;
-    let spi = Spi::new_txonly(p.SPI1, p.PIN_10, p.PIN_11, p.DMA_CH0, Irqs, spi_config);
+    let spi = Spi::new_txonly(
+        p.lcd_spi, p.lcd_sck, p.lcd_mosi, p.dma_ch0, Irqs, spi_config,
+    );
     let mut lcd = PicoCalcLcd::new(
         spi,
-        Output::new(p.PIN_13, Level::High),
-        Output::new(p.PIN_14, Level::High),
-        Output::new(p.PIN_15, Level::High),
+        Output::new(p.lcd_cs, Level::High),
+        Output::new(p.lcd_dc, Level::High),
+        Output::new(p.lcd_reset, Level::High),
         &ILI9488_SPI,
     );
 
@@ -191,27 +197,27 @@ async fn main(_spawner: Spawner) {
     // Use the same blocking STM32 bridge path validated by KOTO-0067 and
     // KOTO-0115. The async read path worked for the keyboard FIFO but failed
     // repeatedly on the slower battery-register response.
-    let mut keyboard = I2c::new_blocking(p.I2C1, p.PIN_7, p.PIN_6, i2c_config);
+    let mut keyboard =
+        I2c::new_blocking(p.keyboard_i2c, p.keyboard_sda, p.keyboard_scl, i2c_config);
     let mut audio_pwm = PwmConfig::default();
     audio_pwm.divider = 32u8.into();
     audio_pwm.top = 1_000;
     audio_pwm.compare_a = 500;
     audio_pwm.compare_b = 500;
-    let audio_pwm = Pwm::new_output_ab(p.PWM_SLICE5, p.PIN_26, p.PIN_27, audio_pwm);
+    let audio_pwm = Pwm::new_output_ab(p.audio_pwm, p.audio_a, p.audio_b, audio_pwm);
     let mut audio = PicoAudioBackend::spawn_cpu1(
-        p.CORE1,
+        p.core1,
         unsafe { &mut *addr_of_mut!(AUDIO_CORE1_STACK) },
         audio_pwm,
     );
     // PicoCalc SD detect is active-low on GP22. Removal is supported as a
     // fail-safe transition; reinsertion requires reboot/remount.
-    let sd_detect = Input::new(p.PIN_22, Pull::Up);
+    let sd_detect = Input::new(p.sd_detect, Pull::Up);
 
     let mut sd_spi_config = SpiConfig::default();
-    sd_spi_config.frequency = SD_FAST_SPI_HZ;
-    let sd_spi = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_16, sd_spi_config);
-    let sd_device =
-        ExclusiveDevice::new(sd_spi, Output::new(p.PIN_17, Level::High), Delay).unwrap();
+    sd_spi_config.frequency = SD_ACQUIRE_SPI_HZ;
+    let sd_spi = Spi::new_blocking(p.sd_spi, p.sd_sck, p.sd_mosi, p.sd_miso, sd_spi_config);
+    let sd_device = ExclusiveDevice::new(sd_spi, Output::new(p.sd_cs, Level::High), Delay).unwrap();
     let sdcard = SdCard::new(sd_device, Delay);
 
     // Bring up the PicoCalc PSRAM (PIO1, GP20/21/2/3) so large apps can stage
@@ -230,17 +236,17 @@ async fn main(_spawner: Spawner) {
         ),
         allow(unused_mut)
     )]
-    let mut pio1 = Pio::new(p.PIO1, Irqs);
+    let mut pio1 = Pio::new(p.psram_pio, Irqs);
     #[cfg(feature = "psram_qpi_safe_read_code_window")]
     let mut psram = match PicoCalcQpiPsram::new(
         &mut pio1.common,
         pio1.sm0,
-        p.PIN_20,
-        p.PIN_21,
-        p.PIN_2,
-        p.PIN_3,
-        p.PIN_4,
-        p.PIN_5,
+        p.psram_cs,
+        p.psram_sck,
+        p.psram_sio0,
+        p.psram_sio1,
+        p.psram_sio2,
+        p.psram_sio3,
     ) {
         Ok(hal_base) => match koto_pico::psram::QpiCodeWindowPsram::new(hal_base) {
             Ok(hal) => PsramBlocks::try_new(hal, PSRAM_CAPACITY).ok(),
@@ -259,11 +265,37 @@ async fn main(_spawner: Spawner) {
         let psram_hal_base = PicoCalcPsram::new(
             &mut pio1.common,
             pio1.sm0,
-            p.PIN_20,
-            p.PIN_21,
-            p.PIN_2,
-            p.PIN_3,
+            p.psram_cs,
+            p.psram_sck,
+            p.psram_sio0,
+            p.psram_sio1,
         );
+        let identity = psram_hal_base.identity();
+        let state = psram_hal_base.diag_state();
+        let mut line = LineBuffer::new();
+        let _ = write!(
+            line,
+            "phase=17 psram-device-id backend=picocalc-pio1 raw={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} manufacturer=0x{:02x} kgd=0x{:02x} density=0x{:02x} valid={} sys_hz={} pio_sm_hz={} serial_hz={} clkdiv={}.{} forced_fallback={}\r\n",
+            identity.raw[0],
+            identity.raw[1],
+            identity.raw[2],
+            identity.raw[3],
+            identity.raw[4],
+            identity.raw[5],
+            identity.raw[6],
+            identity.raw[7],
+            identity.manufacturer,
+            identity.known_good_die,
+            identity.density,
+            identity.is_aps6404_8m(),
+            embassy_rp::clocks::clk_sys_freq(),
+            state.sm_hz,
+            state.sm_hz / u32::from(state.cycles_per_bit),
+            state.clkdiv,
+            state.clkdiv_frac,
+            cfg!(feature = "force_psram_fallback"),
+        );
+        uart_write_line(&mut uart, &line);
         #[cfg(feature = "psram_dma_read_code_window")]
         let psram_hal: FirmwarePsramHal<'_> =
             koto_pico::psram::DmaCodeWindowPsram::new(psram_hal_base);
@@ -281,7 +313,7 @@ async fn main(_spawner: Spawner) {
     // `psram_fast_code_window` implies the default backend (enforced in
     // `psram_ext`), so this binding only exists in that build.
     #[cfg(feature = "psram_fast_code_window")]
-    let psram_rx_dma = dma::Channel::new(p.DMA_CH1, Irqs);
+    let psram_rx_dma = dma::Channel::new(p.psram_rx_dma, Irqs);
     #[cfg(all(
         not(feature = "psram_qpi_safe_read_code_window"),
         not(feature = "psram_dma_read_code_window"),
@@ -290,12 +322,12 @@ async fn main(_spawner: Spawner) {
     let mut psram = match KotoPsram::new(
         pio1.common,
         pio1.sm0,
-        p.PIN_20,
-        p.PIN_21,
-        p.PIN_2,
-        p.PIN_3,
-        p.PIN_4,
-        p.PIN_5,
+        p.psram_cs,
+        p.psram_sck,
+        p.psram_sio0,
+        p.psram_sio1,
+        p.psram_sio2,
+        p.psram_sio3,
         #[cfg(feature = "psram_fast_code_window")]
         psram_rx_dma,
     ) {

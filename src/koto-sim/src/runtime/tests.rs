@@ -590,7 +590,7 @@ mod tests {
 
     /// The committed memo bytecode, compiled from `apps/memo/src/main.koto` and
     /// kept in sync by the app build loop. The validation drives this real app.
-    const REAL_MEMO_KBC: &[u8] = include_bytes!("../../../../sdcard_mock/bytecode/memo.kbc");
+    const REAL_MEMO_KBC: &[u8] = include_bytes!("../../../../package_inputs/bytecode/memo.kbc");
 
     #[test]
     fn memo_validation_drives_bytecode_app_end_to_end() {
@@ -1495,23 +1495,56 @@ mod tests {
     /// The real KotoBlocks bytecode app, kept in sync by the app build loop. The
     /// KOTO-0163 validation below drives its audio the way the shell would.
     const REAL_KOTO_BLOCKS_KBC: &[u8] =
-        include_bytes!("../../../../sdcard_mock/bytecode/koto_blocks.kbc");
+        include_bytes!("../../../../package_inputs/bytecode/koto_blocks.kbc");
 
     const KOTO_BLOCKS_APP_ID: &str = "dev.koto.games.koto-blocks";
 
     /// Stage a minimal KotoBlocks package: the real `.kbc` plus a manifest that
     /// declares the audio asset paths (the `asset_paths` permission the audio
-    /// hostcalls check) and the app's SRAM/PSRAM budget. The KotoBlocks asset paths
-    /// route straight to the primary sequence bridge without reading the `.kmml`
-    /// payloads, so no audio files need to exist on disk.
+    /// hostcalls check), the real SD-resident KMML payloads, and the app's
+    /// SRAM/PSRAM budget.
     fn write_koto_blocks_package(root: &Path) {
         fs::create_dir_all(root.join("apps")).unwrap();
         fs::create_dir_all(root.join("bytecode")).unwrap();
+        fs::create_dir_all(root.join("audio")).unwrap();
         fs::write(
             root.join("bytecode").join("koto_blocks.kbc"),
             REAL_KOTO_BLOCKS_KBC,
         )
         .unwrap();
+        const AUDIO: &[(&str, &[u8])] = &[
+            (
+                "koto_blocks_bgm.kmml",
+                include_bytes!("../../../../apps/koto_blocks/audio/bgm.kmml"),
+            ),
+            (
+                "koto_blocks_move.kmml",
+                include_bytes!("../../../../apps/koto_blocks/audio/move.kmml"),
+            ),
+            (
+                "koto_blocks_rotate.kmml",
+                include_bytes!("../../../../apps/koto_blocks/audio/rotate.kmml"),
+            ),
+            (
+                "koto_blocks_lock.kmml",
+                include_bytes!("../../../../apps/koto_blocks/audio/lock.kmml"),
+            ),
+            (
+                "koto_blocks_clear.kmml",
+                include_bytes!("../../../../apps/koto_blocks/audio/clear.kmml"),
+            ),
+            (
+                "koto_blocks_tetris.kmml",
+                include_bytes!("../../../../apps/koto_blocks/audio/tetris.kmml"),
+            ),
+            (
+                "koto_blocks_over.kmml",
+                include_bytes!("../../../../apps/koto_blocks/audio/over.kmml"),
+            ),
+        ];
+        for (name, bytes) in AUDIO {
+            fs::write(root.join("audio").join(name), bytes).unwrap();
+        }
         fs::write(
             root.join("apps").join("koto_blocks.kpa.json"),
             r#"{
@@ -1536,13 +1569,11 @@ mod tests {
         .unwrap();
     }
 
-    /// KOTO-0163: the real KotoBlocks app drives the **primary** KotoAudio
-    /// generated-sequence bridge for BGM and SFX — not the deprecated legacy MML
-    /// synth — and that primary path renders non-silent audio while a normal play
-    /// cadence drops no SFX cue. Guards against the exact-path routing drifting out
-    /// of sync with the app's asset paths (which would silently fall back to legacy).
+    /// The real KotoBlocks app reads its mounted KMML payloads and drives the
+    /// owned Native KotoAudio BGM/SFX players. The runtime path renders
+    /// non-silent audio under a normal gameplay cadence.
     #[test]
-    fn koto_blocks_app_drives_primary_seq_audio_not_legacy() {
+    fn koto_blocks_app_drives_sd_loaded_native_audio() {
         use koto_core::runtime::text_intent as ti;
         let root = test_root("koto_blocks_seq_audio");
         write_koto_blocks_package(&root);
@@ -1568,17 +1599,13 @@ mod tests {
             "start frame must issue the BGM asset hostcall"
         );
 
-        // The BGM asset routed to the primary sequence bridge: `seq` exists (the
-        // legacy MML BGM path never creates it) and a BGM source was admitted.
+        // The mounted KMML payload was compiled into the owned KotoAudio player.
         {
             let audio = session.audio_handle();
             let audio = audio.lock().unwrap();
-            let snapshot = audio
-                .seq_counter()
-                .expect("KotoBlocks BGM must route to the primary sequence bridge, not legacy MML");
             assert!(
-                snapshot.bgm_start_count >= 1,
-                "primary BGM source was not admitted"
+                audio.runtime_bgm_active(),
+                "SD-loaded Native KMML BGM was not admitted"
             );
         }
 
@@ -1602,7 +1629,10 @@ mod tests {
             }
         }
 
-        assert!(sfx_events > 0, "gameplay inputs raised no SFX asset hostcalls");
+        assert!(
+            sfx_events > 0,
+            "gameplay inputs raised no SFX asset hostcalls"
+        );
         assert!(
             samples.iter().any(|&sample| sample != 0),
             "primary audio path rendered only silence"
@@ -1614,13 +1644,8 @@ mod tests {
             let audio = session.audio_handle();
             let audio = audio.lock().unwrap();
             assert!(
-                audio.seq_bgm_active(),
+                audio.runtime_bgm_active(),
                 "BGM should still be looping during play"
-            );
-            let snapshot = audio.seq_counter().unwrap();
-            assert_eq!(
-                snapshot.dropped_source_count, 0,
-                "no SFX cue should be dropped under a normal gameplay cadence"
             );
         }
 
@@ -1634,37 +1659,49 @@ mod tests {
         (
             "dev.koto.samples.hello-text",
             "sample_hello_text.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/sample_hello_text.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/sample_hello_text.kbc"),
         ),
         (
             "dev.koto.samples.input-echo",
             "sample_input_echo.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/sample_input_echo.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/sample_input_echo.kbc"),
         ),
         (
             "dev.koto.samples.counter-loop",
             "sample_counter_loop.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/sample_counter_loop.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/sample_counter_loop.kbc"),
         ),
         (
             "dev.koto.samples.file-note",
             "sample_file_note.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/sample_file_note.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/sample_file_note.kbc"),
         ),
         (
             "dev.koto.samples.ime-playground",
             "sample_ime_playground.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/sample_ime_playground.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/sample_ime_playground.kbc"),
         ),
         (
             "dev.koto.samples.dirty-rects",
             "sample_dirty_rects.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/sample_dirty_rects.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/sample_dirty_rects.kbc"),
         ),
         (
             "dev.koto.samples.actor-array",
             "sample_actor_array.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/sample_actor_array.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/sample_actor_array.kbc"),
+        ),
+        (
+            "dev.koto.samples.retained-tilemap",
+            "sample_retained_tilemap.kbc",
+            include_bytes!("../../../../package_inputs/bytecode/sample_retained_tilemap.kbc"),
+        ),
+        (
+            "dev.koto.samples.retained-tilemap-scroll",
+            "sample_retained_tilemap_scroll.kbc",
+            include_bytes!(
+                "../../../../package_inputs/bytecode/sample_retained_tilemap_scroll.kbc"
+            ),
         ),
     ];
 
@@ -1672,6 +1709,31 @@ mod tests {
         fs::create_dir_all(root.join("apps")).unwrap();
         fs::create_dir_all(root.join("bytecode")).unwrap();
         fs::write(root.join("bytecode").join(file_name), bytecode).unwrap();
+        let assets = match app_id {
+            "dev.koto.samples.retained-tilemap" => {
+                fs::create_dir_all(root.join("maps")).unwrap();
+                fs::write(
+                    root.join("maps").join("world.map"),
+                    include_bytes!(
+                        "../../../../apps/samples/retained_tilemap/maps/world.map"
+                    ),
+                )
+                .unwrap();
+                r#", "assets": [{ "path": "maps/world.map", "type": "data" }]"#
+            }
+            "dev.koto.samples.retained-tilemap-scroll" => {
+                fs::create_dir_all(root.join("maps")).unwrap();
+                fs::write(
+                    root.join("maps").join("world.map"),
+                    include_bytes!(
+                        "../../../../apps/samples/retained_tilemap_scroll/maps/world.map"
+                    ),
+                )
+                .unwrap();
+                r#", "assets": [{ "path": "maps/world.map", "type": "data" }]"#
+            }
+            _ => "",
+        };
         fs::write(
             root.join("apps").join(format!("{file_name}.kpa.json")),
             format!(
@@ -1682,7 +1744,7 @@ mod tests {
                     "name": "SDK Sample",
                     "runtime": "kotoruntime-bytecode",
                     "entry": "bytecode/{file_name}",
-                    "permissions": {{ "fs": "sandbox", "network": false }}
+                    "permissions": {{ "fs": "sandbox", "network": false }}{assets}
                 }}"#
             ),
         )
@@ -1711,7 +1773,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{app_id}: launch failed: {error:?}"));
 
             // A representative slice of the demo loop: each yielded frame keeps
-            // running and repaints (every sample clears or redraws its band).
+            // running and produces immediate or retained pixel output.
             for frame in 0..8 {
                 session
                     .step_frame(VmInputSnapshot::empty())
@@ -1721,7 +1783,7 @@ mod tests {
                     "{app_id}: exited at idle frame {frame} without an EXIT intent"
                 );
                 assert!(
-                    !session.draw_rects().is_empty(),
+                    !session.draw_rects().is_empty() || !session.draw_pixels().is_empty(),
                     "{app_id}: yielded frame {frame} drew nothing"
                 );
             }
@@ -1742,7 +1804,7 @@ mod tests {
     }
 
     /// KOTO-0178 companion: `dev.koto.sample` (the hand-assembled KOTO-0035
-    /// launch fixture, `sdcard_mock/bytecode/main.kbc`) is a baseline package
+    /// launch fixture, `package_inputs/bytecode/main.kbc`) is a baseline package
     /// whose whole demo is "launch and exit 0 immediately" — pin that so it is
     /// never mistaken for a hung or broken sample.
     #[test]
@@ -1752,7 +1814,7 @@ mod tests {
             &root,
             "dev.koto.sample",
             "main.kbc",
-            include_bytes!("../../../../sdcard_mock/bytecode/main.kbc"),
+            include_bytes!("../../../../package_inputs/bytecode/main.kbc"),
         );
 
         let report = run_app_scenario(&root, "dev.koto.sample", &[]).unwrap();
@@ -2090,9 +2152,7 @@ mod tests {
         host.clear_frame_draw();
         assert_eq!(host.game2d_present(&heap), HostCallOutcome::Ok0);
         // Cell (0,0)->B at well origin (8, 0); cell (1,2)->A at (8+16, 32).
-        assert!(host
-            .draw_pixels
-            .contains(&(8, 0, 16, 16, vec![0xB2; 512])));
+        assert!(host.draw_pixels.contains(&(8, 0, 16, 16, vec![0xB2; 512])));
         assert!(host
             .draw_pixels
             .contains(&(24, 32, 16, 16, vec![0xA1; 512])));
@@ -2103,6 +2163,22 @@ mod tests {
         assert_eq!(host.game2d_clear_layer(0), HostCallOutcome::Ok0);
         assert_eq!(host.game2d_present(&heap), HostCallOutcome::Ok0);
         assert!(host.draw_pixels.is_empty());
+
+        // KOTO-0199: active dimensions and pixel origin are configurable up to 20x20.
+        assert_eq!(
+            host.game2d_configure_tilemap(0, 20, 20, -16, 32),
+            HostCallOutcome::Ok0
+        );
+        assert_eq!(host.game2d_set_tile(0, 19, 19, 0), HostCallOutcome::Ok0);
+        host.clear_frame_draw();
+        assert_eq!(host.game2d_present(&heap), HostCallOutcome::Ok0);
+        assert!(host
+            .draw_pixels
+            .contains(&(288, 336, 16, 16, vec![0xA1; 512])));
+        assert_eq!(
+            host.game2d_configure_tilemap(0, 21, 20, 0, 0),
+            HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT)
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2136,13 +2212,20 @@ mod tests {
             HostCallOutcome::Ok0
         );
         // Place sprite 0 = stamp 3 at pixel (40, 48) drawing tile B (offset 512).
-        assert_eq!(host.game2d_sprite_set(0, 3, 40, 48, 512), HostCallOutcome::Ok0);
+        assert_eq!(
+            host.game2d_sprite_set(0, 3, 40, 48, 512),
+            HostCallOutcome::Ok0
+        );
 
         host.clear_frame_draw();
         assert_eq!(host.game2d_present(&heap), HostCallOutcome::Ok0);
         // Cell 0 (0,1) -> (40, 64); cell 1 (1,0) -> (56, 48), both tile B.
-        assert!(host.draw_pixels.contains(&(40, 64, 16, 16, vec![0xB2; 512])));
-        assert!(host.draw_pixels.contains(&(56, 48, 16, 16, vec![0xB2; 512])));
+        assert!(host
+            .draw_pixels
+            .contains(&(40, 64, 16, 16, vec![0xB2; 512])));
+        assert!(host
+            .draw_pixels
+            .contains(&(56, 48, 16, 16, vec![0xB2; 512])));
         assert_eq!(host.draw_pixels.len(), 2);
 
         // Sprites are retained across the per-frame clear; hiding empties the layer.
@@ -2172,10 +2255,19 @@ mod tests {
         );
 
         // Set two id-keyed items; they are retained at their slots.
-        assert_eq!(host.game2d_text_set(1, 250, 212, "000123", 2113), HostCallOutcome::Ok0);
-        assert_eq!(host.game2d_text_set(0, 284, 5, "実行中", 11593), HostCallOutcome::Ok0);
+        assert_eq!(
+            host.game2d_text_set(1, 250, 212, "000123", 2113),
+            HostCallOutcome::Ok0
+        );
+        assert_eq!(
+            host.game2d_text_set(0, 284, 5, "実行中", 11593),
+            HostCallOutcome::Ok0
+        );
         let item = host.text_items[1].as_ref().unwrap();
-        assert_eq!((item.x, item.y, item.rgb565, item.text.as_str()), (250, 212, 2113, "000123"));
+        assert_eq!(
+            (item.x, item.y, item.rgb565, item.text.as_str()),
+            (250, 212, 2113, "000123")
+        );
 
         // Items survive the per-frame draw clear (like the sprite/tilemap layers).
         host.clear_frame_draw();
@@ -2183,7 +2275,10 @@ mod tests {
         assert_eq!(host.text_items[1].as_ref().unwrap().text, "000123");
 
         // Updating an id replaces only that item; hiding clears its slot.
-        assert_eq!(host.game2d_text_set(1, 250, 212, "000456", 2113), HostCallOutcome::Ok0);
+        assert_eq!(
+            host.game2d_text_set(1, 250, 212, "000456", 2113),
+            HostCallOutcome::Ok0
+        );
         assert_eq!(host.text_items[1].as_ref().unwrap().text, "000456");
         assert_eq!(host.game2d_text_hide(0), HostCallOutcome::Ok0);
         assert!(host.text_items[0].is_none());

@@ -13,8 +13,7 @@ opcode_stats = ["koto-core/opcode_stats"]
 
 [dependencies]
 koto-core = { path = "../koto-core" }
-# M13 bounded audio runtime (sibling project). Used for the generated-sequence
-# BGM/SFX workflow that KotoBlocks drives; the crate itself is unmodified.
+# Bounded audio runtime used for fixed host cues and SD-loaded owned KMML cues.
 koto-audio = { path = "../koto-audio/crates/koto-audio", features = [
     "sldpcm4-drums",
 ] }

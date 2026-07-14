@@ -21,6 +21,8 @@ pub struct Program {
 pub struct ConstDef {
     pub name: String,
     pub value: i64,
+    pub name_line: usize,
+    pub name_col: usize,
 }
 
 /// The element width of a `data` literal array, which fixes its little-endian byte
@@ -41,12 +43,16 @@ pub struct DataDef {
     pub values: Vec<i64>,
     pub line: usize,
     pub col: usize,
+    pub name_line: usize,
+    pub name_col: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    pub line: usize,
+    pub col: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +63,8 @@ pub struct Function {
     pub body: Vec<Stmt>,
     pub line: usize,
     pub col: usize,
+    pub name_line: usize,
+    pub name_col: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +254,7 @@ impl<'a> Parser<'a> {
     fn data_def(&mut self) -> Result<DataDef, Diag> {
         let (line, col) = self.position();
         self.expect(Tok::Data)?;
+        let (name_line, name_col) = self.position();
         let name = self.ident()?;
         self.expect(Tok::Eq)?;
         // Element width keyword (`u8`/`u16`) read as an identifier, then a bracketed,
@@ -306,11 +315,14 @@ impl<'a> Parser<'a> {
             values,
             line,
             col,
+            name_line,
+            name_col,
         })
     }
 
     fn const_def(&mut self) -> Result<ConstDef, Diag> {
         self.expect(Tok::Const)?;
+        let (name_line, name_col) = self.position();
         let name = self.ident()?;
         self.expect(Tok::Eq)?;
         let (line, col) = self.position();
@@ -337,20 +349,32 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect(Tok::Semi)?;
-        Ok(ConstDef { name, value })
+        Ok(ConstDef {
+            name,
+            value,
+            name_line,
+            name_col,
+        })
     }
 
     fn function(&mut self) -> Result<Function, Diag> {
         let (line, col) = self.position();
         self.expect(Tok::Fn)?;
+        let (name_line, name_col) = self.position();
         let name = self.ident()?;
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
         while !self.at(&Tok::RParen) {
+            let (param_line, param_col) = self.position();
             let pname = self.ident()?;
             self.expect(Tok::Colon)?;
             let ty = self.ty()?;
-            params.push(Param { name: pname, ty });
+            params.push(Param {
+                name: pname,
+                ty,
+                line: param_line,
+                col: param_col,
+            });
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -369,6 +393,8 @@ impl<'a> Parser<'a> {
             body,
             line,
             col,
+            name_line,
+            name_col,
         })
     }
 

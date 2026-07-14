@@ -45,9 +45,9 @@ bytecode, PSRAM, LCD, CodeWindow, or Game2D semantics changed.
   >
   > **Stage 2 update (GFX-0002).** The retained-layer *data model* (the POD
   > layout) has moved into `koto-gfx` (`layer.rs`): `AppDrawCommand`,
-  > `Game2dSprite`, `Game2dStampDef`, `Game2dText`, `Game2dBoard`, `AppStaticLayer`,
+  > `Game2dSprite`, `Game2dStampDef`, `Game2dText`, `Game2dTilemap`, `AppStaticLayer`,
   > plus the capacity constants (`MAX_APP_TEXT_BYTES`, `GAME2D_TEXT_BYTES`,
-  > `GAME2D_STATIC_CMD_CAP`, board dims). The firmware still owns the *instances*
+  > `GAME2D_STATIC_CMD_CAP`, tilemap capacity/geometry). The firmware still owns the *instances*
   > (`DeviceRuntimeHost` + its diff double-buffer) and the VM hostcall methods;
   > `app_host.rs` / `config.rs` re-export the moved items so field bytes, hostcall
   > IDs, and call sites are unchanged. `AppStaticLayer::push` split into a pure
@@ -58,7 +58,7 @@ bytecode, PSRAM, LCD, CodeWindow, or Game2D semantics changed.
   > `koto-gfx` (`derive.rs`): the per-command/sprite/text footprints and dirty
   > unions, `board_band_rect`, `stamp_cell`, and `push_dirty` — pure geometry over
   > the POD types + app heap, surface-parameterised like `Rect::clip`. The
-  > board-placement constants (`GAME2D_ORIGIN_X/Y`, `GAME2D_TILE_PX`) moved too.
+  > tile scaling (`GAME2D_TILE_PX`) and configured tilemap geometry moved too.
   > `present_app_delta` is unchanged: its collect loops call identically-signed
   > firmware adapters that delegate to koto-gfx. `FullRepaintPolicy` (the
   > *decision*) was already koto-gfx and is untouched; only the *collection* moved.

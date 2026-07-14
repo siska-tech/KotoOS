@@ -1,0 +1,7 @@
+# Native KotoAudio jingle — the KOTO-0189 bake proving case.
+# This source uses the same native KotoAudio instrument IDs and volume range as
+# application KMML; `koto-mml bake` renders it to the committed PCM16 clip.
+# Rebake with:
+#   cargo run -p koto-mml -- bake harness/fixtures/kacl_bake/native_pcm16_jingle.kmml \
+#     harness/fixtures/kacl_bake/native_pcm16_jingle.kacl
+@0 T150 V102 O5 L8 E G B O6 E4

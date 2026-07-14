@@ -11,7 +11,7 @@
 // opposite edge (running into yourself is the only way to lose), and segments ease
 // smoothly between cells (interpolated by the step progress). Audio is host-owned
 // (KOTO-0095): SFX use package `.kmml`, and the BGM uses a *package-defined custom
-// wavetable instrument* (`#INST` + `.kwt`, KOTOMML wavetable extension) so the music
+// Native KotoAudio built-in instruments so the music
 // carries KotoSnake's own timbre rather than a built-in voice.
 //
 // Controls: Arrow keys turn, F1 start / retry, F10 quit.

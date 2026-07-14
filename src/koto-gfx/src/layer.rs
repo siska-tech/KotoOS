@@ -28,29 +28,81 @@ pub const GAME2D_TEXT_BYTES: usize = 32;
 /// KOTO-0136). KotoBlocks' chrome is 65 commands; 80 leaves layout headroom.
 pub const GAME2D_STATIC_CMD_CAP: usize = 80;
 
-/// Retained Game2D board tilemap geometry (KOTO-0135): a `GAME2D_BOARD_COLS` x
-/// `GAME2D_BOARD_ROWS` grid of 16x16 cells at the KotoBlocks well origin.
-pub const GAME2D_BOARD_COLS: usize = 10;
-pub const GAME2D_BOARD_ROWS: usize = 20;
-pub const GAME2D_BOARD_CELLS: usize = GAME2D_BOARD_COLS * GAME2D_BOARD_ROWS;
+/// Maximum retained Game2D tilemap geometry (KOTO-0199). Storage stays fixed and
+/// allocation-free for RP2040; each app configures an active rectangle within it.
+pub const GAME2D_TILEMAP_MAX_COLS: usize = 20;
+pub const GAME2D_TILEMAP_MAX_ROWS: usize = 20;
+pub const GAME2D_TILEMAP_MAX_CELLS: usize = GAME2D_TILEMAP_MAX_COLS * GAME2D_TILEMAP_MAX_ROWS;
 
 /// Side length in pixels of one Game2D tile/cell (16x16).
 pub const GAME2D_TILE_PX: i32 = 16;
 /// Bytes of one Game2D tile: a 16x16 little-endian RGB565 block. The board and
 /// sprite compositors read exactly this many bytes per tile from the app heap.
 pub const GAME2D_TILE_BYTES: usize = (GAME2D_TILE_PX * GAME2D_TILE_PX) as usize * 2;
-/// Top-left pixel origin of the retained board layer on the app surface.
-pub const GAME2D_ORIGIN_X: i32 = 8;
-pub const GAME2D_ORIGIN_Y: i32 = 0;
+/// Legacy KotoBlocks geometry used until an app explicitly configures layer 0.
+pub const GAME2D_LEGACY_COLS: u8 = 10;
+pub const GAME2D_LEGACY_ROWS: u8 = 20;
+pub const GAME2D_LEGACY_ORIGIN_X: i16 = 8;
+pub const GAME2D_LEGACY_ORIGIN_Y: i16 = 0;
 
-/// The retained board tilemap shape: one `tile_ref` per cell — the app-heap byte
-/// offset of a 16x16 RGB565 tile, or `-1` for empty. Row-major (`cy * COLS + cx`).
-pub type Game2dBoard = [i32; GAME2D_BOARD_CELLS];
+/// One allocation-free retained tilemap layer. `cells` always uses the maximum
+/// 20-column stride; only `columns * rows` coordinates are active. A cell is an
+/// app-heap byte offset of a 16x16 RGB565 tile, or a negative value for empty.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Game2dTilemap {
+    pub cells: [i32; GAME2D_TILEMAP_MAX_CELLS],
+    pub columns: u8,
+    pub rows: u8,
+    pub origin_x: i16,
+    pub origin_y: i16,
+}
+
+impl Game2dTilemap {
+    /// Backward-compatible geometry for KBCs authored before KOTO-0199.
+    pub const fn legacy() -> Self {
+        Self {
+            cells: [-1; GAME2D_TILEMAP_MAX_CELLS],
+            columns: GAME2D_LEGACY_COLS,
+            rows: GAME2D_LEGACY_ROWS,
+            origin_x: GAME2D_LEGACY_ORIGIN_X,
+            origin_y: GAME2D_LEGACY_ORIGIN_Y,
+        }
+    }
+
+    pub const fn cell_index(column: usize, row: usize) -> usize {
+        row * GAME2D_TILEMAP_MAX_COLS + column
+    }
+
+    pub fn geometry_eq(&self, other: &Self) -> bool {
+        self.columns == other.columns
+            && self.rows == other.rows
+            && self.origin_x == other.origin_x
+            && self.origin_y == other.origin_y
+    }
+}
+
+impl Default for Game2dTilemap {
+    fn default() -> Self {
+        Self::legacy()
+    }
+}
 
 /// Returned by [`AppStaticLayer::try_push`] when the layer is already at capacity.
 /// The firmware maps this to the `NO_MEMORY` hostcall outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayerFull;
+
+/// Marker carried in the otherwise-bounded heap offset for a pixel blit whose
+/// LCD-GRAM contents persist after the command leaves the next frame's list.
+pub const APP_DRAW_PERSISTENT_BIT: u32 = 1 << 31;
+
+pub const fn pixel_heap_offset(off: u32) -> u32 {
+    off & !APP_DRAW_PERSISTENT_BIT
+}
+
+pub const fn is_persistent_pixels(command: AppDrawCommand) -> bool {
+    matches!(command, AppDrawCommand::Pixels { off, .. } if off & APP_DRAW_PERSISTENT_BIT != 0)
+}
 
 /// One immediate app draw command. The bounded per-frame command list and the
 /// retained static layer are arrays of these; the present path composites them.
@@ -235,10 +287,14 @@ mod tests {
     // the 32-bit `thumbv6m` target.
 
     #[test]
-    fn board_shape_is_cols_times_rows_i32s() {
-        assert_eq!(GAME2D_BOARD_CELLS, 200);
-        assert_eq!(size_of::<Game2dBoard>(), GAME2D_BOARD_CELLS * 4);
-        assert_eq!(align_of::<Game2dBoard>(), 4);
+    fn tilemap_has_bounded_capacity_and_legacy_geometry() {
+        assert_eq!(GAME2D_TILEMAP_MAX_CELLS, 400);
+        let map = Game2dTilemap::legacy();
+        assert_eq!((map.columns, map.rows), (10, 20));
+        assert_eq!((map.origin_x, map.origin_y), (8, 0));
+        // Six metadata bytes plus two bytes of alignment padding after 1600 cells.
+        assert_eq!(size_of::<Game2dTilemap>(), GAME2D_TILEMAP_MAX_CELLS * 4 + 8);
+        assert_eq!(align_of::<Game2dTilemap>(), 4);
     }
 
     #[test]
@@ -279,7 +335,7 @@ mod tests {
         // the guard holds on both the 64-bit host and the 32-bit target (the
         // `usize` len makes a fixed magic number platform-specific).
         let array = size_of::<[AppDrawCommand; GAME2D_STATIC_CMD_CAP]>();
-        assert!(size_of::<AppStaticLayer>() >= array + size_of::<usize>() + 1);
+        assert!(size_of::<AppStaticLayer>() > array + size_of::<usize>());
         assert!(size_of::<AppStaticLayer>() <= array + size_of::<usize>() + align_of::<usize>());
         assert_eq!(
             size_of::<AppStaticLayer>() % align_of::<AppStaticLayer>(),

@@ -1,6 +1,7 @@
 use super::*;
 
-use crate::koto_blocks_audio::{primary_audio_route, PrimaryCue};
+use crate::audio::{RUNTIME_BGM_EVENTS_PER_TRACK, RUNTIME_SFX_EVENTS_PER_TRACK};
+use koto_audio::RuntimeCue;
 
 #[derive(Debug)]
 pub(super) struct SkkSession {
@@ -19,6 +20,8 @@ pub(super) struct SimRuntimeHost {
     pub(super) draw_rects: Vec<(i32, i32, i32, i32, i32)>,
     /// Recorded `draw_pixels` blits: `(x, y, w, h, little-endian RGB565 bytes)`.
     pub(super) draw_pixels: Vec<(i32, i32, i32, i32, Vec<u8>)>,
+    /// Session-persistent 320x320 RGB565 LCD-GRAM image used by streamed art.
+    pub(super) persistent_pixels: Vec<u8>,
     pub(super) text: Vec<(i32, i32, String)>,
     /// Colour for each `text` entry, index-aligned. [`TEXT_COLOR_DEFAULT`] marks a
     /// colourless `draw_text`; any other value is the RGB565 colour (held as a
@@ -33,13 +36,16 @@ pub(super) struct SimRuntimeHost {
     pub(super) audio: Arc<Mutex<SimAudio>>,
     /// Read-only package asset paths declared by the launching manifest.
     pub(super) asset_paths: Vec<String>,
+    /// The authoritative KPA1 archive for this session. Tests for the legacy
+    /// loose-file host seam may leave this unset.
+    pub(super) package_archive: Option<Arc<Vec<u8>>>,
     /// Audio actions issued by the VM this frame, for deterministic inspection
     /// (mirrors the recorded draw lists).
     pub(super) audio_events: Vec<AudioEvent>,
     /// Retained Game2D board tilemap layer (KOTO-0135): one `tile_ref` per cell,
     /// `-1` empty. Unlike the per-frame draw lists this persists across frames;
     /// `game2d_present` re-emits its non-empty cells into `draw_pixels`.
-    pub(super) tilemap: [i32; GAME2D_BOARD_CELLS],
+    pub(super) tilemap: SimTilemap,
     /// Retained Game2D static/background command layer (KOTO-0136): draw calls
     /// captured between `game2d_static_begin` and `game2d_static_end`. Like the
     /// tilemap these persist across the per-frame draw clear; the paint pipeline
@@ -102,15 +108,39 @@ pub(super) struct Game2dText {
 }
 
 /// KotoBlocks board geometry the Game2D tilemap layer composites against
-/// (KOTO-0135). 10x20 cells of 16x16 px at well origin (8, 0).
-pub(super) const GAME2D_BOARD_COLS: usize = 10;
-pub(super) const GAME2D_BOARD_ROWS: usize = 20;
-pub(super) const GAME2D_BOARD_CELLS: usize = GAME2D_BOARD_COLS * GAME2D_BOARD_ROWS;
+/// by default; KOTO-0199 permits any active shape up to 20x20 and any i16 origin.
+pub(super) const GAME2D_TILEMAP_MAX_COLS: usize = 20;
+pub(super) const GAME2D_TILEMAP_MAX_ROWS: usize = 20;
+pub(super) const GAME2D_TILEMAP_MAX_CELLS: usize =
+    GAME2D_TILEMAP_MAX_COLS * GAME2D_TILEMAP_MAX_ROWS;
 const GAME2D_TILE: i32 = 16;
-const GAME2D_ORIGIN_X: i32 = 8;
-const GAME2D_ORIGIN_Y: i32 = 0;
 /// Bytes of one 16x16 little-endian RGB565 tile.
 const GAME2D_TILE_BYTES: usize = (GAME2D_TILE * GAME2D_TILE) as usize * 2;
+
+#[derive(Debug)]
+pub(super) struct SimTilemap {
+    cells: [i32; GAME2D_TILEMAP_MAX_CELLS],
+    columns: usize,
+    rows: usize,
+    origin_x: i16,
+    origin_y: i16,
+}
+
+impl SimTilemap {
+    fn legacy() -> Self {
+        Self {
+            cells: [-1; GAME2D_TILEMAP_MAX_CELLS],
+            columns: 10,
+            rows: 20,
+            origin_x: 8,
+            origin_y: 0,
+        }
+    }
+
+    fn index(column: usize, row: usize) -> usize {
+        row * GAME2D_TILEMAP_MAX_COLS + column
+    }
+}
 /// Retained sprite/stamp table sizes (KOTO-0140), mirroring the device budget in
 /// `koto-pico` config. 32 stamps cover KotoBlocks' 28 piece orientations with
 /// headroom; 16 sprites cover its active/ghost/NEXTx3/HOLD instances.
@@ -145,6 +175,7 @@ impl SimRuntimeHost {
             sandbox: Sandbox::new(app_id).map_err(|_| SimError::RuntimeExecutionFailed)?,
             draw_rects: Vec::new(),
             draw_pixels: Vec::new(),
+            persistent_pixels: vec![0; 320 * 320 * 2],
             text: Vec::new(),
             text_colors: Vec::new(),
             files: Vec::new(),
@@ -153,8 +184,9 @@ impl SimRuntimeHost {
             skk,
             audio,
             asset_paths,
+            package_archive: None,
             audio_events: Vec::new(),
-            tilemap: [-1; GAME2D_BOARD_CELLS],
+            tilemap: SimTilemap::legacy(),
             static_rects: Vec::new(),
             static_pixels: Vec::new(),
             static_text: Vec::new(),
@@ -164,6 +196,29 @@ impl SimRuntimeHost {
             sprites: [None; GAME2D_MAX_SPRITES],
             text_items: core::array::from_fn(|_| None),
         })
+    }
+
+    pub(super) fn with_audio_and_package(
+        fs: HostFs,
+        app_id: &str,
+        audio: Arc<Mutex<SimAudio>>,
+        package_archive: Arc<Vec<u8>>,
+    ) -> Result<Self, SimError> {
+        let reader =
+            KpaReader::new(package_archive.as_slice()).map_err(|_| SimError::InvalidManifest)?;
+        let mut asset_paths = Vec::new();
+        for index in 0..reader.entry_count() {
+            asset_paths.push(
+                reader
+                    .entry(index)
+                    .map_err(|_| SimError::InvalidManifest)?
+                    .path
+                    .to_string(),
+            );
+        }
+        let mut host = Self::with_audio_and_assets(fs, app_id, audio, asset_paths)?;
+        host.package_archive = Some(package_archive);
+        Ok(host)
     }
 
     pub(super) fn clear_frame_draw(&mut self) {
@@ -230,36 +285,22 @@ impl SimRuntimeHost {
             .ok_or(HostErrorKind::BadArgument)
     }
 
-    /// Resolve a BGM score's `#INST` directives into an [`InstrumentBank`] by loading
-    /// each referenced `.kwt` package asset. Every referenced path must be declared by
-    /// the manifest (like the BGM asset itself) and live under `audio/`, so a score
-    /// cannot reach outside the package's audio assets. The wavetable data lives in the
-    /// KPA, not the host.
-    fn load_instrument_bank(&mut self, mml: &str) -> Result<Arc<InstrumentBank>, HostCallOutcome> {
-        let refs = scan_instrument_refs(mml)
-            .map_err(|_| HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT))?;
-        let mut bank = InstrumentBank::new();
-        for (id, path) in refs {
-            if !path.starts_with("audio/") || !path.ends_with(".kwt") {
-                return Err(HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT));
-            }
-            if !self.asset_paths.iter().any(|asset| asset == &path) {
-                return Err(HostCallOutcome::Err(
-                    koto_core::HostErrorCode::PERMISSION_DENIED,
-                ));
-            }
-            let bytes = self.read_asset_bytes(&path, 8 * 1024)?;
-            let text = core::str::from_utf8(&bytes)
-                .map_err(|_| HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT))?;
-            bank.define_from_kwt(id, text)
-                .map_err(|_| HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT))?;
-        }
-        Ok(Arc::new(bank))
-    }
-
-    /// Read a read-only package asset fully into memory, capped at `cap` bytes. Used to
-    /// pull `.kwt` instrument data out of the package the same way BGM/SFX `.kmml` is.
+    /// Read a read-only package asset fully into memory, capped at `cap` bytes.
     fn read_asset_bytes(&mut self, path: &str, cap: usize) -> Result<Vec<u8>, HostCallOutcome> {
+        if let Some(archive) = &self.package_archive {
+            let reader = KpaReader::new(archive.as_slice())
+                .map_err(|_| HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR))?;
+            let bytes = reader
+                .payload_for(path)
+                .map_err(|_| HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR))?
+                .ok_or(HostCallOutcome::Err(
+                    koto_core::HostErrorCode::PERMISSION_DENIED,
+                ))?;
+            if bytes.len() > cap {
+                return Err(HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY));
+            }
+            return Ok(bytes.to_vec());
+        }
         let mut file = match self.fs.open(path, FileMode::Read) {
             Ok(file) => file,
             Err(koto_core::HalError::InvalidArgument) => {
@@ -312,6 +353,35 @@ impl VmHost for SimRuntimeHost {
         HostCallOutcome::Ok0
     }
 
+    fn draw_pixels_persistent_rgb565(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        pixels: &[u8],
+    ) -> HostCallOutcome {
+        if w <= 0 || h <= 0 || pixels.len() != w as usize * h as usize * 2 {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
+        }
+        for row in 0..h {
+            let dy = y + row;
+            if !(0..320).contains(&dy) {
+                continue;
+            }
+            let left = x.max(0);
+            let right = (x + w).min(320);
+            if left >= right {
+                continue;
+            }
+            let src = ((row * w + (left - x)) * 2) as usize;
+            let dst = ((dy * 320 + left) * 2) as usize;
+            let len = ((right - left) * 2) as usize;
+            self.persistent_pixels[dst..dst + len].copy_from_slice(&pixels[src..src + len]);
+        }
+        HostCallOutcome::Ok0
+    }
+
     fn game2d_set_tile(&mut self, layer: i32, x: i32, y: i32, tile_ref: i32) -> HostCallOutcome {
         if layer != 0 {
             return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
@@ -319,12 +389,12 @@ impl VmHost for SimRuntimeHost {
         let (Ok(cx), Ok(cy)) = (usize::try_from(x), usize::try_from(y)) else {
             return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
         };
-        if cx >= GAME2D_BOARD_COLS || cy >= GAME2D_BOARD_ROWS {
+        if cx >= self.tilemap.columns || cy >= self.tilemap.rows {
             return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
         }
         // `tile_ref` is an app-heap byte offset (validated against the heap at
         // present time, when the heap is in hand); `< 0` clears the cell.
-        self.tilemap[cy * GAME2D_BOARD_COLS + cx] = tile_ref;
+        self.tilemap.cells[SimTilemap::index(cx, cy)] = tile_ref;
         HostCallOutcome::Ok0
     }
 
@@ -332,7 +402,37 @@ impl VmHost for SimRuntimeHost {
         if layer != 0 {
             return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
         }
-        self.tilemap.fill(-1);
+        self.tilemap.cells.fill(-1);
+        HostCallOutcome::Ok0
+    }
+
+    fn game2d_configure_tilemap(
+        &mut self,
+        layer: i32,
+        columns: i32,
+        rows: i32,
+        origin_x: i32,
+        origin_y: i32,
+    ) -> HostCallOutcome {
+        let (Ok(columns), Ok(rows), Ok(origin_x), Ok(origin_y)) = (
+            usize::try_from(columns),
+            usize::try_from(rows),
+            i16::try_from(origin_x),
+            i16::try_from(origin_y),
+        ) else {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
+        };
+        if layer != 0
+            || !(1..=GAME2D_TILEMAP_MAX_COLS).contains(&columns)
+            || !(1..=GAME2D_TILEMAP_MAX_ROWS).contains(&rows)
+        {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
+        }
+        self.tilemap.cells.fill(-1);
+        self.tilemap.columns = columns;
+        self.tilemap.rows = rows;
+        self.tilemap.origin_x = origin_x;
+        self.tilemap.origin_y = origin_y;
         HostCallOutcome::Ok0
     }
 
@@ -341,9 +441,9 @@ impl VmHost for SimRuntimeHost {
         // existing paint pipeline renders the tilemap unchanged. The simulator
         // repaints fully each frame, so emitting all cells (not just dirty ones)
         // is correct; dirty tracking is a device concern (KOTO-0135).
-        for cy in 0..GAME2D_BOARD_ROWS {
-            for cx in 0..GAME2D_BOARD_COLS {
-                let tile_ref = self.tilemap[cy * GAME2D_BOARD_COLS + cx];
+        for cy in 0..self.tilemap.rows {
+            for cx in 0..self.tilemap.columns {
+                let tile_ref = self.tilemap.cells[SimTilemap::index(cx, cy)];
                 let Ok(off) = usize::try_from(tile_ref) else {
                     continue; // empty (`-1`) or invalid
                 };
@@ -351,8 +451,8 @@ impl VmHost for SimRuntimeHost {
                     return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
                 };
                 self.draw_pixels.push((
-                    GAME2D_ORIGIN_X + cx as i32 * GAME2D_TILE,
-                    GAME2D_ORIGIN_Y + cy as i32 * GAME2D_TILE,
+                    i32::from(self.tilemap.origin_x) + cx as i32 * GAME2D_TILE,
+                    i32::from(self.tilemap.origin_y) + cy as i32 * GAME2D_TILE,
                     GAME2D_TILE,
                     GAME2D_TILE,
                     src.to_vec(),
@@ -571,117 +671,87 @@ impl VmHost for SimRuntimeHost {
     }
 
     fn play_bgm_asset(&mut self, path: &str) -> HostCallOutcome {
-        if !path.starts_with("audio/") || !path.ends_with(".kmml") {
+        if !path.starts_with("audio/") || !(path.ends_with(".kmml") || path.ends_with(".kacl")) {
             return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
         }
         if !self.asset_paths.iter().any(|asset| asset == path) {
             return HostCallOutcome::Err(koto_core::HostErrorCode::PERMISSION_DENIED);
         }
-        // Primary audio path (KOTO-0164): a registered app route drives the
-        // koto-audio generated-sequence bridge (which starts the looping BGM once)
-        // without reading the `.kmml` payload. Today only KotoBlocks registers a BGM
-        // route; every unrouted path keeps the legacy MML path below.
-        if primary_audio_route(path) == Some(PrimaryCue::Bgm) {
-            if let Ok(mut audio) = self.audio.lock() {
-                audio.seq_start_bgm();
+        let bytes = match self.read_asset_bytes(
+            path,
+            if path.ends_with(".kacl") {
+                usize::MAX
+            } else {
+                4096
+            },
+        ) {
+            Ok(bytes) => bytes,
+            Err(outcome) => return outcome,
+        };
+        if path.ends_with(".kacl") {
+            let ok = self
+                .audio
+                .lock()
+                .map(|mut audio| audio.play_runtime_bgm_clip(&bytes))
+                .unwrap_or(false);
+            if !ok {
+                return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
             }
             self.audio_events.push(AudioEvent::BgmAsset);
             return HostCallOutcome::Ok0;
         }
-        let mut file = match self.fs.open(path, FileMode::Read) {
-            Ok(file) => file,
-            Err(koto_core::HalError::InvalidArgument) => {
-                return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT)
-            }
-            Err(_) => return HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR),
-        };
-        let mut bytes = Vec::new();
-        let mut chunk = [0u8; 512];
-        loop {
-            let len = match file.read(&mut chunk) {
-                Ok(len) => len,
-                Err(_) => return HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR),
-            };
-            if len == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..len]);
-            if bytes.len() > 64 * 1024 {
-                return HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY);
-            }
-        }
-        let mml = match core::str::from_utf8(&bytes) {
-            Ok(mml) => mml,
+        let cue = match if bytes.starts_with(b"KAQ1") {
+            RuntimeCue::<RUNTIME_BGM_EVENTS_PER_TRACK>::decode(&bytes)
+        } else {
+            core::str::from_utf8(&bytes)
+                .map_err(|_| koto_audio::RuntimeCueError::InvalidText)
+                .and_then(RuntimeCue::<RUNTIME_BGM_EVENTS_PER_TRACK>::compile_kmml)
+        } {
+            Ok(cue) => cue,
             Err(_) => return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT),
         };
-        // A score may bind custom wavetable instruments to package `.kwt` assets via
-        // `#INST <id> <path>`; load each one's data from the package and build the
-        // bank so `@n` resolves to package-owned timbres (the data lives in the KPA,
-        // not the host).
-        let bank = match self.load_instrument_bank(mml) {
-            Ok(bank) => bank,
-            Err(outcome) => return outcome,
-        };
         if let Ok(mut audio) = self.audio.lock() {
-            if audio.play_bgm_mml_banked(mml, bank).is_err() {
-                return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
-            }
-        } else {
-            return HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR);
+            audio.play_runtime_bgm(cue);
         }
         self.audio_events.push(AudioEvent::BgmAsset);
         HostCallOutcome::Ok0
     }
 
     fn play_sfx_asset(&mut self, path: &str) -> HostCallOutcome {
-        if !path.starts_with("audio/") || !path.ends_with(".kmml") {
+        if !path.starts_with("audio/") || !(path.ends_with(".kmml") || path.ends_with(".kacl")) {
             return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
         }
         if !self.asset_paths.iter().any(|asset| asset == path) {
             return HostCallOutcome::Err(koto_core::HostErrorCode::PERMISSION_DENIED);
         }
-        // Primary audio path (KOTO-0164): a registered app SFX route drives the
-        // authored koto-audio sequence bridge instead of the MML synth. Unrouted SFX
-        // assets fall through to the legacy MML path below.
-        if let Some(PrimaryCue::Sfx(kind)) = primary_audio_route(path) {
-            if let Ok(mut audio) = self.audio.lock() {
-                audio.seq_sfx(kind);
+        let bytes = match self.read_asset_bytes(path, usize::MAX) {
+            Ok(bytes) => bytes,
+            Err(outcome) => return outcome,
+        };
+        if path.ends_with(".kacl") {
+            let ok = self
+                .audio
+                .lock()
+                .map(|mut audio| audio.play_runtime_clip(&bytes))
+                .unwrap_or(false);
+            if !ok {
+                return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
             }
             self.audio_events.push(AudioEvent::SfxAsset);
             return HostCallOutcome::Ok0;
         }
-        let mut file = match self.fs.open(path, FileMode::Read) {
-            Ok(file) => file,
-            Err(koto_core::HalError::InvalidArgument) => {
-                return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT)
-            }
-            Err(_) => return HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR),
-        };
-        let mut bytes = Vec::new();
-        let mut chunk = [0u8; 256];
-        loop {
-            let len = match file.read(&mut chunk) {
-                Ok(len) => len,
-                Err(_) => return HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR),
-            };
-            if len == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&chunk[..len]);
-            if bytes.len() > 8 * 1024 {
-                return HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY);
-            }
-        }
-        let mml = match core::str::from_utf8(&bytes) {
-            Ok(mml) => mml,
+        let cue = match if bytes.starts_with(b"KAQ1") {
+            RuntimeCue::<RUNTIME_SFX_EVENTS_PER_TRACK>::decode(&bytes)
+        } else {
+            core::str::from_utf8(&bytes)
+                .map_err(|_| koto_audio::RuntimeCueError::InvalidText)
+                .and_then(RuntimeCue::<RUNTIME_SFX_EVENTS_PER_TRACK>::compile_kmml)
+        } {
+            Ok(cue) => cue,
             Err(_) => return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT),
         };
         if let Ok(mut audio) = self.audio.lock() {
-            if audio.play_sfx_mml(mml).is_err() {
-                return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
-            }
-        } else {
-            return HostCallOutcome::Err(koto_core::HostErrorCode::IO_ERROR);
+            audio.play_runtime_sfx(cue);
         }
         self.audio_events.push(AudioEvent::SfxAsset);
         HostCallOutcome::Ok0
@@ -690,10 +760,7 @@ impl VmHost for SimRuntimeHost {
     fn stop_bgm(&mut self) -> HostCallOutcome {
         self.audio_events.push(AudioEvent::StopBgm);
         if let Ok(mut audio) = self.audio.lock() {
-            // Stop both BGM engines' music: the MML synth (non-KotoBlocks apps)
-            // and the koto-audio sequence bridge (KotoBlocks). Both stop only the
-            // BGM bus; one-shot SFX keep playing.
-            audio.stop_bgm();
+            // Native KotoAudio BGM stops without affecting one-shot SFX.
             audio.seq_stop_bgm();
         }
         HostCallOutcome::Ok0
@@ -763,7 +830,7 @@ impl VmHost for SimRuntimeHost {
 
     fn asset_load(&mut self, path: &str, dst: &mut [u8]) -> HostCallOutcome {
         // Only manifest-declared package assets are readable, mirroring how BGM/SFX
-        // and `.kwt` instruments are gated. The asset is read-only and never touches
+        // assets are gated. The asset is read-only and never touches
         // the save sandbox.
         if !self.asset_paths.iter().any(|asset| asset == path) {
             return HostCallOutcome::Err(koto_core::HostErrorCode::PERMISSION_DENIED);
@@ -774,6 +841,22 @@ impl VmHost for SimRuntimeHost {
         };
         let n = bytes.len().min(dst.len());
         dst[..n].copy_from_slice(&bytes[..n]);
+        HostCallOutcome::Ok1(n as i32)
+    }
+
+    fn asset_load_range(&mut self, path: &str, offset: usize, dst: &mut [u8]) -> HostCallOutcome {
+        if !self.asset_paths.iter().any(|asset| asset == path) {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::PERMISSION_DENIED);
+        }
+        let bytes = match self.read_asset_bytes(path, usize::MAX) {
+            Ok(bytes) => bytes,
+            Err(outcome) => return outcome,
+        };
+        if offset > bytes.len() {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
+        }
+        let n = dst.len().min(bytes.len() - offset);
+        dst[..n].copy_from_slice(&bytes[offset..offset + n]);
         HostCallOutcome::Ok1(n as i32)
     }
 

@@ -42,6 +42,10 @@ const TONE_PCM: [i16; RING_SAMPLES] = make_triangle_ring();
 const BANNER: &[u8] = concat!(
     "KotoOS KOTO-0114 pwm-audio-uart v",
     env!("CARGO_PKG_VERSION"),
+    " board=",
+    env!("KOTO_BOARD_ID"),
+    " mcu=",
+    env!("KOTO_MCU_ID"),
     "\r\n"
 )
 .as_bytes();
@@ -51,19 +55,19 @@ const BANNER: &[u8] = concat!(
     entry = "cortex_m_rt::entry"
 )]
 async fn main(_spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
-    let _dma_ch0 = p.DMA_CH0;
+    let p = koto_pico::board::split_peripherals(embassy_rp::init(Default::default()));
+    let _dma_ch0 = p.dma_ch0;
 
     let mut uart_config = UartConfig::default();
     uart_config.baudrate = 115_200;
-    let mut uart = UartTx::new_blocking(p.UART0, p.PIN_0, uart_config);
+    let mut uart = UartTx::new_blocking(p.uart, p.uart_tx, uart_config);
 
     let mut config = PwmConfig::default();
     config.divider = PWM_DIVIDER.into();
     config.top = PWM_TOP;
     config.compare_a = PWM_MIDPOINT;
     config.compare_b = PWM_MIDPOINT;
-    let mut pwm = Pwm::new_output_ab(p.PWM_SLICE5, p.PIN_26, p.PIN_27, config);
+    let mut pwm = Pwm::new_output_ab(p.audio_pwm, p.audio_a, p.audio_b, config);
 
     let mut ring = [0i16; RING_SAMPLES];
     let mut mixer = PcmMixer::<1>::new();
@@ -91,9 +95,14 @@ async fn main(_spawner: Spawner) {
         w.set_y(pacing_y as u16);
     });
 
-    Timer::after_secs(2).await;
     let _ = uart.blocking_write(BANNER);
     let _ = uart.blocking_write(b"log=uart0 tx=GP0 baud=115200 format=8N1\r\n");
+    for remaining in (1..=10).rev() {
+        let mut countdown = LineBuffer::new();
+        let _ = write!(countdown, "audio probe starts in {}s\r\n", remaining);
+        write_line(&mut uart, &countdown);
+        Timer::after_secs(1).await;
+    }
     let mut line = LineBuffer::new();
     let _ = write!(
         line,
@@ -121,7 +130,10 @@ async fn main(_spawner: Spawner) {
 
         let _ = pwm.set_duty_cycle(PWM_MIDPOINT);
         let dma_status = pac::DMA.ch(0).ctrl_trig().read();
+        #[cfg(feature = "mcu-rp2040")]
         let remaining = pac::DMA.ch(0).trans_count().read();
+        #[cfg(feature = "mcu-rp235xa")]
+        let remaining = pac::DMA.ch(0).trans_count().read().count();
         let dma_error = dma_status.ahb_error();
         line.clear();
         let _ = write!(
@@ -151,7 +163,12 @@ fn start_audio_dma(ring: &AlignedDmaRing) {
     channel
         .write_addr()
         .write_value(pac::PWM.ch(5).cc().as_ptr() as u32);
+    #[cfg(feature = "mcu-rp2040")]
     channel.trans_count().write_value(TONE_SAMPLE_COUNT);
+    #[cfg(feature = "mcu-rp235xa")]
+    channel
+        .trans_count()
+        .write(|w| w.set_count(TONE_SAMPLE_COUNT));
     channel.ctrl_trig().write(|w| {
         w.set_data_size(DataSize::SIZE_WORD);
         w.set_incr_read(true);

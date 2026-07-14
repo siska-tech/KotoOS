@@ -58,7 +58,10 @@ impl CodecId {
     pub const fn is_supported_by_build(self) -> bool {
         match self {
             Self::Pcm16 => true,
-            Self::Sldpcm4 => cfg!(feature = "experimental-sldpcm4"),
+            Self::Sldpcm4 => cfg!(any(
+                feature = "experimental-sldpcm4",
+                feature = "sldpcm4-drums"
+            )),
             Self::Unsupported(_) => false,
         }
     }

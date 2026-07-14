@@ -1,0 +1,50 @@
+{
+  "app_id": "dev.koto.games.kotorun",
+  "kind": "koto",
+  "package": "kotorun",
+  "name": "KotoRun",
+  "description": "走って、跳んで、ダイブで破壊。穴やドローンを越える高速横スクロールアクション。",
+  "category": "ゲーム",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "shell_icon": {
+    "style": "mask",
+    "background": "#151238",
+    "primary": "#FFD84A",
+    "secondary": "#7654D8",
+    "accent": "#F04464",
+    "highlight": "#44D8F0",
+    "shadow": "#080718"
+  },
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 16384
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "audio": [
+    {
+      "source": "audio/bgm.kmml",
+      "output": "audio/kotorun_bgm.kmml"
+    },
+    {
+      "source": "audio/jump.kmml",
+      "output": "audio/kotorun_jump.kmml"
+    },
+    {
+      "source": "audio/coin.kmml",
+      "output": "audio/kotorun_coin.kmml"
+    },
+    {
+      "source": "audio/hit.kmml",
+      "output": "audio/kotorun_hit.kmml"
+    },
+    {
+      "source": "audio/start.kmml",
+      "output": "audio/kotorun_start.kmml"
+    }
+  ]
+}
