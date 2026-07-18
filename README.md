@@ -11,6 +11,13 @@ two-core audio service — all running both on real PicoCalc hardware
 (`koto-pico` firmware) and in a desktop simulator (KotoSim) that shares the
 same core crates.
 
+## OpenAI Build Week
+
+KotoOS was developed with extensive use of Codex and GPT-5.6 for implementation,
+architecture, debugging, performance investigation, testing, and documentation.
+
+See [How Codex & GPT-5.6 were used](#how-codex--gpt-56-were-used) for details.
+
 ## Version 0.2 Highlights
 
 - **Pico 2 W support:** RP2350A firmware, linker/UF2 profiles, PicoCalc LCD,
@@ -171,6 +178,51 @@ The retained single-peripheral probes are `probe_lcd`, `probe_keyboard`,
 `probe_sd`, `probe_psram`, `probe_power`, and `probe_audio`. See
 [`src/koto-pico/README.md`](src/koto-pico/README.md) for their purpose and build
 commands.
+
+## How Codex & GPT-5.6 were used
+
+KotoOS was developed with extensive assistance from Codex and GPT-5.6 as
+engineering partners throughout the project.
+
+They were used for:
+
+- Exploring and implementing Rust / Embassy embedded designs
+- Refactoring the firmware into reusable `no_std` subsystems
+- Designing and extending the Koto VM, compiler, and application language
+- Implementing and reviewing KotoUI, SDK APIs, and bounded resource models
+- Investigating performance bottlenecks using real hardware measurements
+- Iterating on PIO, DMA, PSRAM, graphics, audio, and SD card code
+- Porting KotoOS from RP2040 to RP2350A while preserving compatibility
+- Building simulator and developer-tool workflows
+- Writing regression tests, validation tools, architecture documents, and
+  implementation plans
+
+The development process was highly iterative.
+
+For hardware-related work, generated or modified code was tested on real
+PicoCalc hardware, measurements and logs were fed back into the development
+process, and the implementation was revised based on the observed behavior.
+
+This was especially important for areas such as PSRAM performance, display
+transfer costs, audio scheduling, SD card timing, and RP2350A hardware support,
+where code that looked correct in isolation was not necessarily correct or
+fast enough on the physical device.
+
+Codex was particularly useful for working across the large repository,
+implementing changes, running tests, tracing dependencies, and carrying out
+multi-file refactors.
+
+GPT-5.6 was used extensively for architectural reasoning, debugging strategies,
+design reviews, API design, performance analysis, and planning the next
+iterations of the system.
+
+The project therefore evolved through a repeated loop:
+
+**design → implement → build → test on simulator → test on hardware → measure →
+analyze → refine**
+
+AI accelerated this loop significantly, but real-hardware validation remained
+the source of truth for embedded behavior and performance.
 
 ## License
 
