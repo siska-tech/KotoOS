@@ -26,6 +26,8 @@ pub struct BytecodeAppSession {
     draw_pixels_peak: usize,
     text_draws_peak: usize,
     audio_events_peak: usize,
+    ui_render_commands_peak: usize,
+    frame_time_us_peak: u64,
 }
 
 impl BytecodeAppSession {
@@ -76,7 +78,10 @@ impl BytecodeAppSession {
                 return Err(SimError::AppExceedsMemoryBudget);
             }
         }
-        let host = if let Some(archive) = archive {
+        let fetch_allowlist = *launch.fetch_allowlist();
+        let mqtt_brokers = *launch.mqtt_brokers();
+        let mqtt_topics = *launch.mqtt_topics();
+        let mut host = if let Some(archive) = archive {
             SimRuntimeHost::with_audio_and_package(
                 HostFs::mounted(root).map_err(|_| SimError::Io)?,
                 launch.package.app_id(),
@@ -91,6 +96,9 @@ impl BytecodeAppSession {
                 launch.asset_paths().to_vec(),
             )
         }?;
+        host.set_fetch_allowlist(fetch_allowlist);
+        host.set_mqtt_permission(mqtt_brokers, mqtt_topics);
+        host.set_config_snapshot(load_system_config(root).snapshot());
         // Initialize the heap with the const heap image (KOTO-0139): rodata becomes
         // heap[0..rodata_size]; the rest stays zeroed. The verifier has bounded
         // rodata_size <= max_heap_bytes, so this copy is in range.
@@ -112,6 +120,8 @@ impl BytecodeAppSession {
             draw_pixels_peak: 0,
             text_draws_peak: 0,
             audio_events_peak: 0,
+            ui_render_commands_peak: 0,
+            frame_time_us_peak: 0,
         })
     }
 
@@ -120,11 +130,15 @@ impl BytecodeAppSession {
     /// On a VM trap the error and faulting program counter are retained for
     /// diagnostics (see [`Self::diagnostic`]).
     pub fn step_frame(&mut self, input: VmInputSnapshot) -> Result<VmRunResult, SimError> {
+        let started = std::time::Instant::now();
         self.host.clear_frame_draw();
         let result = self
             .session
             .step_frame(&self.bytecode, &mut self.host, input, &mut self.heap)
             .map_err(|_| SimError::RuntimeExecutionFailed)?;
+        self.frame_time_us_peak = self
+            .frame_time_us_peak
+            .max(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
         // Track host working-set high-water marks: the host clears its per-frame
         // draw lists at the start of the next frame, so capture them now (budget
         // diagnostics, KOTO-0101).
@@ -133,11 +147,87 @@ impl BytecodeAppSession {
         self.draw_pixels_peak = self.draw_pixels_peak.max(self.host.draw_pixels.len());
         self.text_draws_peak = self.text_draws_peak.max(self.host.text.len());
         self.audio_events_peak = self.audio_events_peak.max(self.host.audio_events.len());
+        self.ui_render_commands_peak = self
+            .ui_render_commands_peak
+            .max(self.host.ui_render_command_count());
         Ok(result)
     }
 
     pub fn app_id(&self) -> &str {
         &self.app_id
+    }
+
+    /// Replace the shared configuration snapshot observed at the next frame
+    /// boundary. Window mode and deterministic locale tests use the same path.
+    pub fn set_config_snapshot(&mut self, snapshot: ConfigSnapshot) {
+        self.host.set_config_snapshot(snapshot);
+    }
+
+    /// Script the advisory `time_query` clock (KOTO-0247): `Some(utc_seconds)`
+    /// anchors synchronized UTC at the current frame clock, `None` reverts to
+    /// the unknown-time state. Scenarios drive this instead of any host wall
+    /// clock; a fresh session starts unknown.
+    pub fn set_time_utc(&mut self, utc_seconds: Option<i64>) {
+        self.host.set_time_utc(utc_seconds);
+    }
+
+    /// Script the deterministic fetch backend's next response (KOTO-0247).
+    /// `pending_polls` precede the `Headers` transition; the body is then read
+    /// incrementally in `FETCH_MAX_READ`-bounded chunks.
+    pub fn script_fetch_response(&mut self, status: u16, body: &[u8], pending_polls: u8) {
+        self.host.script_fetch_response(status, body, pending_polls);
+    }
+
+    /// Script a terminal fetch failure (timeout, DNS, disconnect, ...).
+    pub fn script_fetch_failure(&mut self, error: koto_core::FetchError, pending_polls: u8) {
+        self.host.script_fetch_failure(error, pending_polls);
+    }
+
+    /// Script the offline state: `fetch_start` itself is refused.
+    pub fn script_fetch_offline(&mut self) {
+        self.host.script_fetch_offline();
+    }
+
+    /// Script the MQTT broker as offline (KOTO-0249): `mqtt_connect` is refused
+    /// with a stable `Unavailable`, as on a network-disabled or unsupported build.
+    pub fn script_mqtt_offline(&mut self) {
+        self.host.script_mqtt_offline();
+    }
+
+    /// Inspect retained KotoUI text without exposing packet encoding details.
+    pub fn retained_ui_text(&self, widget_id: u16) -> Option<&str> {
+        self.host.ui_text(widget_id)
+    }
+
+    pub fn retained_ui_focused_id(&self) -> Option<u16> {
+        self.host.ui_focused_id()
+    }
+
+    pub fn retained_ui_value(&self, widget_id: u16) -> Option<&str> {
+        self.host.ui_value(widget_id)
+    }
+
+    /// Queue host-side UI input without running the VM. This is intentionally
+    /// narrow: deterministic tests use it to fill the bounded semantic-event
+    /// queue before allowing the App to drain and report overflow.
+    pub fn inject_ui_input_without_vm(&mut self, input: VmInputSnapshot) {
+        self.host.inject_ui_input(input);
+    }
+
+    pub fn ui_present_calls_this_frame(&self) -> usize {
+        self.host.ui_present_calls
+    }
+
+    pub fn ui_paint_count_this_frame(&self) -> usize {
+        self.host.ui_paint_count
+    }
+
+    pub fn ui_presented_damage(&self) -> &[(i32, i32, i32, i32)] {
+        &self.host.ui_presented_damage
+    }
+
+    pub fn ui_polled_events(&self) -> &[(u8, u16, i32, i32)] {
+        &self.host.ui_polled_events
     }
 
     /// The VM program counter (code-word index) — the faulting PC after a trap.
@@ -250,6 +340,26 @@ impl BytecodeAppSession {
         &self.host.static_text_colors
     }
 
+    pub fn ui_rects(&self) -> &[(i32, i32, i32, i32, i32)] {
+        &self.host.ui_rects
+    }
+
+    pub fn ui_text(&self) -> &[(i32, i32, String)] {
+        &self.host.ui_text
+    }
+
+    pub fn ui_text_colors(&self) -> &[i32] {
+        &self.host.ui_text_colors
+    }
+
+    pub(super) fn ui_text_layouts(&self) -> &[super::host::SimUiTextLayout] {
+        &self.host.ui_text_layouts
+    }
+
+    pub(super) fn ui_commands(&self) -> &[super::host::SimUiCommand] {
+        &self.host.ui_commands
+    }
+
     /// Retained Game2D text layer (KOTO-0141): id-keyed text items composited in
     /// fixed z-order above the sprite layer and below the per-frame immediate text.
     /// `None` slots are hidden/unused.
@@ -331,7 +441,10 @@ impl BytecodeAppSession {
             heap_budget: self.sram_work_bytes,
             frame_fuel_peak: vm.frame_fuel_peak,
             frame_fuel_cap: SIM_FRAME_FUEL,
+            frame_time_us_peak: self.frame_time_us_peak,
             host_calls_per_frame_peak: vm.host_calls_per_frame_peak,
+            ui_session_sram_bytes: koto_core::UI_SESSION_SRAM_BYTES,
+            ui_render_commands_peak: self.ui_render_commands_peak,
             open_files_peak: self.open_files_peak,
             open_files_cap: SIM_MAX_OPEN_FILES,
             draw_rects_peak: self.draw_rects_peak,

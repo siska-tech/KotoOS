@@ -1,0 +1,32 @@
+// KOTO-0228: one App-lifetime record, initialized in the KBC heap image.
+struct CounterState {
+    value: int,
+    enabled: bool,
+}
+
+static counter: CounterState = {
+    value: 0,
+    enabled: true,
+};
+
+impl CounterState {
+    fn increment(self) {
+        if self.enabled {
+            self.value = self.value + 1;
+        }
+    }
+
+    fn reset(self) {
+        self.value = 0;
+    }
+}
+
+fn current(state: CounterState) -> int {
+    return state.value;
+}
+
+fn main() {
+    counter.increment();
+    counter.increment();
+    exit(current(counter));
+}

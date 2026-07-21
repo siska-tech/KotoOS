@@ -54,9 +54,10 @@ is dictated by the runtime contract:
 - `bool` — `true` / `false`, represented as `1` / `0`.
 - `buf` — a fixed-size byte buffer in the app heap: `buf name[N];`.
 
-No structs, enums, arrays-of-int, floats, or pointers in the MVP. A `buf` decays to
-its heap offset (an `int`) when passed to a host/SDK call, paired with an explicit
-length.
+There are no arrays-of-int, floats, general pointers, or dynamically allocated
+objects. The deliberately bounded static-record model is described below. A
+`buf` decays to its heap offset (an `int`) when passed to a host/SDK call, paired
+with an explicit length.
 
 ### Local variables and constants
 
@@ -64,12 +65,225 @@ length.
 let cursor = 0;        // int local, mutable
 let done = false;      // bool local
 const MAX = 512;       // compile-time constant, no runtime slot
-buf doc[512];          // 512-byte heap buffer
+const COPY = MAX;      // a previously declared const is also accepted
+buf doc[MAX];          // 512-byte heap buffer
 ```
 
 `let` binds a mutable local; the compiler maps it to a local slot or a heap-backed
-scratch cell. `const` is folded at compile time. `buf` reserves a heap region with a
-static offset.
+scratch cell. `const` is folded at compile time. Its v1 right-hand side is a
+literal, a previously declared const, one of the checked KotoUI capacity
+helper calls described in `KOTO_SDK.md`, or a compile-time asset helper call
+(below); this is deliberately not a general compile-time function evaluator. `buf` reserves
+a heap region with a static offset; its size is a positive integer literal, a
+previously declared positive integer `const`, a direct KotoUI capacity-helper
+call (`buf packet[ui_update_capacity(1, 19)];`), which keeps one-transaction
+sizing facts on the declaration and carries the same compile-time boundary
+diagnostics as the `const` form (KOTO-0233), or a direct asset helper call
+(KOTO-0236/0237).
+
+**Additive compile-time expressions (KOTO-0238).** In the three compile-time
+integer positions — a `const` initializer, a local or struct-field `buf`
+size, and an integer helper argument — those atoms may be joined
+left-to-right by `+` or `-` (`buf tmp[DOC_BYTES + 4];`,
+`ui_update_capacity(4, STATUS_BYTES + DOC_BYTES)`), so arena totals compose
+from independently derived capacities instead of hand-computed literals.
+Folding checks the signed 32-bit integer domain at every step, and a `buf`
+size must still fold positive. There are no parentheses, no multiplication,
+and no runtime spill: mixing a runtime value into a compile-time position
+stays a compile error, and ordinary runtime expressions are unaffected.
+
+### Compile-time asset sizes: `asset_len` (KOTO-0236)
+
+```koto
+const RAW_BYTES =
+    asset_len("locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+buf raw[RAW_BYTES];
+let loaded = asset_load("locales/en-US.txt", 17, raw, len(raw));
+```
+
+`asset_len("path/in/package")` folds to the named package asset's byte size at
+compile time; with two or more arguments it folds to the **maximum** of the
+named assets' sizes (the multi-locale case). It is valid exactly where the
+capacity helpers are valid — a top-level `const` initializer, a local `buf`
+size, a struct buffer-field size, and as an argument to a compile-time
+capacity helper — and nowhere else: there is no runtime form, so naming it in
+an ordinary expression is a compile error.
+
+**Path identity.** `asset_len` and `asset_load` share one namespace: the
+package asset paths declared as `output` in the app manifest's `assets` block
+(`app.json`, discovered as the nearest manifest above the root source file),
+which is exactly the set the runtime host permits. The same string literal
+means the same asset in both positions, and resolution is
+position-independent — any source file in the program, including SDK
+includes, sees the same namespace. It is deliberately *not* include-style
+source-file-relative resolution. Corollary: any literal `asset_len` accepts
+is a valid `asset_load` argument whose runtime permission check cannot fail,
+and the folded size is the size of the bytes that ship in the package, so a
+translation that grows re-folds its storage on the next build instead of
+failing at load time.
+
+**V1 restrictions.** Paths are string literals only (no consts, no
+concatenation, no glob). `asset_len` covers manifest entries packaged
+verbatim (copy-through `assets` entries); pipeline-transformed outputs
+(PNG→`.kim`, KMML→KAQ1) have sizes the compiler cannot see from the source
+file, and naming one is a focused diagnostic, as is any path not declared in
+the manifest. An asset that folds to 0 bytes cannot size a buffer. Because
+asset bytes fold into committed bytecode, packaged text assets pin `eol=lf`
+in `.gitattributes` so sizes do not depend on checkout line endings.
+
+### Compile-time text asset shape (KOTO-0237/0238)
+
+```koto
+const LINES = asset_text_line_count("locales/en-US.txt", "locales/ja-JP.txt");
+const LABEL_BYTES = asset_text_max_range_bytes(
+  9, 3, "locales/en-US.txt", "locales/ja-JP.txt");
+const STATUS_BYTES = asset_text_max_line_bytes(
+  4, LINES - 4, "locales/en-US.txt", "locales/ja-JP.txt");
+```
+
+`asset_text_line_count(path, ...)` returns the common line count and rejects
+the first asset whose count differs. `asset_text_max_range_bytes(first_line,
+line_count, path, ...)` sums the UTF-8 byte lengths in that half-open line
+range for each asset and returns the largest per-asset sum. It does not return
+the longest single line or sum independent per-line maxima.
+`asset_text_max_line_bytes(first_line, line_count, path, ...)` takes the same
+arguments and returns the maximum byte length of any *single* line in the
+range across all listed assets (KOTO-0238). The first line is non-negative,
+the count is positive, and the complete range must exist in every asset.
+
+The two range helpers answer distinct sizing questions: `max_range_bytes`
+bounds the payload one packet actually copies (only one locale is resident, so
+per-line maxima would reserve an impossible combination), while
+`max_line_bytes` bounds a retained component slot whose capacity is fixed at
+mount and must fit whichever indexed line a later `text_resource` update
+selects — there the one-of-N line maximum is the exact bound.
+
+Both forms share `asset_len`'s path namespace, string-literal V1 restriction,
+compile-time-only positions, and focused undeclared/transformed/unreadable
+diagnostics. Text must be valid UTF-8. LF and CRLF terminate lines, internal
+empty lines count with zero payload bytes, a final delimiter does not create
+another empty line, empty input has zero lines, and bare CR is rejected. These
+are exactly `TextResource::parse` boundaries; lengths count encoded bytes, not
+Unicode scalar values or displayed glyphs.
+
+### Integer enums
+
+```koto
+enum GalleryLocale {
+    En,          // 0
+    Ja,          // 1
+    QpsPloc = 8,
+    Fallback,    // 9
+}
+
+let locale = GalleryLocale::Ja;
+```
+
+Enums are top-level compile-time integer domains. The first implicit member is
+zero; later implicit members increment the previous value, and an explicit
+signed 32-bit integer literal resets the sequence. A trailing comma is allowed,
+and duplicate numeric values are valid protocol aliases. Enum and member names
+must be unique in their scopes; textual `include` expansion applies normally.
+
+`Name::Member` is an ordinary `int` constant: it can be compared with integers,
+passed to `int` parameters, stored in buffers, and folded by the compiler. It
+allocates no VM slot or heap object and introduces no opcode, RTTI, or host ABI.
+v1 deliberately has no strong enum/int separation, payload variants, `match`,
+exhaustiveness checking, or bitflag syntax. Masks and composable flags remain
+flat `const` values.
+
+### Static records and inline methods
+
+```koto
+struct CounterState {
+    value: int,
+    enabled: bool,
+}
+
+static counter: CounterState = { value: 0, enabled: true, };
+
+impl CounterState {
+    fn increment(self) {
+        if self.enabled { self.value = self.value + 1; }
+    }
+}
+
+fn read(state: CounterState) -> int { return state.value; }
+```
+
+`struct` declares a compile-time field layout; declaration order assigns each
+`int` or `bool` field one little-endian 32-bit word. A top-level `static`
+reserves exactly one mutable instance for the App lifetime. Its named scalar
+fields must be complete and unique, and literals, `const` values, and enum
+members are written into the initial KBC heap image. Initializer order does not
+affect the layout. The record's checked byte size contributes directly to the
+App heap request and consumes no local slot per field.
+
+Reading `value.field` lowers to `load32`; assigning `value.field = expression`
+lowers to `store32`. Passing a static to a parameter of the same struct type
+passes its base heap offset without copying. `value.method(args...)` resolves by
+receiver type and inlines the matching `impl` method exactly like a free
+function whose first parameter is the reference. Calls therefore add no opcode,
+runtime type metadata, or dynamic dispatch, but each call site still pays the
+method body's bytecode cost and retains the normal recursion rejection.
+
+V1 intentionally rejects block-local `static`, stored aliases (`let copy =
+counter`), record assignment/copy, struct returns, constructor-like `Type {
+... }` expressions, nested records, arrays of records, allocation, equality,
+destructuring, inheritance, traits, and generics. Use a method such as `reset`
+for explicit reinitialization; the initializer itself runs only at App load.
+
+#### Fixed buffer fields (KOTO-0235)
+
+```koto
+struct NoteStorage {
+    doc: buf[64],                           // fixed byte region
+    state: buf[4],
+    mount: buf[ui_mount_capacity(5, 176)],  // capacity helper as a field size
+    dirty: bool,                            // scalars mix freely
+}
+
+static note_app: NoteStorage = { dirty: false, };
+
+fn note_sync(app: NoteStorage) {
+    if ui_mount(app.mount, len(app.mount)) < 0 { return; }
+}
+```
+
+A struct field may be a fixed-size byte region, `name: buf[N]`. The size takes
+the same forms as a local `buf` declaration — positive integer literal, prior
+integer `const`, a KotoUI capacity-helper call, or an `asset_len` call — with
+identical boundary diagnostics (KOTO-0232/0233/0236). Layout stays declaration-ordered with checked
+offsets: scalars keep one 32-bit word, a buffer field takes its declared
+capacity, and the whole record counts into the exact App heap request.
+
+Buffer fields make structure and slot economy compatible: helpers keep
+receiving one typed base reference, while every region offset and the total
+size become compiler-owned instead of hand-summed `const` offsets.
+
+- **Reads are addresses.** `value.field` lowers to `base + offset` with no
+  trailing `load32` — a buffer field decays to its region offset exactly like a
+  named `buf`. On a `static` receiver the address folds to one constant; on a
+  struct parameter it is one runtime add, identical to hand-written
+  `app + REGION_OFFSET`. Passing `value.field` to a host/SDK call passes the
+  address; no length pairing is implied by the type.
+- **`len(value.field)`** folds to the declared capacity at compile time, on
+  statics and struct parameters alike, with no heap read, local slot, or
+  runtime instructions. Scalar fields, unknown fields, and non-struct
+  receivers are compile-time errors.
+- **Not assignable, not initializable.** `value.field = x;` and an initializer
+  entry for a buffer field are compile errors. Buffer regions are
+  zero-initialized (the VM heap starts zeroed); write through
+  `heap_set_u8(value.field + i, x)` as with any buffer.
+- **KBC image rule.** Buffer-field regions contribute no bytes to the rodata
+  heap image — only scalar fields materialize; the loader zero-fills the heap
+  above the image. A buffer field that is *followed* by initialized bytes (a
+  later scalar field or a later initialized `static`) leaves a zero run inside
+  the image, so declare large buffer-carrying statics (and their buffer
+  fields) last to keep the image compact.
+- **V1 restrictions.** No indexing sugar (`value.field[i]`; use
+  `heap_get_u8(value.field + i)`), no nested structs, and the KOTO-0228
+  alias/copy/return rejections are unchanged.
 
 ### Expressions and operators
 
@@ -100,8 +314,8 @@ fn clamp(v: int, lo: int, hi: int) -> int { ... }
 ```
 
 - `fn main()` is the entry point and owns the frame loop.
-- Parameters and returns are `int`/`bool` only; `buf` is passed as its `int` offset
-  plus an explicit length argument.
+- Parameters are `int`, `bool`, or a V1 struct reference. Returns are `int`/`bool`
+  only; `buf` is passed as its `int` offset plus an explicit length argument.
 - **Non-recursive** in the MVP (the flat 48-slot register file makes a call stack of
   locals impossible without a software frame). The compiler **inlines every function**
   at its call site (there are no `call`/`ret` opcodes; local slots are allocated
@@ -121,15 +335,19 @@ fn clamp(v: int, lo: int, hi: int) -> int { ... }
 
 ```koto
 include "dungeon.koto";   // path relative to the including file
+include <sdk/koto_ui.koto>; // standard SDK path, rooted at the workspace
 ```
 
-- A whole line of the form `include "relative/path.koto";` (optional trailing
-  `//` comment) is replaced **before lexing** by the named file's contents.
+- A whole line of the form `include "relative/path.koto";` or
+  `include <sdk/library.koto>;` (optional trailing `//` comment) is replaced
+  **before lexing** by the named file's contents.
   The program then compiles exactly as if it were one file: a faithful,
   line-preserving split produces **byte-identical bytecode**. Diagnostics are
   remapped, so errors report the defining file and line.
-- Paths use `/`, must be relative, and resolve against the including file's
-  directory. Nesting is allowed (depth ≤ 16); each file may be included
+- Quoted paths use `/`, must be relative, and resolve against the including
+  file's directory. Angle-bracket paths are reserved for `sdk/`, resolve from
+  the workspace root, and reject `.` or `..` components. Nesting is allowed
+  (depth ≤ 16); each file may be included
   **once per program** — a re-include or cycle is a compile error at the
   second include site.
 - **Cost warning:** `include` does not change the inlining model above. A
@@ -148,6 +366,12 @@ include "dungeon.koto";   // path relative to the including file
   then passed as `(offset, byte_len)`.
 - `buf name[N]` is zero-initialized (the VM heap starts zeroed). `len(buf)` is the
   compile-time capacity; runtime content length is whatever the app/host tracks.
+  `len` folds to an integer constant with no heap read, local slot, or runtime
+  metadata — a buffer stays a raw heap offset. Its operand must name a `buf`
+  visible at that point under normal identifier resolution (a `let` or parameter
+  of the same name shadows the buffer for its block) or a struct buffer field
+  (`len(value.field)`, KOTO-0235); integers, unknown names, not-yet-declared
+  buffers, and other functions' buffers are compile-time errors (KOTO-0233).
 - Helper intrinsics in the SDK prelude (KOTO-0047) cover copying a literal into a
   buffer and similar bounded operations; the language core has no string objects.
 

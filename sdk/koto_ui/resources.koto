@@ -1,0 +1,208 @@
+// Caller-owned indexed UTF-8 text. `parse` uses four bytes per available line
+// (u16 payload offset + u16 byte length), followed by compact line payloads.
+// The representation is SDK-private; callers retain both raw and parsed
+// storage for the duration of parse, then retain parsed storage while reading.
+struct TextResource {
+    storage: int,
+    capacity: int,
+    line_capacity: int,
+    line_count: int,
+    payload_offset: int,
+    payload_len: int,
+    status: int,
+    complete: bool,
+}
+
+// Caller-owned KUI1/KUP1 List row blob builder. It reserves the complete
+// 12-byte row table selected by begin, then appends labels through one cursor.
+struct UiListRowsBuilder {
+    blob: int,
+    capacity: int,
+    row_capacity: int,
+    row_count: int,
+    label_cursor: int,
+    status: int,
+    active: bool,
+    complete: bool,
+}
+
+impl TextResource {
+    fn parse(self, raw: int, raw_len: int, dst: int, dst_capacity: int,
+        line_capacity: int) -> int {
+        // A new parse is the explicit reset/reuse operation. Validate the full
+        // source and every output bound before touching caller-owned storage.
+        self.status = UI_SDK_OK;
+        self.complete = false;
+        if raw_len < 0 || raw_len > 65535 || dst_capacity < 0 || line_capacity < 0 ||
+           line_capacity > 16383 || dst_capacity > 65535 {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let table_bytes = line_capacity * 4;
+        if table_bytes > dst_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        if ui_sdk_utf8_valid(raw, raw_len) != UI_SDK_OK {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let lines = 0;
+        let payload_len = 0;
+        let i = 0;
+        while i < raw_len {
+            let byte = heap_get_u8(raw + i);
+            if byte == 13 {
+                if i + 1 >= raw_len { self.status = UI_SDK_BAD_ARGUMENT; return self.status; }
+                if heap_get_u8(raw + i + 1) != 10 {
+                    self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+                }
+                if lines >= line_capacity { self.status = UI_SDK_BAD_ARGUMENT; return self.status; }
+                lines = lines + 1; i = i + 2;
+            } else if byte == 10 {
+                if lines >= line_capacity { self.status = UI_SDK_BAD_ARGUMENT; return self.status; }
+                lines = lines + 1; i = i + 1;
+            } else {
+                payload_len = payload_len + 1;
+                i = i + 1;
+            }
+        }
+        // A delimiter terminates its line; it does not synthesize an extra
+        // trailing empty line. Empty input therefore contains zero lines.
+        if raw_len > 0 {
+            if heap_get_u8(raw + raw_len - 1) != 10 {
+                if lines >= line_capacity {
+                    self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+                }
+                lines = lines + 1;
+            }
+        }
+        if table_bytes + payload_len > dst_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+
+        ui_sdk_zero(dst, table_bytes + payload_len);
+        i = 0; let line = 0; let line_start = 0; let cursor = 0;
+        while i < raw_len {
+            let byte = heap_get_u8(raw + i);
+            if byte == 10 || byte == 13 {
+                heap_set_u16(dst + line * 4, line_start);
+                heap_set_u16(dst + line * 4 + 2, cursor - line_start);
+                line = line + 1; line_start = cursor;
+                if byte == 13 { i = i + 2; } else { i = i + 1; }
+            } else {
+                heap_set_u8(dst + table_bytes + cursor, byte);
+                cursor = cursor + 1; i = i + 1;
+            }
+        }
+        if line < lines {
+            heap_set_u16(dst + line * 4, line_start);
+            heap_set_u16(dst + line * 4 + 2, cursor - line_start);
+        }
+        self.storage = dst; self.capacity = dst_capacity;
+        self.line_capacity = line_capacity; self.line_count = lines;
+        self.payload_offset = table_bytes; self.payload_len = payload_len;
+        self.complete = true;
+        return lines;
+    }
+
+    fn count(self) -> int {
+        if self.status != UI_SDK_OK { return self.status; }
+        if !self.complete { self.status = UI_SDK_BAD_ARGUMENT; return self.status; }
+        return self.line_count;
+    }
+
+    fn line_ptr(self, index: int) -> int {
+        if self.status != UI_SDK_OK { return self.status; }
+        if !self.complete { self.status = UI_SDK_BAD_ARGUMENT; return self.status; }
+        if index < 0 || index >= self.line_count {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        return self.storage + self.payload_offset + heap_get_u16(self.storage + index * 4);
+    }
+
+    fn line_len(self, index: int) -> int {
+        if self.status != UI_SDK_OK { return self.status; }
+        if !self.complete { self.status = UI_SDK_BAD_ARGUMENT; return self.status; }
+        if index < 0 || index >= self.line_count {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        return heap_get_u16(self.storage + index * 4 + 2);
+    }
+}
+
+impl UiListRowsBuilder {
+    fn begin(self, blob: int, capacity: int, row_capacity: int) -> int {
+        if self.active {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        self.complete = false;
+        if capacity < 0 || capacity > 65535 || row_capacity < 0 ||
+           row_capacity > UI_MAX_LIST_ROWS || row_capacity * 12 > capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; self.active = false; return self.status;
+        }
+        self.blob = blob; self.capacity = capacity; self.row_capacity = row_capacity;
+        self.row_count = 0; self.label_cursor = row_capacity * 12;
+        self.status = UI_SDK_OK; self.active = true;
+        return UI_SDK_OK;
+    }
+
+    fn row(self, enabled: bool, label: int, label_len: int, app_value: int) -> int {
+        if !self.active { return UI_SDK_BAD_ARGUMENT; }
+        if self.status != UI_SDK_OK { return self.status; }
+        if self.row_count >= self.row_capacity || label_len < 0 || label_len > 65535 ||
+           self.label_cursor + label_len > self.capacity ||
+           ui_sdk_utf8_valid(label, label_len) != UI_SDK_OK {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let record = self.blob + self.row_count * 12;
+        heap_set_u16(record, self.label_cursor);
+        heap_set_u16(record + 2, label_len);
+        heap_set_u16(record + 4, 0);
+        if enabled { heap_set_u16(record + 4, 1); }
+        heap_set_u16(record + 6, 0);
+        ui_sdk_put_u32(record, 8, app_value);
+        let i = 0;
+        while i < label_len {
+            heap_set_u8(self.blob + self.label_cursor + i, heap_get_u8(label + i));
+            i = i + 1;
+        }
+        self.label_cursor = self.label_cursor + label_len;
+        self.row_count = self.row_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn resource_row(self, enabled: bool, resource: TextResource,
+        line: int, app_value: int) -> int {
+        if !self.active { return UI_SDK_BAD_ARGUMENT; }
+        if self.status != UI_SDK_OK { return self.status; }
+        if !resource.complete || resource.status != UI_SDK_OK ||
+           line < 0 || line >= resource.line_count || self.row_count >= self.row_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let label_len = heap_get_u16(resource.storage + line * 4 + 2);
+        if self.label_cursor + label_len > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let record = self.blob + self.row_count * 12;
+        heap_set_u16(record, self.label_cursor); heap_set_u16(record + 2, label_len);
+        heap_set_u16(record + 4, 0); if enabled { heap_set_u16(record + 4, 1); }
+        heap_set_u16(record + 6, 0); ui_sdk_put_u32(record, 8, app_value);
+        let src = resource.storage + resource.payload_offset +
+            heap_get_u16(resource.storage + line * 4);
+        let i = 0;
+        while i < label_len {
+            heap_set_u8(self.blob + self.label_cursor + i, heap_get_u8(src + i));
+            i = i + 1;
+        }
+        self.label_cursor = self.label_cursor + label_len;
+        self.row_count = self.row_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn finish(self) -> int {
+        if !self.active { return UI_SDK_BAD_ARGUMENT; }
+        self.active = false;
+        if self.status != UI_SDK_OK { return self.status; }
+        self.complete = true;
+        return self.label_cursor;
+    }
+}

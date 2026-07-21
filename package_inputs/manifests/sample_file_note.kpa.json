@@ -22,6 +22,21 @@
       "path": "icons/sample_file_note.kicon",
       "type": "image",
       "sequential": false
+    },
+    {
+      "path": "locales/en-US.txt",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "locales/ja-JP.txt",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "locales/qps-ploc.txt",
+      "type": "data",
+      "sequential": true
     }
   ],
   "permissions": {

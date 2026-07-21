@@ -259,6 +259,32 @@ success shape leaks the operand stack on failure.
 | 0x43 | `file_close`         | `handle`                 | none                    | Invalid handles fail.                                                     |
 | 0x44 | `asset_load`         | `path_ptr path_len dst_ptr dst_max` | `bytes_read`  | Copies a read-only, manifest-declared package asset into the app heap in one shot. |
 | 0x45 | `asset_load_range`   | `path_ptr path_len offset dst_ptr dst_max` | `bytes_read` | Host ABI minor 17. Copies a range of a read-only package asset into the app heap. |
+| 0x46 | `fetch_start`        | `url_ptr url_len`        | `request_id`            | Host ABI minor 19. Starts one permission-checked GET; nonblocking.          |
+| 0x47 | `fetch_poll`         | `request_id`             | `state metadata`        | Host ABI minor 19. `metadata` is HTTP status for `Headers` or a fixed error for `Failed`. |
+| 0x48 | `fetch_read`         | `request_id dst_ptr max` | `bytes_read`            | Host ABI minor 19. Copies at most 512 response bytes into caller-owned VM memory. |
+| 0x49 | `fetch_cancel`       | `request_id`             | none                    | Host ABI minor 19. Cancels an owned live request.                          |
+| 0x4A | `json_reset`         | none                     | none                    | Host ABI minor 20. Resets the host-owned bounded JSON decoder for a fresh document. |
+| 0x4B | `json_next`          | `src_ptr len`            | `event`                 | Host ABI minor 20. Feeds a caller-owned chunk and pulls one stable event code; `(consumed, depth)` follow via `json_status`. |
+| 0x4C | `json_finish`        | none                     | `event`                 | Host ABI minor 20. Signals end of input; a flushed trailing number needs one more call. |
+| 0x4D | `json_token`         | `dst_ptr dst_max`        | `bytes_written`         | Host ABI minor 20. Copies the latest Key/Str/Number token; never truncates (`BAD_ARGUMENT` if `dst_max` is short). |
+| 0x4E | `json_error`         | none                     | `error_code byte_offset` | Host ABI minor 20. Sticky failure state, `(0, 0)` while healthy.          |
+| 0x4F | `json_status`        | none                     | `consumed depth`        | Host ABI minor 20. Bytes consumed by the latest `json_next` and current nesting depth. |
+| 0x50 | `ui_capabilities`    | `dst_ptr dst_max`        | `bytes_written`         | Host ABI minor 18. Writes the 64-byte `KUC1` capacity/current-locale record. |
+| 0x51 | `ui_mount`           | `src_ptr len`            | none                    | Host ABI minor 18. Atomically mounts a validated `KUI1` retained component description. |
+| 0x52 | `ui_update`          | `src_ptr len`            | none                    | Host ABI minor 18. Atomically applies a `KUP1` property batch to stable widget IDs. |
+| 0x53 | `ui_present`         | none                     | none                    | Host ABI minor 18. Schedules pending KotoUI damage and is an idle no-op when unchanged. |
+| 0x54 | `ui_poll_event`      | `dst_ptr dst_max`        | `bytes_written`         | Host ABI minor 18. Writes one semantic `KUE1` event or returns zero bytes when empty. |
+| 0x55 | `ui_reset`           | none                     | none                    | Host ABI minor 18. Clears the current app's bounded KotoUI session. |
+| 0x56 | `time_query`         | `kind`                   | `value`                 | Host ABI minor 21. Advisory time selector: UTC seconds (`-1` while unsynchronized), configured UTC offset minutes, or 30-bit wrapping monotonic milliseconds. |
+| 0x57 | `vault_handle`       | `service url_ptr url_len` | `handle`               | Host ABI minor 22. Resolves the running app's opaque credential handle for a destination; `0` means no grant applies. Never exposes a secret. |
+| 0x58 | `fetch_start_authenticated` | `url_ptr url_len handle` | `request_id`     | Host ABI minor 22. Starts one allowlisted GET with the OS-owned credential injected inside the authenticated transport. A zero/stale/foreign/off-endpoint handle fails closed. |
+| 0x59 | `mqtt_connect`       | `broker_index`           | `session`               | Host ABI minor 23. Opens a session to the manifest broker at `broker_index`; returns a generation-tagged handle. One session per app and one globally. |
+| 0x5A | `mqtt_subscribe`     | `session topic_index`    | `0`                     | Host ABI minor 23. Subscribes a connected session to the manifest exact topic filter at `topic_index`. A topic outside the grant fails closed. |
+| 0x5B | `mqtt_poll`          | `session`                | `state`                 | Host ABI minor 23. Advances and reads the lifecycle state: `0` connecting, `1` connected, `2` message queued, `3` disconnected, `4` failed. |
+| 0x5C | `mqtt_peek`          | `session`                | `topic_len payload_len` | Host ABI minor 23. Full lengths of the oldest queued message without consuming it, so the app can size buffers. `(0, 0)` when empty. Idempotent. |
+| 0x5D | `mqtt_read`          | `session t_ptr t_max p_ptr p_max` | `kind`         | Host ABI minor 23. Copies and consumes the oldest message: `0` none, `1` delivered, `2` delivered retained. A message too large for either buffer is consumed and fails closed, never truncated. |
+| 0x5E | `mqtt_disconnect`    | `session`                | `0`                     | Host ABI minor 23. Disconnects and zeroizes the session. |
+| 0x5F | `mqtt_dropped`       | `session`                | `dropped`               | Host ABI minor 23. Saturating count of messages dropped by the OS queue overflow policy (drop-oldest). Idempotent. |
 | 0x60 | `ime_feed_key`       | `kind codepoint`         | none                    | Feeds one key into the host IME+editor. `kind` is an `ime_key` value.     |
 | 0x61 | `ime_convert`        | none                     | none                    | Runs dictionary conversion on the current reading.                        |
 | 0x62 | `ime_query_line`     | `ptr max_len`            | `bytes_written`         | Serializes the IME composition line into the app heap.                    |
@@ -351,6 +377,75 @@ layers described in [GAME2D_ABI.md](GAME2D_ABI.md). Host ABI minor version `16`
 adds `game2d_configure_tilemap` (id `0x22`, KOTO-0199): layer 0 has allocation-free
 20x20 maximum storage, while each app selects active columns/rows and a signed
 pixel origin. Apps that do not configure it keep the legacy 10x20 `(8, 0)` shape.
+
+Host ABI minor version `17` adds persistent RGB565 image writes (`0x23`) and
+ranged package-asset reads (`0x45`). Host ABI minor version `18` implements IDs
+`0x50`–`0x55` as the bounded KotoUI app session documented in
+[KOTOUI_APP_ABI.md](KOTOUI_APP_ABI.md). Minor-17 and older programs continue to
+verify and run without using the new session.
+
+Host ABI minor version `19` adds the bounded Fetch calls (`0x46`–`0x49`). The
+implicit `AppContext` supplies package identity and its exact-origin capability;
+VM memory receives copied status and response bytes only. Minor-18 and older
+programs continue to verify and run without network access.
+
+Host ABI minor version `20` adds the bounded incremental JSON decoder calls
+(`0x4A`–`0x4F`, KOTO-0246). The host owns one fixed-size decoder session per
+app (`koto_core::JsonHostSession`, identical in KotoSim and on device); input
+chunks stay in caller-owned VM memory, completed tokens are copied out through
+`json_token`, and no document tree is built. Event and error codes, and the
+`MAX_JSON_DEPTH`/`MAX_JSON_TOKEN_BYTES`/`MAX_JSON_NUMBER_BYTES` limits, are the
+frozen `koto_core::json` constants surfaced as `JSON_*` SDK constants. Because
+`json_next` is not idempotent, it returns only the event code; the companion
+`(consumed, depth)` pair is read through the idempotent `json_status` call.
+Minor-19 and older programs continue to verify and run unchanged.
+
+Host ABI minor version `21` adds the advisory `time_query` call (`0x56`,
+KOTO-0247). One selector argument (`koto_core::time::app_time_query`, surfaced
+as the `TIME_*` SDK constants) chooses the returned value: synchronized UTC
+seconds from the KOTO-0244 SNTP publication (`-1` before the first valid
+synchronization, after network-generation loss, or outside the `i32` range),
+the user-configured KotoConfig UTC offset in minutes, or monotonic milliseconds
+masked to 30 bits (`TIME_MONOTONIC_MASK`) so values stay non-negative and wrap
+deterministically. The clock is unauthenticated display/cache-age data: it must
+never authorize, order, or expire anything, and unknown time is a normal state
+an app presents explicitly. Minor-20 and older programs continue to verify and
+run unchanged.
+
+Host ABI minor version `22` adds the application credential vault calls
+(`0x57`–`0x58`, KOTO-0248). `vault_handle(service, url_ptr, url_len)` resolves
+the running app's opaque, generation-tagged `CredentialHandle` for a destination
+it is granted, returning `0` when no grant applies (default-denied); no secret
+byte is ever exposed to the application. `fetch_start_authenticated(url_ptr,
+url_len, handle)` starts one allowlisted GET with the OS-owned credential
+injected inside the authenticated transport, after the host re-checks the app
+id, service, exact endpoint, and TLS; a zero, stale, foreign, or off-endpoint
+handle fails closed with a fixed error before any secret is touched. The
+application supplies only a URL and an opaque handle, never a secret, header, or
+login. Grants are created and revoked out of band through the OS-owned vault and
+its consent flow, not through this ABI. Minor-21 and older programs continue to
+verify and run unchanged.
+
+Host ABI minor version `23` adds the bounded MQTT subscribe service (`0x59`–
+`0x5F`, KOTO-0249). A foreground app receives bounded live telemetry through an
+OS-owned MQTT 3.1.1 QoS-0 subscribe profile: it names a manifest-declared broker
+and exact topic *by index* (`mqtt_connect`, `mqtt_subscribe`), advances the
+session (`mqtt_poll`), and drains complete messages into its own bounded buffers
+(`mqtt_peek` to size, then `mqtt_read` to consume). It never sees a socket, TLS
+state, or credential byte; on device, authenticated brokers use the OS-owned
+KOTO-0248 grant injected transport-side, and plain `mqtt://` is development-only.
+Handles are generation-tagged and app-context-bound, so a stale, foreign, or
+unknown handle fails closed. `mqtt_read` copies at most `t_max`/`p_max` bytes and
+reports a message too large for either buffer as a fixed error — a truncated
+message is never delivered as complete. The inbound queue is a fixed eight-deep
+drop-oldest ring: memory never grows with message rate or payload size, and
+`mqtt_dropped` surfaces the saturating overflow count. State codes (`MQTT_*`),
+read results (`MQTT_READ_*`), and the frozen capacity profile are the
+`koto_core::mqtt` constants surfaced as SDK constants. The service is cancelled
+and zeroized on app exit, capability loss, network-generation change, permission
+revocation, or teardown; an inactive app receives no background messages, and an
+unsupported/offline build returns a stable `Unavailable`. Minor-22 and older
+programs continue to verify and run unchanged.
 
 ### Input Snapshot Fields
 

@@ -11,7 +11,7 @@ committed ``APPS/*.kpa`` archive. Each app declares a ``kind``:
 - ``asm``: low-level ``kbc-asm`` assembly / IR.
 
 An ``app.json`` is the single authoring surface: it carries the build recipe
-(``source``, optional ``codegen`` / ``maps`` / ``images`` / ``audio``) *and*
+(``source``, optional ``codegen`` / ``assets`` / ``maps`` / ``images`` / ``audio``) *and*
 the package descriptor (``name``, ``description``, ``category``, ``icon``,
 ``shell_icon``, ``memory``, ``permissions``). In-app paths are app-relative so
 the folder is copy-paste portable; the staged ``.kpa.json`` manifest and the
@@ -100,14 +100,22 @@ def discover_apps(errors: list[str]) -> list[dict]:
 def build_manifest(app: dict) -> dict:
     """Generate the packaging manifest (`.kpa.json`) from an app descriptor.
 
-    Asset order is bytecode, icon, maps, images, audio — the layout the packer turns
-    into the archive, so it is what keeps a ``.kpa`` reproducible.
+    Asset order is bytecode, icon, generic data, maps, images, audio — the layout
+    the packer turns into the archive, so it keeps a ``.kpa`` reproducible.
     """
     package = app["_package"]
     assets = [
         {"path": f"bytecode/{package}.kbc", "type": "bytecode", "sequential": True},
         {"path": f"icons/{package}.kicon", "type": "image", "sequential": False},
     ]
+    for asset in app.get("_data_assets", []):
+        assets.append(
+            {
+                "path": asset["path"],
+                "type": "data",
+                "sequential": asset["sequential"],
+            }
+        )
     for map_asset in app.get("_map_assets", []):
         assets.append({"path": map_asset["path"], "type": "data", "sequential": True})
     for image in app.get("images", []):
@@ -118,9 +126,15 @@ def build_manifest(app: dict) -> dict:
             )
     for audio in app.get("audio", []):
         assets.append({"path": audio["output"], "type": "audio", "sequential": True})
+    permissions = app.get("permissions", {"fs": "sandbox", "network": False})
+    network = permissions.get("network") if isinstance(permissions, dict) else None
+    mqtt = permissions.get("mqtt") if isinstance(permissions, dict) else None
+    # The structured `network` (fetch origins) and `mqtt` (brokers/topics)
+    # declarations are schema v2; a bare boolean `network` stays v1.
+    manifest_version = 2 if isinstance(network, dict) or isinstance(mqtt, dict) else 1
     manifest = {
         "format": "kpa-manifest",
-        "version": 1,
+        "version": manifest_version,
         "app_id": app["app_id"],
         "name": app["name"],
         "entry": f"bytecode/{package}.kbc",
@@ -134,7 +148,7 @@ def build_manifest(app: dict) -> dict:
     if "memory" in app:
         manifest["memory"] = app["memory"]
     manifest["assets"] = assets
-    manifest["permissions"] = app.get("permissions", {"fs": "sandbox", "network": False})
+    manifest["permissions"] = permissions
     return manifest
 
 
@@ -295,6 +309,42 @@ def generate_maps(app: dict, check: bool, errors: list[str]) -> None:
     if len(errors) != before or not assets:
         return
     app["_map_assets"] = assets
+
+
+def register_data_assets(app: dict, errors: list[str]) -> None:
+    """Validate app-local generic files and register read-only KPA data assets."""
+    registered = []
+    for asset in app.get("assets", []):
+        if not isinstance(asset, dict):
+            errors.append(f"{app.get('app_id')}: assets entries must be objects")
+            continue
+        source = asset.get("source")
+        output = asset.get("output", source)
+        if not isinstance(source, str) or not source or not isinstance(output, str) or not output:
+            errors.append(f"{app.get('app_id')}: asset requires non-empty `source` and `output`")
+            continue
+        safe = True
+        for label, value in (("source", source), ("output", output)):
+            path = Path(value)
+            if "\\" in value or path.is_absolute() or any(part in (".", "..") for part in path.parts):
+                safe = False
+                errors.append(
+                    f"{app.get('app_id')}: asset {label} must be a safe app-relative `/` path, got {value!r}"
+                )
+        if not safe:
+            continue
+        source_path = in_app_path(app, source)
+        if not source_path.is_file():
+            errors.append(f"{app.get('app_id')}: missing asset source {source!r}")
+            continue
+        registered.append(
+            {
+                "path": output,
+                "source_path": source_path,
+                "sequential": bool(asset.get("sequential", True)),
+            }
+        )
+    app["_data_assets"] = registered
 
 
 def reject_embedded_map_payloads(app: dict, bytecode: bytes, errors: list[str]) -> None:
@@ -592,15 +642,18 @@ def pack_app(app: dict, check: bool, errors: list[str]) -> None:
         temp_root = Path(tmp)
         assets_root = temp_root / "assets"
         manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
-        map_sources = {
-            asset["path"]: asset["source_path"] for asset in app.get("_map_assets", [])
+        app_sources = {
+            asset["path"]: asset["source_path"] for asset in app.get("_data_assets", [])
         }
+        app_sources.update({
+            asset["path"]: asset["source_path"] for asset in app.get("_map_assets", [])
+        })
         # Every pack gets an isolated input root. This lets two self-contained
         # apps both use `maps/world.map` without a shared package_inputs path
         # overwriting one app's source with the other's.
         for asset in manifest_data["assets"]:
             package_path = asset["path"]
-            source = map_sources.get(package_path, pkg_path(package_path))
+            source = app_sources.get(package_path, pkg_path(package_path))
             destination = assets_root.joinpath(*package_path.split("/"))
             if not source.exists():
                 errors.append(f"{app.get('app_id')}: missing staged asset {package_path!r}")
@@ -671,6 +724,7 @@ def main() -> int:
         package = app["_package"]
         output = f"bytecode/{package}.kbc"
         committed = pkg_path(output)
+        register_data_assets(app, errors)
         generate_maps(app, args.check, errors)
         generate_images(app, args.check, errors)
         sync_audio(app, args.check, errors)

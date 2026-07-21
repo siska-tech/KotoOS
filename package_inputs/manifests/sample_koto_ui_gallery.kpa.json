@@ -1,0 +1,46 @@
+{
+  "format": "kpa-manifest",
+  "version": 1,
+  "app_id": "dev.koto.samples.koto-ui-gallery",
+  "name": "KotoUI Gallery",
+  "entry": "bytecode/sample_koto_ui_gallery.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample_koto_ui_gallery.kicon",
+  "description": "Exercises every app-facing KotoUI v1 component.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_koto_ui_gallery.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample_koto_ui_gallery.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "locales/en-US.txt",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "locales/ja-JP.txt",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "locales/qps-ploc.txt",
+      "type": "data",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  }
+}

@@ -5,6 +5,7 @@ fn main() {
     let rp2040 = env::var_os("CARGO_FEATURE_MCU_RP2040").is_some();
     let rp235xa = env::var_os("CARGO_FEATURE_MCU_RP235XA").is_some();
     let picocalc_pico = env::var_os("CARGO_FEATURE_BOARD_PICOCALC_PICO").is_some();
+    let picocalc_picow = env::var_os("CARGO_FEATURE_BOARD_PICOCALC_PICOW").is_some();
     let picocalc_pico2w = env::var_os("CARGO_FEATURE_BOARD_PICOCALC_PICO2W").is_some();
     let memory = match (rp2040, rp235xa) {
         (true, false) => include_bytes!("memory.x").as_slice(),
@@ -20,9 +21,10 @@ fn main() {
             .expect("write RP235x linker supplement");
     }
 
-    let (board_id, mcu_id) = match (picocalc_pico, picocalc_pico2w) {
-        (true, false) => ("picocalc-pico-rp2040", "rp2040"),
-        (false, true) => ("picocalc-pico2w-rp2350a", "rp2350a"),
+    let (board_id, mcu_id) = match (picocalc_pico, picocalc_picow, picocalc_pico2w) {
+        (true, false, false) => ("picocalc-pico-rp2040", "rp2040"),
+        (false, true, false) => ("picocalc-picow-rp2040", "rp2040"),
+        (false, false, true) => ("picocalc-pico2w-rp2350a", "rp2350a"),
         _ => ("invalid-board-selection", "invalid-board-selection"),
     };
     println!("cargo:rustc-env=KOTO_BOARD_ID={board_id}");

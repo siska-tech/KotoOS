@@ -1,4 +1,5 @@
 use super::*;
+use koto_ui::Painter;
 
 /// Default foreground colour for a bytecode `draw_text` (which carries no colour
 /// of its own in the host ABI): ~rgb(240, 240, 240).
@@ -37,6 +38,15 @@ pub fn paint_app_session(
         session.static_text(),
         session.static_text_colors(),
     );
+    paint_ui_commands(
+        canvas,
+        font,
+        session.ui_rects(),
+        session.ui_text(),
+        session.ui_text_colors(),
+        session.ui_text_layouts(),
+        session.ui_commands(),
+    );
     // Retained Game2D text layer (KOTO-0141): composited above the sprite layer
     // (re-emitted into `draw_pixels`) and below the per-frame immediate text, so an
     // id-keyed status value sits in the same fixed z-order on the device.
@@ -48,6 +58,48 @@ pub fn paint_app_session(
         canvas.draw_text(item.x, item.y, font, &item.text, color);
     }
     paint_text_list(canvas, font, session.text(), session.text_colors());
+}
+
+fn paint_ui_commands(
+    canvas: &mut Canvas<'_>,
+    font: &BitmapFont<'_>,
+    rects: &[(i32, i32, i32, i32, i32)],
+    text: &[(i32, i32, String)],
+    colors: &[i32],
+    layouts: &[super::host::SimUiTextLayout],
+    commands: &[super::host::SimUiCommand],
+) {
+    let mut painter = koto_core::CanvasUiPainter::new(canvas, font);
+    for command in commands {
+        match *command {
+            super::host::SimUiCommand::Rect(index) => {
+                if let Some(&(x, y, w, h, rgb565)) = rects.get(index) {
+                    painter
+                        .canvas_mut()
+                        .fill_rect(Rect { x, y, w, h }, Rgb565(rgb565 as u16));
+                }
+            }
+            super::host::SimUiCommand::Text(index) => {
+                let (Some((_, _, body)), Some(layout)) = (text.get(index), layouts.get(index))
+                else {
+                    continue;
+                };
+                let color = match colors.get(index).copied().unwrap_or(TEXT_COLOR_DEFAULT) {
+                    TEXT_COLOR_DEFAULT => koto_ui::Rgb565(APP_DEFAULT_TEXT_RGB565),
+                    rgb565 => koto_ui::Rgb565(rgb565 as u16),
+                };
+                let _ = painter.draw_text(
+                    layout.clip,
+                    layout.bounds,
+                    koto_ui::TextRun {
+                        text: body,
+                        color,
+                        align: layout.align,
+                    },
+                );
+            }
+        }
+    }
 }
 
 /// Paint one text list with its index-aligned colour list, mapping the

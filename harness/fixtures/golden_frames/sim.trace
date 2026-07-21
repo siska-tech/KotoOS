@@ -1,6 +1,6 @@
 golden-frame-trace v1
 [shell:list]
-selected=0 packages=19
+selected=0 packages=25
 render rect x=0 y=0 w=320 h=20 on 320x320 Rgb565
 render rect x=0 y=20 w=65 h=84 on 320x320 Rgb565
 render rect x=65 y=20 w=65 h=84 on 320x320 Rgb565

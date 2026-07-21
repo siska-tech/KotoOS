@@ -20,6 +20,16 @@ The PicoCalc carrier mapping shared by Pico and Pico 2 W lives in
 `board/picocalc.rs`. Module-specific clocks and capacities live in
 `board/picocalc_pico.rs` and `board/picocalc_pico2w.rs`.
 
+## Wi-Fi capability composition
+
+`BoardCapabilities::WIFI` means only that the profile provides a supported
+radio transport. It does not expose KotoConfig's `WIFI_CONFIG` page by itself.
+That composite capability additionally requires an initialized Wi-Fi HAL, a
+compiled and live NetworkService, and an initialized credential provider. A
+W suffix, RP2040/RP2350 MCU selection, or concurrent Audio/Wi-Fi residency is
+never used as a substitute. See the
+[KotoConfig Wi-Fi extension contract](KOTOCONFIG_WIFI_EXTENSION.md).
+
 ## Adding a board
 
 1. Add a public `board-<name>` Cargo feature that selects one internal MCU

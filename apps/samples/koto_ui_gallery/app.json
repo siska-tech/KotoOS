@@ -1,0 +1,38 @@
+{
+  "app_id": "dev.koto.samples.koto-ui-gallery",
+  "kind": "koto",
+  "package": "sample_koto_ui_gallery",
+  "name": "KotoUI Gallery",
+  "description": "Exercises every app-facing KotoUI v1 component.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": false
+  },
+  "assets": [
+    {
+      "source": "locales/en-US.txt",
+      "output": "locales/en-US.txt"
+    },
+    {
+      "source": "locales/ja-JP.txt",
+      "output": "locales/ja-JP.txt"
+    },
+    {
+      "source": "locales/qps-ploc.txt",
+      "output": "locales/qps-ploc.txt"
+    }
+  ],
+  "codegen": {
+    "comment": "KOTO-0220: SDK packet validators inline deeply; relocate one-time setup and outline locale/event branches to keep 16-bit branch spans and the steady idle loop bounded.",
+    "relocate_preamble": true,
+    "outline_cold_blocks": true
+  }
+}

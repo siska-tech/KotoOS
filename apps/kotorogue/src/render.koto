@@ -206,11 +206,11 @@ fn render_title(stats: int, sheet: int) {
     draw_text_color(44, 252, "矢印:移動 Q:薬 F1:再開 F10:終了", 40, C_DIM);
 }
 
-fn render_over(stats: int, num: int, won: int) {
+fn render_over(stats: int, num: int, won: bool) {
     draw_rect(0, 0, 320, 320, C_BG);
     draw_rect(30, 78, 260, 164, C_PANEL);
     draw_rect(30, 78, 260, 3, C_PANELHI);
-    if won == 1 {
+    if won == true {
         draw_text_color(122, 98, "勝利！", 9, C_GOLD);
         draw_text_color(56, 128, "アミュレットを手にした", 33, C_TEXT);
     } else {

@@ -7,3 +7,5 @@ docs/Reference/
 
 # Alternate build-artifact trees (manual target/ copies)
 /target-alt-*/
+
+.VSCodeCounter/

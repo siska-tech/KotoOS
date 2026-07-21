@@ -1,8 +1,21 @@
 // Dirty-rectangle drawing sample: redraw only a narrow band and moving square.
 
-fn main() {
-    let x = 0;
+struct MotionState {
+    x: int,
+}
 
+static motion: MotionState = { x: 0, };
+
+impl MotionState {
+    fn advance(self) {
+        self.x = self.x + 8;
+        if self.x > 296 {
+            self.x = 0;
+        }
+    }
+}
+
+fn main() {
     loop {
         let intent = text_intent();
         if (intent & INTENT_EXIT) != 0 {
@@ -10,12 +23,9 @@ fn main() {
         }
 
         draw_rect(0, 72, 320, 40, 0);
-        draw_rect(x, 80, 24, 24, 65535);
+        draw_rect(motion.x, 80, 24, 24, 65535);
         draw_text(16, 24, "dirty rect sample", 17);
-        x = x + 8;
-        if x > 296 {
-            x = 0;
-        }
+        motion.advance();
         yield_frame();
     }
 }

@@ -10,6 +10,11 @@
     { "include": "#constants" },
     { "include": "#strings" },
     { "include": "#numbers" },
+    { "include": "#enum-member" },
+    { "include": "#enum-def" },
+    { "include": "#struct-def" },
+    { "include": "#static-def" },
+    { "include": "#member" },
     { "include": "#function-def" },
     { "include": "#call" },
     { "include": "#operators" }
@@ -34,7 +39,7 @@
         },
         {
           "name": "storage.type.koto",
-          "match": "\\b(fn|let|const|buf|data)\\b"
+          "match": "\\b(fn|let|const|buf|data|enum|struct|static|impl)\\b"
         }
       ]
     },
@@ -74,6 +79,44 @@
       "captures": {
         "1": { "name": "storage.type.koto" },
         "2": { "name": "entity.name.function.koto" }
+      }
+    },
+    "enum-def": {
+      "match": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.koto" },
+        "2": { "name": "entity.name.type.enum.koto" }
+      }
+    },
+    "struct-def": {
+      "match": "\\b(struct|impl)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.koto" },
+        "2": { "name": "entity.name.type.struct.koto" }
+      }
+    },
+    "static-def": {
+      "match": "\\b(static)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(:)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.koto" },
+        "2": { "name": "variable.other.constant.koto" },
+        "3": { "name": "punctuation.separator.type.koto" },
+        "4": { "name": "entity.name.type.struct.koto" }
+      }
+    },
+    "member": {
+      "match": "(\\.)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.accessor.koto" },
+        "2": { "name": "variable.other.member.koto" }
+      }
+    },
+    "enum-member": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(::)\\s*([A-Za-z_][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": { "name": "entity.name.type.enum.koto" },
+        "2": { "name": "punctuation.accessor.koto" },
+        "3": { "name": "constant.other.enum.koto" }
       }
     },
     "call": {

@@ -1,0 +1,8 @@
+# KOTO-0236: `asset_len` folds packaged text-asset byte sizes into committed
+# bytecode, and packages embed the same bytes verbatim. Pin LF so the sizes
+# (and therefore KBC/KPA bytes) do not depend on checkout line-ending config.
+apps/**/locales/*.txt text eol=lf
+# KOTO-0246: .kicon sources are ASCII text that is embedded into KPA archives
+# byte-for-byte; pin LF for the same reason as the locale assets above.
+apps/**/*.kicon text eol=lf
+package_inputs/icons/*.kicon text eol=lf

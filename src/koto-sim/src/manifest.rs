@@ -1,4 +1,8 @@
-use koto_core::{ManifestFields, PackageIconStyle, PackageIconTheme, PackageInfo, PackageManifest};
+use koto_core::{
+    parse_manifest_fetch_permission, parse_manifest_mqtt_permission, BrokerAllowlist,
+    FetchAllowlist, FetchPinTable, ManifestFields, ManifestMqttError, PackageIconStyle,
+    PackageIconTheme, PackageInfo, PackageManifest, TopicFilterSet,
+};
 use serde_json::Value;
 
 use crate::SimError;
@@ -9,6 +13,10 @@ pub struct PackageLaunch {
     pub(crate) runtime: String,
     pub(crate) entry: String,
     pub(crate) asset_paths: Vec<String>,
+    pub(crate) fetch_allowlist: FetchAllowlist,
+    pub(crate) fetch_pins: FetchPinTable,
+    pub(crate) mqtt_brokers: BrokerAllowlist,
+    pub(crate) mqtt_topics: TopicFilterSet,
 }
 
 impl PackageLaunch {
@@ -22,6 +30,22 @@ impl PackageLaunch {
 
     pub fn asset_paths(&self) -> &[String] {
         &self.asset_paths
+    }
+
+    pub const fn fetch_allowlist(&self) -> &FetchAllowlist {
+        &self.fetch_allowlist
+    }
+
+    pub const fn fetch_pins(&self) -> &FetchPinTable {
+        &self.fetch_pins
+    }
+
+    pub const fn mqtt_brokers(&self) -> &BrokerAllowlist {
+        &self.mqtt_brokers
+    }
+
+    pub const fn mqtt_topics(&self) -> &TopicFilterSet {
+        &self.mqtt_topics
     }
 }
 
@@ -56,17 +80,32 @@ pub fn parse_launch_manifest(text: &str) -> Result<PackageLaunch, SimError> {
         })
         .unwrap_or_default();
 
-    let permissions = root.get("permissions").and_then(Value::as_object);
+    let permissions = match root.get("permissions") {
+        Some(value) => Some(value.as_object().ok_or(SimError::InvalidManifest)?),
+        None => None,
+    };
     let fs_permission = optional_string(permissions.and_then(|value| value.get("fs")));
-    let network_permission = permissions
-        .and_then(|value| value.get("network"))
-        .and_then(Value::as_bool);
+    let fetch =
+        parse_manifest_fetch_permission(text, version).map_err(|_| SimError::InvalidManifest)?;
+    let network_permission = fetch.legacy;
+    let fetch_allowlist = fetch.allowlist;
+    let fetch_pins = fetch.pins;
+    // The MQTT permission is a schema-v2 declaration; v1 manifests simply carry
+    // no MQTT grant (default-denied), so an unsupported-version result is empty
+    // rather than an error.
+    let mqtt = match parse_manifest_mqtt_permission(text, version) {
+        Ok(permission) => permission,
+        Err(ManifestMqttError::UnsupportedVersion) => koto_core::ManifestMqttPermission::empty(),
+        Err(_) => return Err(SimError::InvalidManifest),
+    };
+    let mqtt_brokers = mqtt.brokers;
+    let mqtt_topics = mqtt.topics;
 
     let memory = root.get("memory").and_then(Value::as_object);
     let sram_work_bytes = optional_u32(memory.and_then(|value| value.get("sram_work_bytes")));
     let psram_cache_bytes = optional_u32(memory.and_then(|value| value.get("psram_cache_bytes")));
 
-    PackageManifest::new(ManifestFields {
+    let manifest = PackageManifest::new(ManifestFields {
         format: &format,
         version,
         app_id: &app_id,
@@ -82,13 +121,17 @@ pub fn parse_launch_manifest(text: &str) -> Result<PackageLaunch, SimError> {
         description: description.as_deref(),
         category: category.as_deref(),
     })
-    .map(|manifest| PackageLaunch {
+    .map_err(|_| SimError::InvalidManifest)?;
+    Ok(PackageLaunch {
         package: manifest.package(),
         runtime,
         entry,
         asset_paths,
+        fetch_allowlist,
+        fetch_pins,
+        mqtt_brokers,
+        mqtt_topics,
     })
-    .map_err(|_| SimError::InvalidManifest)
 }
 
 fn parse_shell_icon(value: Option<&Value>) -> Result<Option<PackageIconTheme>, SimError> {
@@ -223,5 +266,67 @@ mod tests {
             }
         }"##;
         assert_eq!(parse_manifest(manifest), Err(SimError::InvalidManifest));
+    }
+
+    #[test]
+    fn v2_fetch_origins_are_canonical_and_default_denied() {
+        let manifest = r#"{
+            "format":"kpa-manifest","version":2,
+            "app_id":"dev.koto.fetch","name":"Fetch",
+            "runtime":"kotoruntime-bytecode","entry":"bytecode/main.kbc",
+            "permissions":{"network":{"origins":["https://api.example.com"]}}
+        }"#;
+        assert_eq!(
+            parse_launch_manifest(manifest)
+                .unwrap()
+                .fetch_allowlist()
+                .len(),
+            1
+        );
+
+        let absent = r#"{"format":"kpa-manifest","version":2,"app_id":"dev.koto.fetch","name":"Fetch","runtime":"kotoruntime-bytecode","entry":"bytecode/main.kbc"}"#;
+        assert!(parse_launch_manifest(absent)
+            .unwrap()
+            .fetch_allowlist()
+            .is_empty());
+        for bad in [
+            "https://*.example.com",
+            "https://user@example.com",
+            "https://api.example.com:443",
+        ] {
+            let invalid = manifest.replace("https://api.example.com", bad);
+            assert_eq!(parse_manifest(&invalid), Err(SimError::InvalidManifest));
+        }
+    }
+
+    #[test]
+    fn network_permission_shape_is_versioned() {
+        let v1 = r#"{"format":"kpa-manifest","version":1,"app_id":"dev.koto.v1","name":"V1","runtime":"kotoruntime-bytecode","entry":"main.kbc","permissions":{"network":false}}"#;
+        assert!(parse_manifest(v1).is_ok());
+        let v2_bool = v1.replace("\"version\":1", "\"version\":2");
+        assert_eq!(parse_manifest(&v2_bool), Err(SimError::InvalidManifest));
+
+        let duplicate = r#"{"format":"kpa-manifest","version":2,"app_id":"dev.koto.v2","name":"V2","runtime":"kotoruntime-bytecode","entry":"main.kbc","permissions":{},"permissions":{"network":{"origins":[]}}}"#;
+        assert_eq!(parse_manifest(duplicate), Err(SimError::InvalidManifest));
+    }
+
+    #[test]
+    fn retains_manifest_spki_rotation_without_claiming_tls_validation() {
+        let manifest = r#"{
+            "format":"kpa-manifest","version":2,
+            "app_id":"dev.koto.secure","name":"Secure",
+            "runtime":"kotoruntime-bytecode","entry":"main.kbc",
+            "permissions":{"network":{"origins":[{
+                "origin":"https://secure.example",
+                "spki_sha256":[
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ]
+            }]}}
+        }"#;
+        let launch = parse_launch_manifest(manifest).unwrap();
+        assert_eq!(launch.fetch_allowlist().len(), 1);
+        assert_eq!(launch.fetch_pins().get(0).unwrap().len(), 2);
+        assert!(launch.fetch_pins().complete_for(launch.fetch_allowlist()));
     }
 }

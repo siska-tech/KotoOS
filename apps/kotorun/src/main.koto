@@ -14,9 +14,11 @@ const GROUND_Y = 246;
 const RUNNER_X = 72;
 const SEG = 96;
 
-const S_TITLE = 0;
-const S_PLAY = 1;
-const S_OVER = 2;
+enum RunState {
+    Title,
+    Play,
+    Over,
+}
 
 const C_SKY = 10847;
 const C_SKY2 = 19071;
@@ -310,7 +312,7 @@ fn main() {
     buf num[24];
     let parts = actor_array_new(12);
 
-    let state = S_TITLE;
+    let state = RunState::Title;
     let y = (GROUND_Y - 27) * 8;
     let vy = 0;
     let cam = 0;
@@ -367,9 +369,9 @@ fn main() {
             jump = 1;
         }
 
-        if state == S_TITLE {
+        if state == RunState::Title {
             if jump != 0 {
-                state = S_PLAY;
+                state = RunState::Play;
                 y = (GROUND_Y - 27) * 8;
                 vy = 0; cam = 0; speed = 4; score = 0; coins = 0;
                 smashseg = -1; coinseg = -1; bonus_score = 0; chain = 0;
@@ -398,10 +400,10 @@ fn main() {
             continue;
         }
 
-        if state == S_OVER {
+        if state == RunState::Over {
             deadt = deadt + 1;
             if jump != 0 {
-                state = S_TITLE;
+                state = RunState::Title;
             }
         } else {
             // Speed ramps with distance; Left/Right allow a little tactical control.
@@ -502,7 +504,7 @@ fn main() {
             }
             if y / 8 > 330 { hit = 1; }
             if hit != 0 {
-                state = S_OVER;
+                state = RunState::Over;
                 deadt = 0; flash = 12; shake = 12;
                 // Clear the transient-draw state so every S_OVER frame keeps
                 // one fixed command count (KOTO-0175): the dive streaks, the
@@ -537,7 +539,7 @@ fn main() {
         }
 
         let dpad = 0;
-        if state == S_PLAY { dpad = 1; }
+        if state == RunState::Play { dpad = 1; }
         draw_runner(y, vy, tick, flash, dive, dpad);
 
         // Compact HUD. The displayed score refreshes every 8 frames (and every
@@ -548,7 +550,7 @@ fn main() {
         // unchanged values produce identical bytes, so the command is stable.
         draw_rect(0, 0, 320, 28, C_PANEL);
         draw_text_color(8, 7, "SCORE", 5, C_DIM);
-        if state != S_PLAY || (tick & 7) == 0 || cam < 40 {
+        if state != RunState::Play || (tick & 7) == 0 || cam < 40 {
             fmt6(num, score);
         }
         draw_text_color(58, 5, num, 6, C_WHITE);
@@ -562,7 +564,7 @@ fn main() {
         // has its own fixed count without these pads.
         if bonus > 0 {
             draw_text_color(126, 74 - (24 - bonus), "SMASH!", 6, C_GOLD);
-        } else if state == S_PLAY {
+        } else if state == RunState::Play {
             pad_cmds(1);
         }
         if chain > 1 {
@@ -570,11 +572,11 @@ fn main() {
             draw_text_color(230, 43, "CHAIN x", 7, C_CYAN);
             heap_set_u8(num + 23, 48 + chain);
             draw_text_color(294, 43, num + 23, 1, C_GOLD);
-        } else if state == S_PLAY {
+        } else if state == RunState::Play {
             pad_cmds(3);
         }
 
-        if state == S_OVER {
+        if state == RunState::Over {
             let oy = -90 + deadt * 8;
             if oy > 78 { oy = 78; }
             draw_rect(34, oy, 252, 154, C_PANEL);

@@ -59,6 +59,12 @@ Apps are distributed as `.kpa` packages. A package contains bytecode plus sequen
 
 On RP2040, bytecode and large assets may live in PSRAM or SD-backed streams, but execution uses SRAM working buffers. Code must never assume PSRAM pointers can be dereferenced.
 
+The device launcher and app VM are foreground-exclusive. The Pico backend uses
+one tagged SRAM slot for either `ShellState` or the resident VM CodeWindow,
+swapping the inactive shell through a reserved PSRAM region at app boundaries.
+The ownership and failure rules are defined in
+[RP2040 Shell / Code-Window Resident Overlay](RP2040_SHELL_CODE_RESIDENT_OVERLAY.md).
+
 The first `kotoruntime-bytecode` executable contract is the `KBC1` format and
 host-call ABI in [RUNTIME_BYTECODE_ABI.md](../spec/RUNTIME_BYTECODE_ABI.md). Runtime
 execution is cooperative: each active app receives a bounded instruction budget

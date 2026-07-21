@@ -1,0 +1,35 @@
+{
+  "format": "kpa-manifest",
+  "version": 2,
+  "app_id": "dev.koto.samples.vault-fetch",
+  "name": "SDK Vault Fetch",
+  "entry": "bytecode/sample_vault_fetch.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample_vault_fetch.kicon",
+  "description": "Uses an OS-owned credential without seeing the secret.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_vault_fetch.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample_vault_fetch.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": {
+      "origins": [
+        "https://api.example.com"
+      ]
+    }
+  }
+}

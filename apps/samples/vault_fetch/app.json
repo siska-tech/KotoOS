@@ -1,0 +1,23 @@
+{
+  "app_id": "dev.koto.samples.vault-fetch",
+  "kind": "koto",
+  "package": "sample_vault_fetch",
+  "name": "SDK Vault Fetch",
+  "description": "Uses an OS-owned credential without seeing the secret.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": {
+      "origins": [
+        "https://api.example.com"
+      ]
+    }
+  }
+}

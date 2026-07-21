@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use koto_compiler::{DiagnosticSeverity, FsLoader, OverlayLoader, SourceSpan};
-use koto_lsp::{analyze, budget_inlay, definition_at, hover_at, Analysis};
+use koto_compiler::{DiagnosticSeverity, FsLoader, OverlayLoader, SourceSpan, SymbolKind};
+use koto_lsp::{analyze, budget_inlay, completion_items, definition_at, hover_at, Analysis};
 use serde_json::{json, Value};
 
 fn main() -> io::Result<()> {
@@ -28,6 +28,24 @@ struct Server {
 }
 
 impl Server {
+    fn include_resolver(&self) -> OverlayLoader<FsLoader> {
+        let mut resolver = OverlayLoader::new(FsLoader);
+        let workspace = std::env::current_dir().ok();
+        for (path, text) in &self.documents {
+            resolver.insert(path, text.clone());
+            // Standard SDK includes use workspace-relative `sdk/...` keys.
+            // Alias open absolute documents so unsaved SDK edits participate
+            // in analysis just like unsaved source-relative includes.
+            if let Some(relative) = workspace
+                .as_deref()
+                .and_then(|workspace| path.strip_prefix(workspace).ok())
+            {
+                resolver.insert(relative, text.clone());
+            }
+        }
+        resolver
+    }
+
     fn handle(&mut self, message: Value, writer: &mut impl Write) -> io::Result<bool> {
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let id = message.get("id").cloned();
@@ -42,6 +60,8 @@ impl Server {
                         "textDocumentSync": 1,
                         "definitionProvider": true,
                         "hoverProvider": true,
+                        "completionProvider": { "triggerCharacters": ["_", ":"] },
+                        "documentSymbolProvider": true,
                         "inlayHintProvider": true
                     },
                     "serverInfo": { "name": "koto-lsp", "version": env!("CARGO_PKG_VERSION") }
@@ -117,6 +137,66 @@ impl Server {
                     },
                 );
                 respond(writer, id, result.unwrap_or(Value::Null))?;
+            }
+            "textDocument/completion" => {
+                let result = self.request_context(&params).map(
+                    |(_path, source, analysis, line, character)| {
+                        let items = completion_items(&analysis, &source, line, character)
+                            .into_iter()
+                            .map(|item| {
+                                json!({
+                                    "label": item.label,
+                                    "kind": item.kind,
+                                    "detail": item.detail
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({ "isIncomplete": false, "items": items })
+                    },
+                );
+                respond(
+                    writer,
+                    id,
+                    result.unwrap_or_else(|| json!({ "isIncomplete": false, "items": [] })),
+                )?;
+            }
+            "textDocument/documentSymbol" => {
+                let result = self.request_analysis(&params).map(|analysis| {
+                    let requested = params
+                        .pointer("/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(file_uri_to_path)
+                        .map(|path| display_path(&path));
+                    analysis
+                        .symbols
+                        .iter()
+                        .filter(|symbol| {
+                            requested.as_deref() == Some(symbol.definition.file.as_str())
+                        })
+                        .filter(|symbol| symbol.kind != SymbolKind::Parameter)
+                        .map(|symbol| {
+                            json!({
+                                "name": symbol.name,
+                                "kind": match symbol.kind {
+                                    SymbolKind::Function => 12,
+                                    SymbolKind::Constant => 14,
+                                    SymbolKind::Enum => 10,
+                                    SymbolKind::EnumMember => 22,
+                                    SymbolKind::Struct => 23,
+                                    SymbolKind::Field => 8,
+                                    SymbolKind::Method => 6,
+                                    SymbolKind::Static | SymbolKind::Data | SymbolKind::Parameter => 13,
+                                },
+                                "containerName": symbol.container,
+                                "location": {
+                                    "uri": path_to_file_uri(Path::new(&symbol.definition.file)),
+                                    "range": span_range(&symbol.definition),
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                respond(writer, id, json!(result.unwrap_or_default()))?;
             }
             "textDocument/inlayHint" => {
                 let result = self.request_analysis(&params).and_then(|analysis| {
@@ -198,10 +278,7 @@ impl Server {
     fn analysis_for(&self, path: &Path) -> Option<Analysis> {
         let root = self.root_for(path);
         let source = self.source(&root)?;
-        let mut resolver = OverlayLoader::new(FsLoader);
-        for (path, text) in &self.documents {
-            resolver.insert(path, text.clone());
-        }
+        let mut resolver = self.include_resolver();
         Some(analyze(&display_path(&root), &source, &mut resolver))
     }
 
@@ -216,10 +293,7 @@ impl Server {
             let Some(source) = self.source(&root) else {
                 continue;
             };
-            let mut resolver = OverlayLoader::new(FsLoader);
-            for (path, text) in &self.documents {
-                resolver.insert(path, text.clone());
-            }
+            let mut resolver = self.include_resolver();
             for diagnostic in analyze(&display_path(&root), &source, &mut resolver).diagnostics {
                 let Some(span) = diagnostic.span else {
                     continue;

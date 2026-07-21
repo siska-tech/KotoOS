@@ -3,7 +3,7 @@
   "kind": "koto",
   "package": "sample_audio_codecs",
   "name": "KotoAudio PCM16 / SLD4",
-  "description": "Plays runtime-ready PCM16 and SLD4 KACL assets from its KPA.",
+  "description": "PCM16/SLD4 demo and five-minute CPU0 audio scratch regression.",
   "category": "Samples",
   "runtime": "kotoruntime-bytecode",
   "source": "src/main.koto",
@@ -24,6 +24,14 @@
     {
       "source": "audio/sld4.kacl",
       "output": "audio/sample_audio_sld4.kacl"
+    },
+    {
+      "source": "audio/cue_a.kmml",
+      "output": "audio/scratch_cue_a.kmml"
+    },
+    {
+      "source": "audio/cue_b.kmml",
+      "output": "audio/scratch_cue_b.kmml"
     }
   ]
 }

@@ -1,16 +1,57 @@
 param(
     [string]$Picotool = $env:PICOTOOL,
     [switch]$AllBins,
-    [switch]$ValidationBundle
+    [switch]$ValidationBundle,
+    [switch]$WifiResidencyProbe,
+    [switch]$WifiSequentialPioProbe,
+    [switch]$WifiMinimalProbe,
+    [switch]$WifiMinimalDma23Probe,
+    [switch]$WifiMinimalCooperativeProbe,
+    [switch]$WifiConfig,
+    [switch]$NetworkServiceProbe,
+    [switch]$AppFetchHttps
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $targetTriple = "thumbv8m.main-none-eabihf"
 $features = "board-picocalc-pico2w,ram_interpreter,ram_audio_mixer"
+if ($WifiMinimalCooperativeProbe) {
+    $features = "$features,wifi_minimal_cooperative_probe"
+} elseif ($WifiMinimalDma23Probe) {
+    $features = "$features,wifi_minimal_dma23_probe"
+} elseif ($WifiSequentialPioProbe) {
+    $features = "$features,wifi_pio_sequential_probe"
+} elseif ($WifiResidencyProbe) {
+    $features = "$features,wifi_residency_probe"
+} elseif ($AppFetchHttps) {
+    $features = "$features,network_service,app_fetch_https"
+} elseif ($WifiConfig -or $NetworkServiceProbe) {
+    $features = "$features,network_service"
+}
 $artifactDir = Join-Path $root "target\$targetTriple\release"
-$elf = Join-Path $artifactDir "koto_firmware"
-$uf2 = Join-Path $artifactDir "koto_firmware-picocalc-pico2w-rp2350a.uf2"
+$binName = if ($WifiMinimalProbe -or $WifiMinimalDma23Probe -or $WifiMinimalCooperativeProbe) { "probe_wifi_minimal" } else { "koto_firmware" }
+$elf = Join-Path $artifactDir $binName
+$uf2Name = if ($WifiMinimalCooperativeProbe) {
+    "probe_wifi_minimal-cooperative-csfix-picocalc-pico2w-rp2350a.uf2"
+} elseif ($WifiMinimalDma23Probe) {
+    "probe_wifi_minimal-dma23-picocalc-pico2w-rp2350a.uf2"
+} elseif ($WifiMinimalProbe) {
+    "probe_wifi_minimal-picocalc-pico2w-rp2350a.uf2"
+} elseif ($WifiSequentialPioProbe) {
+    "koto_firmware-picocalc-pico2w-rp2350a-wifi-sequential-pio-probe.uf2"
+} elseif ($WifiResidencyProbe) {
+    "koto_firmware-picocalc-pico2w-rp2350a-wifi-residency-probe.uf2"
+} elseif ($WifiConfig) {
+    "koto_firmware-picocalc-pico2w-rp2350a-wifi-config.uf2"
+} elseif ($NetworkServiceProbe) {
+    "koto_firmware-picocalc-pico2w-rp2350a-network-service.uf2"
+} elseif ($AppFetchHttps) {
+    "koto_firmware-picocalc-pico2w-rp2350a-app-fetch-https.uf2"
+} else {
+    "koto_firmware-picocalc-pico2w-rp2350a.uf2"
+}
+$uf2 = Join-Path $artifactDir $uf2Name
 $probeBins = @(
     "probe_lcd",
     "probe_keyboard",
@@ -32,7 +73,10 @@ if (-not $Picotool -or -not (Test-Path -LiteralPath $Picotool)) {
 
 Push-Location $root
 try {
-    $binArg = if ($AllBins -or $ValidationBundle) { "--bins" } else { "--bin=koto_firmware" }
+    if ($NetworkServiceProbe) {
+        Write-Warning "-NetworkServiceProbe is retained for compatibility; use -WifiConfig for the KotoShell product path."
+    }
+    $binArg = if ($AllBins -or $ValidationBundle) { "--bins" } else { "--bin=$binName" }
     & cargo build -p koto-pico $binArg --release --target $targetTriple `
         --no-default-features --features $features
     if ($LASTEXITCODE -ne 0) {

@@ -2,6 +2,11 @@ use super::*;
 
 use crate::audio::{RUNTIME_BGM_EVENTS_PER_TRACK, RUNTIME_SFX_EVENTS_PER_TRACK};
 use koto_audio::RuntimeCue;
+use koto_core::JsonHostSession;
+
+use super::fake_fetch::FakeFetchBackend;
+use super::fake_mqtt::{ScriptedMessage, SimMqttBackend, SimMqttTerminal};
+use super::sim_vault::SimVault;
 
 #[derive(Debug)]
 pub(super) struct SkkSession {
@@ -17,6 +22,11 @@ pub(super) struct SkkSession {
 pub(super) struct SimRuntimeHost {
     pub(super) fs: HostFs,
     pub(super) sandbox: Sandbox,
+    /// Copied system configuration view exposed through KUC1. The host does not
+    /// retain a reference to mutable configuration storage.
+    config_snapshot: ConfigSnapshot,
+    ui_session: UiSession,
+    pub(super) ui_ime_owner: u16,
     pub(super) draw_rects: Vec<(i32, i32, i32, i32, i32)>,
     /// Recorded `draw_pixels` blits: `(x, y, w, h, little-endian RGB565 bytes)`.
     pub(super) draw_pixels: Vec<(i32, i32, i32, i32, Vec<u8>)>,
@@ -39,6 +49,33 @@ pub(super) struct SimRuntimeHost {
     /// The authoritative KPA1 archive for this session. Tests for the legacy
     /// loose-file host seam may leave this unset.
     pub(super) package_archive: Option<Arc<Vec<u8>>>,
+    /// Deterministic app-facing Fetch service. It never touches the host
+    /// network; the active manifest allowlist is copied at launch.
+    fetch: AppFetchService<FakeFetchBackend>,
+    fetch_allowlist: FetchAllowlist,
+    fetch_app: AppContext,
+    fetch_now_ms: u64,
+    fetch_poll_cache: Option<(i32, u64, i32, i32)>,
+    /// Scripted advisory UTC for the `time_query` host call (KOTO-0247): the
+    /// synchronized UTC seconds at frame-clock zero, or `None` while the
+    /// scenario runs "time unknown". The clock advances with the same
+    /// deterministic per-frame tick as `fetch_now_ms`, never host wall time.
+    time_utc_base: Option<i64>,
+    /// Host-owned bounded JSON decoder session behind the `json_*` host calls
+    /// (KOTO-0246). The same `koto_core::JsonHostSession` backs the device
+    /// host, so both runtimes expose byte-identical ABI behavior.
+    json: JsonHostSession,
+    /// Deterministic application credential vault behind the `vault_handle` /
+    /// `fetch_start_authenticated` host calls (KOTO-0248). Synthetic handles and
+    /// fake secrets; it never reads any host credential store.
+    vault: SimVault,
+    /// Deterministic app-facing MQTT subscribe service (KOTO-0249). It never
+    /// touches the host network; the manifest broker/topic allowlists are copied
+    /// at launch and it shares the deterministic `fetch_now_ms` frame clock.
+    mqtt: AppMqttService<SimMqttBackend>,
+    mqtt_brokers: BrokerAllowlist,
+    mqtt_topics: TopicFilterSet,
+    mqtt_app: AppContext,
     /// Audio actions issued by the VM this frame, for deterministic inspection
     /// (mirrors the recorded draw lists).
     pub(super) audio_events: Vec<AudioEvent>,
@@ -56,6 +93,19 @@ pub(super) struct SimRuntimeHost {
     pub(super) static_pixels: Vec<(i32, i32, i32, i32, Vec<u8>)>,
     pub(super) static_text: Vec<(i32, i32, String)>,
     pub(super) static_text_colors: Vec<i32>,
+    /// Retained command image produced by `ui_present`; replaced atomically on
+    /// UI damage and preserved across per-frame immediate-list clears.
+    pub(super) ui_rects: Vec<(i32, i32, i32, i32, i32)>,
+    pub(super) ui_text: Vec<(i32, i32, String)>,
+    pub(super) ui_text_colors: Vec<i32>,
+    pub(super) ui_text_layouts: Vec<SimUiTextLayout>,
+    pub(super) ui_commands: Vec<SimUiCommand>,
+    /// Per-frame retained-UI trace. These are observations only; the command
+    /// image above remains session-persistent while these vectors are cleared.
+    pub(super) ui_present_calls: usize,
+    pub(super) ui_paint_count: usize,
+    pub(super) ui_presented_damage: Vec<(i32, i32, i32, i32)>,
+    pub(super) ui_polled_events: Vec<(u8, u16, i32, i32)>,
     /// While `true`, draw calls are captured into the static layer above instead
     /// of the per-frame immediate lists.
     pub(super) capturing_static: bool,
@@ -173,6 +223,9 @@ impl SimRuntimeHost {
         Ok(Self {
             fs,
             sandbox: Sandbox::new(app_id).map_err(|_| SimError::RuntimeExecutionFailed)?,
+            config_snapshot: ConfigService::new().snapshot(),
+            ui_session: UiSession::new(),
+            ui_ime_owner: u16::MAX,
             draw_rects: Vec::new(),
             draw_pixels: Vec::new(),
             persistent_pixels: vec![0; 320 * 320 * 2],
@@ -185,12 +238,57 @@ impl SimRuntimeHost {
             audio,
             asset_paths,
             package_archive: None,
+            // The scripted body exercises the KOTO-0246 sample's selection
+            // path: an unknown nested object/array to skip, a null, and the
+            // two named fields the app extracts.
+            fetch: AppFetchService::new(FakeFetchBackend::response(
+                200,
+                br#"{"station":{"id":"KOTO-1","samples":[3,7]},"location":"Tokyo","wind":null,"temperature_c":21,"ok":true}"#,
+                2,
+            )),
+            fetch_allowlist: FetchAllowlist::empty(),
+            fetch_app: AppContext {
+                app_id: stable_app_id(app_id),
+                generation: 1,
+            },
+            fetch_now_ms: 0,
+            fetch_poll_cache: None,
+            time_utc_base: None,
+            json: JsonHostSession::new(),
+            vault: SimVault::seeded(app_id),
+            // Default deterministic telemetry: a retained value delivered first,
+            // then two live samples on the sample app's topic. Scenario tests and
+            // the launch path re-script this without a host network.
+            mqtt: AppMqttService::new(SimMqttBackend::scenario(
+                1,
+                vec![
+                    ScriptedMessage::new(b"sensors/room/temp", b"21.4", true),
+                    ScriptedMessage::new(b"sensors/room/temp", b"21.7", false),
+                    ScriptedMessage::new(b"sensors/room/temp", b"22.1", false),
+                ],
+                SimMqttTerminal::Idle,
+            )),
+            mqtt_brokers: BrokerAllowlist::empty(),
+            mqtt_topics: TopicFilterSet::empty(),
+            mqtt_app: AppContext {
+                app_id: stable_app_id(app_id),
+                generation: 1,
+            },
             audio_events: Vec::new(),
             tilemap: SimTilemap::legacy(),
             static_rects: Vec::new(),
             static_pixels: Vec::new(),
             static_text: Vec::new(),
             static_text_colors: Vec::new(),
+            ui_rects: Vec::new(),
+            ui_text: Vec::new(),
+            ui_text_colors: Vec::new(),
+            ui_text_layouts: Vec::new(),
+            ui_commands: Vec::new(),
+            ui_present_calls: 0,
+            ui_paint_count: 0,
+            ui_presented_damage: Vec::new(),
+            ui_polled_events: Vec::new(),
             capturing_static: false,
             stamps: [None; GAME2D_MAX_STAMPS],
             sprites: [None; GAME2D_MAX_SPRITES],
@@ -227,6 +325,109 @@ impl SimRuntimeHost {
         self.text.clear();
         self.text_colors.clear();
         self.audio_events.clear();
+        self.ui_present_calls = 0;
+        self.ui_paint_count = 0;
+        self.ui_presented_damage.clear();
+        self.ui_polled_events.clear();
+    }
+
+    pub(super) fn set_config_snapshot(&mut self, snapshot: ConfigSnapshot) {
+        self.config_snapshot = snapshot;
+    }
+
+    pub(super) fn set_fetch_allowlist(&mut self, allowlist: FetchAllowlist) {
+        self.fetch.teardown();
+        self.fetch_allowlist = allowlist;
+        self.fetch_app.generation = self.fetch_app.generation.wrapping_add(1).max(1);
+        self.fetch_poll_cache = None;
+    }
+
+    /// Install the manifest MQTT broker/topic allowlists at launch (KOTO-0249).
+    /// Tears down any live session and re-generations the app context so no
+    /// handle survives the change.
+    pub(super) fn set_mqtt_permission(&mut self, brokers: BrokerAllowlist, topics: TopicFilterSet) {
+        self.mqtt.teardown();
+        self.mqtt_brokers = brokers;
+        self.mqtt_topics = topics;
+        self.mqtt_app.generation = self.mqtt_app.generation.wrapping_add(1).max(1);
+    }
+
+    /// Script the deterministic MQTT broker as offline, so `mqtt_connect` is
+    /// refused with a stable `Unavailable` (KOTO-0249). Tears down any live
+    /// session so the change starts clean.
+    pub(super) fn script_mqtt_offline(&mut self) {
+        self.mqtt.teardown();
+        *self.mqtt.backend_mut() = SimMqttBackend::offline();
+        self.mqtt_app.generation = self.mqtt_app.generation.wrapping_add(1).max(1);
+    }
+
+    /// Re-script the deterministic fetch backend (KOTO-0247 weather scenarios).
+    /// The live request is torn down and the app generation bumped so a new
+    /// `fetch_start` sees the freshly scripted response, failure, or offline
+    /// state. `pending_polls` is how many `Pending` polls precede headers.
+    pub(super) fn script_fetch_response(&mut self, status: u16, body: &[u8], pending_polls: u8) {
+        self.fetch.teardown();
+        self.fetch
+            .backend_mut()
+            .configure_response(status, body, pending_polls);
+        self.fetch_app.generation = self.fetch_app.generation.wrapping_add(1).max(1);
+        self.fetch_poll_cache = None;
+    }
+
+    pub(super) fn script_fetch_failure(&mut self, error: FetchError, pending_polls: u8) {
+        self.fetch.teardown();
+        self.fetch
+            .backend_mut()
+            .configure_failure(error, pending_polls);
+        self.fetch_app.generation = self.fetch_app.generation.wrapping_add(1).max(1);
+        self.fetch_poll_cache = None;
+    }
+
+    pub(super) fn script_fetch_offline(&mut self) {
+        self.fetch.teardown();
+        self.fetch.backend_mut().configure_offline();
+        self.fetch_app.generation = self.fetch_app.generation.wrapping_add(1).max(1);
+        self.fetch_poll_cache = None;
+    }
+
+    /// Script the advisory clock: `Some(utc_seconds)` anchors synchronized UTC
+    /// at the current frame clock; `None` reverts to the unknown-time state.
+    pub(super) fn set_time_utc(&mut self, utc_seconds: Option<i64>) {
+        self.time_utc_base =
+            utc_seconds.map(|seconds| seconds - (self.fetch_now_ms / 1_000) as i64);
+    }
+
+    pub(super) fn ui_text(&self, widget_id: u16) -> Option<&str> {
+        let node = self
+            .ui_session
+            .nodes()
+            .iter()
+            .find(|node| node.id == widget_id)?;
+        Some(self.ui_session.text(node))
+    }
+
+    pub(super) fn ui_focused_id(&self) -> Option<u16> {
+        self.ui_session.focused_id()
+    }
+
+    pub(super) fn ui_render_command_count(&self) -> usize {
+        self.ui_rects.len() + self.ui_text.len()
+    }
+
+    pub(super) fn ui_value(&self, widget_id: u16) -> Option<&str> {
+        let node = self
+            .ui_session
+            .nodes()
+            .iter()
+            .find(|node| node.id == widget_id)?;
+        core::str::from_utf8(self.ui_session.value(node)).ok()
+    }
+
+    /// Queue normalized UI input without resuming bytecode. Deterministic
+    /// capacity tests use this to exercise the bounded KUE1 queue exactly as a
+    /// burst-capable platform input adapter would.
+    pub(super) fn inject_ui_input(&mut self, input: VmInputSnapshot) {
+        <Self as VmHost>::ui_frame_begin(self, input);
     }
 
     fn sandbox_path(&self, path: &str) -> Result<String, HostErrorKind> {
@@ -325,9 +526,254 @@ impl SimRuntimeHost {
         }
         Ok(bytes)
     }
+
+    fn present_ui(&mut self) -> HostCallOutcome {
+        let damage: Vec<_> = self
+            .ui_session
+            .damaged_rects()
+            .map(|rect| (rect.x, rect.y, rect.w, rect.h))
+            .collect();
+        let mut rects = Vec::new();
+        let mut text = Vec::new();
+        let mut colors = Vec::new();
+        let mut layouts = Vec::new();
+        let mut commands = Vec::new();
+        let result = {
+            let mut painter = SimUiPainter {
+                rects: &mut rects,
+                text: &mut text,
+                colors: &mut colors,
+                layouts: &mut layouts,
+                commands: &mut commands,
+            };
+            self.ui_session
+                .paint_full_if_damaged(&mut painter, &koto_ui::Theme::DARK)
+        };
+        match result {
+            Ok(false) => HostCallOutcome::Ok0,
+            Ok(true) => {
+                self.ui_paint_count += 1;
+                self.ui_presented_damage.extend(damage);
+                self.ui_rects = rects;
+                self.ui_text = text;
+                self.ui_text_colors = colors;
+                self.ui_text_layouts = layouts;
+                self.ui_commands = commands;
+                self.ui_session.complete_present();
+                HostCallOutcome::Ok0
+            }
+            Err(_) => HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY),
+        }
+    }
 }
 
 impl VmHost for SimRuntimeHost {
+    fn ui_frame_begin(&mut self, input: VmInputSnapshot) {
+        self.fetch_now_ms = self.fetch_now_ms.saturating_add(16);
+        self.fetch_poll_cache = None;
+        let Some(target) = self.ui_session.ime_target() else {
+            if self.ui_ime_owner != u16::MAX {
+                let _ = self.ime.process_key(MemoImeKey::Cancel, &mut self.editor);
+                self.ui_session.clear_ime_composition();
+                self.ui_ime_owner = u16::MAX;
+            }
+            self.ui_session.frame_begin(input, self.config_snapshot);
+            return;
+        };
+        let widget_id = target.widget_id;
+        let cursor = target.cursor;
+        let mut initial = [0u8; 256];
+        let initial_len = target.value.len();
+        initial[..initial_len].copy_from_slice(target.value.as_bytes());
+        if self.ui_ime_owner != widget_id {
+            let _ = self.ime.process_key(MemoImeKey::Cancel, &mut self.editor);
+            self.ui_session.clear_ime_composition();
+            self.ui_ime_owner = widget_id;
+        }
+        let initial_text = core::str::from_utf8(&initial[..initial_len]).unwrap_or("");
+        let _ = self.editor.load_str(initial_text);
+        let _ = self.editor.set_cursor(cursor);
+
+        let mut forwarded = input;
+        let intents = input.intent_bits;
+        if intents & koto_core::runtime::text_intent::IME_TOGGLE != 0 {
+            let _ = self.ime.process_key(MemoImeKey::Toggle, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::IME_TOGGLE;
+        }
+        if intents & koto_core::runtime::text_intent::SHIFT != 0 {
+            let _ = self.ime.process_key(MemoImeKey::Shift, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::SHIFT;
+        }
+        if intents & koto_core::runtime::text_intent::NEWLINE != 0
+            && self.ime.line().mode != MemoImeMode::Empty
+        {
+            let _ = self.ime.process_key(MemoImeKey::Commit, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::NEWLINE;
+            forwarded.pressed_bits &= !(1 << 4);
+        }
+        if intents & koto_core::runtime::text_intent::CONVERT != 0 {
+            let _ = self.ime_convert();
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::CONVERT;
+        }
+        if intents & koto_core::runtime::text_intent::COMMIT != 0 {
+            let _ = self.ime.process_key(MemoImeKey::Commit, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::COMMIT;
+        }
+        if intents & koto_core::runtime::text_intent::CANCEL != 0
+            && self.ime.line().mode != MemoImeMode::Empty
+        {
+            let _ = self.ime.process_key(MemoImeKey::Cancel, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::CANCEL;
+            forwarded.pressed_bits &= !(1 << 5);
+            forwarded.text_codepoint = 0;
+        }
+        if intents & koto_core::runtime::text_intent::BACKSPACE != 0
+            && self.ime.line().mode != MemoImeMode::Empty
+        {
+            let _ = self
+                .ime
+                .process_key(MemoImeKey::Backspace, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::BACKSPACE;
+        }
+        if let Some(ch) = char::from_u32(forwarded.text_codepoint).filter(|ch| *ch != '\0') {
+            let _ = self
+                .ime
+                .process_key(MemoImeKey::Character(ch), &mut self.editor);
+            forwarded.text_codepoint = 0;
+        }
+
+        let mut value = [0u8; 256];
+        let value_len = self.editor.as_str().len().min(value.len());
+        value[..value_len].copy_from_slice(&self.editor.as_str().as_bytes()[..value_len]);
+        let mut composition = [0u8; 128];
+        let mut composition_len = 0usize;
+        let mut candidate = [0u8; 64];
+        let mut candidate_len = 0usize;
+        let line = self.ime.line();
+        for part in [line.reading, line.pending_romaji] {
+            let len = part.len().min(composition.len() - composition_len);
+            composition[composition_len..composition_len + len]
+                .copy_from_slice(&part.as_bytes()[..len]);
+            composition_len += len;
+        }
+        if let Some(text) = line.candidate {
+            candidate_len = text.len().min(candidate.len());
+            candidate[..candidate_len].copy_from_slice(&text.as_bytes()[..candidate_len]);
+        }
+        let value = core::str::from_utf8(&value[..value_len]).unwrap_or("");
+        let composition = core::str::from_utf8(&composition[..composition_len]).unwrap_or("");
+        let candidate = (candidate_len != 0)
+            .then(|| core::str::from_utf8(&candidate[..candidate_len]).unwrap_or(""));
+        let value_changed = initial_text != value;
+        let ime_changed = self
+            .ui_session
+            .apply_ime_snapshot(
+                widget_id,
+                value,
+                self.editor.cursor(),
+                composition,
+                candidate,
+            )
+            .unwrap_or(false);
+        self.ui_session.frame_begin(forwarded, self.config_snapshot);
+        // Composition-only changes do not create an App semantic event, so the
+        // host presents their retained TextField damage without requiring an
+        // otherwise-idle `ui_present` call from bytecode.
+        if ime_changed && !value_changed {
+            let _ = self.present_ui();
+        }
+    }
+
+    fn ui_capabilities(&mut self, dst: &mut [u8]) -> HostCallOutcome {
+        match UiCapabilities::from_config(self.config_snapshot).encode(dst) {
+            Ok(written) => HostCallOutcome::Ok1(written as i32),
+            Err(_) => HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY),
+        }
+    }
+
+    fn ui_mount(&mut self, src: &[u8]) -> HostCallOutcome {
+        match self.ui_session.mount(src) {
+            Ok(()) => {
+                self.ime = KotoMemoIme::new();
+                self.ui_ime_owner = u16::MAX;
+                HostCallOutcome::Ok0
+            }
+            Err(UiMountError::BadArgument) => {
+                HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT)
+            }
+            Err(UiMountError::Unsupported) => {
+                HostCallOutcome::Err(koto_core::HostErrorCode::UNSUPPORTED)
+            }
+            Err(UiMountError::NoMemory) => {
+                HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY)
+            }
+        }
+    }
+
+    fn ui_update(&mut self, src: &[u8]) -> HostCallOutcome {
+        if !self.ui_session.is_mounted() {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::NOT_FOUND);
+        }
+        match self.ui_session.update(src) {
+            Ok(()) => HostCallOutcome::Ok0,
+            Err(UiMountError::BadArgument) => {
+                HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT)
+            }
+            Err(UiMountError::Unsupported) => {
+                HostCallOutcome::Err(koto_core::HostErrorCode::UNSUPPORTED)
+            }
+            Err(UiMountError::NoMemory) => {
+                HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY)
+            }
+        }
+    }
+
+    fn ui_present(&mut self) -> HostCallOutcome {
+        if !self.ui_session.is_mounted() {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::NOT_FOUND);
+        }
+        self.ui_present_calls += 1;
+        self.present_ui()
+    }
+
+    fn ui_poll_event(&mut self, dst: &mut [u8]) -> HostCallOutcome {
+        match self.ui_session.poll_event(dst) {
+            Ok(written) => {
+                if written >= 32 {
+                    self.ui_polled_events.push((
+                        dst[12],
+                        u16::from_le_bytes([dst[14], dst[15]]),
+                        i32::from_le_bytes([dst[16], dst[17], dst[18], dst[19]]),
+                        i32::from_le_bytes([dst[20], dst[21], dst[22], dst[23]]),
+                    ));
+                }
+                HostCallOutcome::Ok1(written as i32)
+            }
+            Err(UiPollError::NotMounted) => {
+                HostCallOutcome::Err(koto_core::HostErrorCode::NOT_FOUND)
+            }
+            Err(UiPollError::NoMemory) => HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY),
+        }
+    }
+
+    fn ui_reset(&mut self) -> HostCallOutcome {
+        if self.ui_ime_owner != u16::MAX {
+            self.ime = KotoMemoIme::new();
+        }
+        self.ui_ime_owner = u16::MAX;
+        self.ui_session.reset();
+        self.ui_rects.clear();
+        self.ui_text.clear();
+        self.ui_text_colors.clear();
+        self.ui_text_layouts.clear();
+        self.ui_commands.clear();
+        HostCallOutcome::Ok0
+    }
+
+    fn ui_session_end(&mut self) {
+        let _ = self.ui_reset();
+    }
+
     fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, rgb565: i32) -> HostCallOutcome {
         if self.capturing_static {
             self.static_rects.push((x, y, w, h, rgb565));
@@ -860,10 +1306,221 @@ impl VmHost for SimRuntimeHost {
         HostCallOutcome::Ok1(n as i32)
     }
 
+    fn fetch_start(&mut self, url: &str) -> HostCallOutcome {
+        self.fetch_poll_cache = None;
+        match self.fetch.start(
+            self.fetch_app,
+            &self.fetch_allowlist,
+            url,
+            self.fetch_now_ms,
+        ) {
+            Ok(id) => HostCallOutcome::Ok1(id.raw() as i32),
+            Err(error) => HostCallOutcome::Err(fetch_host_error(error)),
+        }
+    }
+
+    fn fetch_poll(&mut self, request_id: i32) -> HostCallOutcome {
+        if let Some((cached_id, cached_at, state, metadata)) = self.fetch_poll_cache {
+            if cached_id == request_id && cached_at == self.fetch_now_ms {
+                return HostCallOutcome::Ok2(state, metadata);
+            }
+        }
+        let id = FetchRequestId::from_raw(request_id as u32);
+        let (state, metadata) = match self.fetch.poll(self.fetch_app, id, self.fetch_now_ms) {
+            Ok(FetchPoll::Pending) => (0, 0),
+            Ok(FetchPoll::Headers { status }) => (1, i32::from(status)),
+            Ok(FetchPoll::Body) => (2, 0),
+            Ok(FetchPoll::Complete) => (3, 0),
+            Ok(FetchPoll::Failed(error)) | Err(error) => (4, error as i32),
+        };
+        self.fetch_poll_cache = Some((request_id, self.fetch_now_ms, state, metadata));
+        HostCallOutcome::Ok2(state, metadata)
+    }
+
+    fn fetch_read(&mut self, request_id: i32, dst: &mut [u8]) -> HostCallOutcome {
+        self.fetch_poll_cache = None;
+        let id = FetchRequestId::from_raw(request_id as u32);
+        match self.fetch.read(self.fetch_app, id, dst) {
+            Ok(len) => HostCallOutcome::Ok1(len as i32),
+            Err(error) => HostCallOutcome::Err(fetch_host_error(error)),
+        }
+    }
+
+    fn fetch_cancel(&mut self, request_id: i32) -> HostCallOutcome {
+        self.fetch_poll_cache = None;
+        let id = FetchRequestId::from_raw(request_id as u32);
+        match self.fetch.cancel(self.fetch_app, id) {
+            Ok(()) => HostCallOutcome::Ok0,
+            Err(error) => HostCallOutcome::Err(fetch_host_error(error)),
+        }
+    }
+
+    // Bounded MQTT subscribe service (Host ABI minor 23, KOTO-0249). The app
+    // names a manifest broker/topic by index; the OS owns the socket, TLS, and
+    // credential. The service shares the deterministic `fetch_now_ms` clock.
+
+    fn mqtt_connect(&mut self, broker_index: i32) -> HostCallOutcome {
+        let Ok(index) = usize::try_from(broker_index) else {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
+        };
+        match self
+            .mqtt
+            .connect(self.mqtt_app, &self.mqtt_brokers, index, self.fetch_now_ms)
+        {
+            Ok(id) => HostCallOutcome::Ok1(id.raw() as i32),
+            Err(error) => HostCallOutcome::Err(mqtt_host_error(error)),
+        }
+    }
+
+    fn mqtt_subscribe(&mut self, session: i32, topic_index: i32) -> HostCallOutcome {
+        let Ok(index) = usize::try_from(topic_index) else {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
+        };
+        let id = MqttSessionId::from_raw(session as u32);
+        match self.mqtt.subscribe(
+            self.mqtt_app,
+            id,
+            &self.mqtt_topics,
+            index,
+            self.fetch_now_ms,
+        ) {
+            Ok(()) => HostCallOutcome::Ok1(0),
+            Err(error) => HostCallOutcome::Err(mqtt_host_error(error)),
+        }
+    }
+
+    fn mqtt_poll(&mut self, session: i32) -> HostCallOutcome {
+        let id = MqttSessionId::from_raw(session as u32);
+        match self.mqtt.poll(self.mqtt_app, id, self.fetch_now_ms) {
+            Ok(state) => HostCallOutcome::Ok1(state.state_code()),
+            Err(error) => HostCallOutcome::Err(mqtt_host_error(error)),
+        }
+    }
+
+    fn mqtt_peek(&mut self, session: i32) -> HostCallOutcome {
+        let id = MqttSessionId::from_raw(session as u32);
+        match self.mqtt.peek(self.mqtt_app, id) {
+            Ok(Some((topic_len, payload_len))) => {
+                HostCallOutcome::Ok2(topic_len as i32, payload_len as i32)
+            }
+            Ok(None) => HostCallOutcome::Ok2(0, 0),
+            Err(error) => HostCallOutcome::Err(mqtt_host_error(error)),
+        }
+    }
+
+    fn mqtt_read(&mut self, session: i32, topic: &mut [u8], payload: &mut [u8]) -> HostCallOutcome {
+        let id = MqttSessionId::from_raw(session as u32);
+        match self.mqtt.read_message(self.mqtt_app, id, topic, payload) {
+            Ok(None) => HostCallOutcome::Ok1(koto_core::mqtt::app_mqtt::READ_NONE),
+            Ok(Some(message)) => HostCallOutcome::Ok1(if message.retained {
+                koto_core::mqtt::app_mqtt::READ_RETAINED
+            } else {
+                koto_core::mqtt::app_mqtt::READ_MESSAGE
+            }),
+            Err(error) => HostCallOutcome::Err(mqtt_host_error(error)),
+        }
+    }
+
+    fn mqtt_disconnect(&mut self, session: i32) -> HostCallOutcome {
+        let id = MqttSessionId::from_raw(session as u32);
+        match self.mqtt.disconnect(self.mqtt_app, id) {
+            Ok(()) => HostCallOutcome::Ok1(0),
+            Err(error) => HostCallOutcome::Err(mqtt_host_error(error)),
+        }
+    }
+
+    fn mqtt_dropped(&mut self, session: i32) -> HostCallOutcome {
+        let id = MqttSessionId::from_raw(session as u32);
+        match self.mqtt.dropped(self.mqtt_app, id) {
+            Ok(count) => HostCallOutcome::Ok1(count as i32),
+            Err(error) => HostCallOutcome::Err(mqtt_host_error(error)),
+        }
+    }
+
+    fn json_reset(&mut self) -> HostCallOutcome {
+        self.json.reset();
+        HostCallOutcome::Ok0
+    }
+
+    fn json_next(&mut self, src: &[u8]) -> HostCallOutcome {
+        HostCallOutcome::Ok1(self.json.next(src))
+    }
+
+    fn json_finish(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Ok1(self.json.finish())
+    }
+
+    fn json_token(&mut self, dst: &mut [u8]) -> HostCallOutcome {
+        let token = self.json.token();
+        if dst.len() < token.len() {
+            return HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT);
+        }
+        dst[..token.len()].copy_from_slice(token);
+        HostCallOutcome::Ok1(token.len() as i32)
+    }
+
+    fn json_error(&mut self) -> HostCallOutcome {
+        let (code, offset) = self.json.error();
+        HostCallOutcome::Ok2(code, offset)
+    }
+
+    fn json_status(&mut self) -> HostCallOutcome {
+        let (consumed, depth) = self.json.status();
+        HostCallOutcome::Ok2(consumed, depth)
+    }
+
+    /// Advisory time (Host ABI minor 21, KOTO-0247), driven entirely by the
+    /// deterministic frame clock and the scripted UTC anchor — never the host
+    /// wall clock.
+    fn time_query(&mut self, kind: i32) -> HostCallOutcome {
+        use koto_core::time::app_time_query as time_query;
+        match kind {
+            time_query::UTC_SECONDS => {
+                let utc = self
+                    .time_utc_base
+                    .map(|base| base + (self.fetch_now_ms / 1_000) as i64);
+                match utc {
+                    Some(seconds) if (0..=i64::from(i32::MAX)).contains(&seconds) => {
+                        HostCallOutcome::Ok1(seconds as i32)
+                    }
+                    _ => HostCallOutcome::Ok1(-1),
+                }
+            }
+            time_query::OFFSET_MINUTES => {
+                HostCallOutcome::Ok1(i32::from(self.config_snapshot.utc_offset.minutes()))
+            }
+            time_query::MONOTONIC_MS => HostCallOutcome::Ok1(
+                (self.fetch_now_ms as i64 & i64::from(time_query::MONOTONIC_MASK)) as i32,
+            ),
+            _ => HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT),
+        }
+    }
+
+    /// Resolve the running app's opaque credential handle for `url` (KOTO-0248).
+    /// Returns `0` when no grant applies; never exposes a secret.
+    fn vault_handle(&mut self, service: i32, url: &str) -> HostCallOutcome {
+        HostCallOutcome::Ok1(self.vault.handle(service, url))
+    }
+
+    /// Start an allowlisted GET with the granted credential injected by the OS.
+    /// The sim validates the handle exactly as the device host would (grant
+    /// generation, app id, service, exact endpoint, TLS), then starts the fetch;
+    /// a failed validation is a fixed `PERMISSION_DENIED` and no secret is
+    /// exposed. The fake secret never rides the sim's fake transport.
+    fn fetch_start_authenticated(&mut self, url: &str, handle: i32) -> HostCallOutcome {
+        match self.vault.resolve_fetch(url, handle) {
+            Ok(()) => self.fetch_start(url),
+            Err(_) => HostCallOutcome::Err(koto_core::HostErrorCode::PERMISSION_DENIED),
+        }
+    }
+
     fn close_all_files(&mut self) {
         for slot in &mut self.files {
             *slot = None;
         }
+        self.fetch.teardown();
+        self.fetch_poll_cache = None;
+        self.mqtt.teardown();
     }
 
     fn ime_feed_key(&mut self, kind: i32, codepoint: i32) -> HostCallOutcome {
@@ -1091,6 +1748,183 @@ impl VmHost for SimRuntimeHost {
         let written = bytes.len().min(dst.len());
         dst[..written].copy_from_slice(&bytes[..written]);
         HostCallOutcome::Ok2(count, written as i32)
+    }
+}
+
+fn stable_app_id(app_id: &str) -> u32 {
+    app_id.bytes().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
+}
+
+fn fetch_host_error(error: FetchError) -> koto_core::HostErrorCode {
+    match error {
+        FetchError::Denied | FetchError::ForeignRequest => {
+            koto_core::HostErrorCode::PERMISSION_DENIED
+        }
+        FetchError::Unavailable => koto_core::HostErrorCode::UNSUPPORTED,
+        FetchError::Busy | FetchError::BufferTooLarge | FetchError::MalformedUrl => {
+            koto_core::HostErrorCode::BAD_ARGUMENT
+        }
+        FetchError::StaleRequest => koto_core::HostErrorCode::NOT_FOUND,
+        _ => koto_core::HostErrorCode::IO_ERROR,
+    }
+}
+
+fn mqtt_host_error(error: MqttError) -> koto_core::HostErrorCode {
+    match error {
+        MqttError::Denied | MqttError::TopicNotAllowed => {
+            koto_core::HostErrorCode::PERMISSION_DENIED
+        }
+        MqttError::Unavailable => koto_core::HostErrorCode::UNSUPPORTED,
+        MqttError::Busy
+        | MqttError::BufferTooLarge
+        | MqttError::MalformedBroker
+        | MqttError::MessageTooLarge => koto_core::HostErrorCode::BAD_ARGUMENT,
+        MqttError::StaleSession | MqttError::ForeignSession => koto_core::HostErrorCode::NOT_FOUND,
+        _ => koto_core::HostErrorCode::IO_ERROR,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SimUiTextLayout {
+    pub(super) clip: koto_ui::UiRect,
+    pub(super) bounds: koto_ui::UiRect,
+    pub(super) align: koto_ui::TextAlign,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SimUiCommand {
+    Rect(usize),
+    Text(usize),
+}
+
+struct SimUiPainter<'a> {
+    rects: &'a mut Vec<(i32, i32, i32, i32, i32)>,
+    text: &'a mut Vec<(i32, i32, String)>,
+    colors: &'a mut Vec<i32>,
+    layouts: &'a mut Vec<SimUiTextLayout>,
+    commands: &'a mut Vec<SimUiCommand>,
+}
+
+// KotoSim and PicoCalc both render retained App UI with mplus12.kfont.
+// Command layout must use the font's real advances or UTF-8 text and its caret
+// diverge when CanvasUiPainter performs the final rasterization.
+const UI_FONT_HALF_WIDTH: i32 = 6;
+const UI_FONT_FULL_WIDTH: i32 = 12;
+const UI_FONT_LINE_HEIGHT: i32 = 13;
+
+impl koto_ui::TextMetrics for SimUiPainter<'_> {
+    fn measure_text(&mut self, text: &str) -> Result<i32, koto_ui::PaintError> {
+        Ok(text
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii() {
+                    UI_FONT_HALF_WIDTH
+                } else {
+                    UI_FONT_FULL_WIDTH
+                }
+            })
+            .sum())
+    }
+
+    fn line_height(&self) -> Option<i32> {
+        Some(UI_FONT_LINE_HEIGHT)
+    }
+}
+
+impl koto_ui::Painter for SimUiPainter<'_> {
+    fn fill_rect(
+        &mut self,
+        clip: koto_ui::UiRect,
+        rect: koto_ui::UiRect,
+        color: koto_ui::Rgb565,
+    ) -> Result<(), koto_ui::PaintError> {
+        if let Some(rect) = rect.intersection(clip) {
+            let index = self.rects.len();
+            self.rects
+                .push((rect.x, rect.y, rect.w, rect.h, i32::from(color.0)));
+            self.commands.push(SimUiCommand::Rect(index));
+        }
+        Ok(())
+    }
+    fn stroke_rect(
+        &mut self,
+        clip: koto_ui::UiRect,
+        rect: koto_ui::UiRect,
+        color: koto_ui::Rgb565,
+        width: u8,
+    ) -> Result<(), koto_ui::PaintError> {
+        let width = i32::from(width).max(1);
+        for edge in [
+            koto_ui::UiRect::new(rect.x, rect.y, rect.w, width),
+            koto_ui::UiRect::new(rect.x, rect.y + rect.h - width, rect.w, width),
+            koto_ui::UiRect::new(rect.x, rect.y, width, rect.h),
+            koto_ui::UiRect::new(rect.x + rect.w - width, rect.y, width, rect.h),
+        ] {
+            self.fill_rect(clip, edge, color)?;
+        }
+        Ok(())
+    }
+    fn draw_text(
+        &mut self,
+        clip: koto_ui::UiRect,
+        bounds: koto_ui::UiRect,
+        run: koto_ui::TextRun<'_>,
+    ) -> Result<(), koto_ui::PaintError> {
+        if bounds.intersection(clip).is_none() {
+            return Ok(());
+        }
+        let width = <Self as koto_ui::TextMetrics>::measure_text(self, run.text)?;
+        let x = match run.align {
+            koto_ui::TextAlign::Start => bounds.x,
+            koto_ui::TextAlign::Center => bounds.x + (bounds.w - width) / 2,
+            koto_ui::TextAlign::End => bounds.x + bounds.w - width,
+        };
+        let index = self.text.len();
+        self.text.push((
+            x,
+            bounds.y + (bounds.h - UI_FONT_LINE_HEIGHT).max(0) / 2,
+            run.text.to_string(),
+        ));
+        self.colors.push(i32::from(run.color.0));
+        self.layouts.push(SimUiTextLayout {
+            clip,
+            bounds,
+            align: run.align,
+        });
+        self.commands.push(SimUiCommand::Text(index));
+        Ok(())
+    }
+    fn draw_glyphs(
+        &mut self,
+        clip: koto_ui::UiRect,
+        bounds: koto_ui::UiRect,
+        run: koto_ui::GlyphRun<'_>,
+    ) -> Result<(), koto_ui::PaintError> {
+        let text: String = run
+            .glyphs
+            .iter()
+            .filter_map(|id| char::from_u32(u32::from(*id)))
+            .collect();
+        self.draw_text(
+            clip,
+            bounds,
+            koto_ui::TextRun {
+                text: &text,
+                color: run.color,
+                align: koto_ui::TextAlign::Start,
+            },
+        )
+    }
+    fn draw_focus_mark(
+        &mut self,
+        clip: koto_ui::UiRect,
+        rect: koto_ui::UiRect,
+        color: koto_ui::Rgb565,
+        width: u8,
+    ) -> Result<(), koto_ui::PaintError> {
+        self.stroke_rect(clip, rect, color, width)
     }
 }
 

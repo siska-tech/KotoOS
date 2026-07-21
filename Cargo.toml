@@ -3,6 +3,7 @@ members = [
     "src/koto-core",
     "src/koto-gfx",
     "src/koto-game2d",
+    "src/koto-ui",
     "src/koto-pico",
     "src/koto-psram",
     "src/koto-sim",
@@ -29,6 +30,7 @@ default-members = [
     "src/koto-core",
     "src/koto-gfx",
     "src/koto-game2d",
+    "src/koto-ui",
     "src/koto-sim",
     "src/koto-vm",
     "tools/kbc-asm",
@@ -45,7 +47,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-version = "0.2.0"
+version = "0.3.0-alpha"
 
 # KOTO-0176: deterministic release code layout. At the default
 # codegen-units=16 with no LTO, firmware function layout reshuffles per build

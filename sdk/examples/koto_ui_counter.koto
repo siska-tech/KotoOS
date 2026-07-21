@@ -1,0 +1,115 @@
+include <sdk/koto_ui.koto>;
+
+data count_zero = u8[67, 111, 117, 110, 116, 58, 32, 48];
+data count_one = u8[67, 111, 117, 110, 116, 58, 32, 49];
+data increment = u8[73, 110, 99, 114, 101, 109, 101, 110, 116];
+
+enum CounterWidget {
+    Panel = 1,
+    Count,
+    Increment,
+}
+
+const COUNTER_EVENT_BYTES = 64;
+const COUNTER_COUNT_BYTES = 8;
+const COUNTER_INCREMENT_BYTES = 9;
+
+static counter_mount_builder: UiMountBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+static counter_update_builder: UiUpdateBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+fn fail(status: int) {
+    ui_reset();
+    exit(status);
+}
+
+fn main() {
+    buf capabilities[64];
+    let capability_len = ui_capabilities(capabilities, 64);
+    if capability_len < 0 {
+        // Older Host ABI: this sample requires the retained UI calls.
+        exit(capability_len);
+    }
+    if ui_capabilities_validate(capabilities, capability_len) != 0 {
+        exit(UI_SDK_BAD_ARGUMENT);
+    }
+
+    // Three records; the 8-byte count and 9-byte button label occupy 17 data
+    // bytes.
+    buf mount_packet[ui_mount_capacity(3, 17)];
+    let status = counter_mount_builder.begin(mount_packet, len(mount_packet), 3,
+        CounterWidget::Panel, CounterWidget::Increment);
+    if status != 0 { fail(status); }
+    counter_mount_builder.panel(
+        CounterWidget::Panel, UI_PARENT_ROOT, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        0, 0, 320, 320, count_zero, 0, 0, 8, 16);
+    counter_mount_builder.label(
+        CounterWidget::Count, CounterWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        16, 24, 160, 24, count_zero, COUNTER_COUNT_BYTES, COUNTER_COUNT_BYTES,
+        UiAlignment::Start);
+    counter_mount_builder.button(
+        CounterWidget::Increment, CounterWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        16, 64, 120, 28, increment, COUNTER_INCREMENT_BYTES,
+        COUNTER_INCREMENT_BYTES, false);
+    status = counter_mount_builder.finish();
+    if status < 0 { fail(status); }
+    status = ui_mount(mount_packet, status);
+    if status != 0 { fail(status); }
+    status = ui_present();
+    if status != 0 { fail(status); }
+
+    buf event[64];
+    // Updates replace only the count text, whose encoded width remains 8
+    // bytes in this sample.
+    buf update_packet[ui_update_capacity(1, 8)];
+    let value = 0;
+    while 1 {
+        let changed = 0;
+        let event_len = ui_poll_event(event, COUNTER_EVENT_BYTES);
+        if event_len < 0 { fail(event_len); }
+        while event_len > 0 {
+            if ui_event_validate(event, event_len) != 0 { fail(UI_SDK_BAD_ARGUMENT); }
+            let response = ui_event_response(event);
+            if response == UiResponse::Activated &&
+               ui_event_widget_id(event) == CounterWidget::Increment {
+                value = 1 - value;
+                changed = 1;
+            } else if response == UiResponse::LocaleChanged {
+                if ui_locale_changed_validate(event, event_len) != 0 { fail(UI_SDK_BAD_ARGUMENT); }
+                // This sample embeds English only, so the documented fallback is
+                // the same resource while business state remains unchanged.
+                changed = 1;
+            } else if response == UiResponse::Cancelled {
+                ui_reset();
+                exit(0);
+            }
+            event_len = ui_poll_event(event, COUNTER_EVENT_BYTES);
+            if event_len < 0 { fail(event_len); }
+        }
+
+        if changed != 0 {
+            status = counter_update_builder.begin(update_packet, len(update_packet), 1);
+            if status != 0 { fail(status); }
+            if value == 0 {
+                counter_update_builder.text(CounterWidget::Count,
+                    count_zero, COUNTER_COUNT_BYTES);
+            } else {
+                counter_update_builder.text(CounterWidget::Count,
+                    count_one, COUNTER_COUNT_BYTES);
+            }
+            status = counter_update_builder.finish();
+            if status < 0 { fail(status); }
+            status = ui_update(update_packet, status);
+            if status != 0 { fail(status); }
+            status = ui_present();
+            if status != 0 { fail(status); }
+        }
+        yield_frame();
+    }
+}

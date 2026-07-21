@@ -1,0 +1,28 @@
+Koto Weather
+Location
+Refresh
+Cancel
+Unit C/F
+No data yet
+stale
+time ?
+Unknown
+Clear
+Partly cloudy
+Cloudy
+Fog
+Rain
+Snow
+Thunderstorm
+Windy
+Ready
+Loading...
+Updated
+Offline
+Timed out
+Provider error
+Invalid data
+Response too large
+Set a location
+Please wait
+Save failed

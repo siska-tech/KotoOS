@@ -240,6 +240,16 @@ impl<const CAP: usize, const DIRTY: usize> MemoEditor<CAP, DIRTY> {
         self.cursor
     }
 
+    /// Set a byte cursor supplied by another bounded editor owner.
+    pub fn set_cursor(&mut self, cursor: usize) -> Result<(), MemoError> {
+        if cursor > self.len || !self.as_str().is_char_boundary(cursor) {
+            return Err(MemoError::InvalidText);
+        }
+        self.cursor = cursor;
+        self.ensure_cursor_visible();
+        Ok(())
+    }
+
     pub fn scroll_row(&self) -> usize {
         self.scroll_row
     }

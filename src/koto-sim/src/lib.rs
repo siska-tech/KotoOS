@@ -9,6 +9,7 @@ mod host_fs;
 pub mod koto_blocks_audio;
 mod manifest;
 mod runtime;
+mod ui_gallery;
 
 #[cfg(feature = "window")]
 pub mod window;
@@ -20,3 +21,4 @@ pub use framebuffer::{
 pub use host_fs::{HostDirEntry, HostFile, HostFs};
 pub use manifest::{parse_launch_manifest, parse_manifest, PackageLaunch};
 pub use runtime::*;
+pub use ui_gallery::{GalleryResponse, GalleryStep, UiGallery, GALLERY_SURFACE};

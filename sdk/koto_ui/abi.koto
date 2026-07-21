@@ -1,0 +1,924 @@
+// KotoUI application ABI builders (KUI1/KUP1/KUE1).
+//
+// The caller owns every buffer. These helpers only serialize snapshots into
+// that storage; ui_mount/ui_update are the points that copy a validated packet
+// into the host-owned session.
+
+const UI_SDK_OK = 0;
+const UI_SDK_BAD_ARGUMENT = -2;
+const UI_MOUNT_HEADER_BYTES = 40;
+const UI_NODE_RECORD_BYTES = 48;
+const UI_UPDATE_HEADER_BYTES = 32;
+const UI_UPDATE_RECORD_BYTES = 32;
+const UI_MAX_UPDATE_RECORDS = 16;
+const UI_PROPERTY_TEXT = 1;
+const UI_PROPERTY_ENABLED = 2;
+const UI_PROPERTY_VISIBLE = 3;
+const UI_PROPERTY_CHECKED = 4;
+const UI_PROPERTY_SELECTION = 5;
+const UI_PROPERTY_TEXT_VALUE = 6;
+const UI_PROPERTY_BOUNDS = 7;
+const UI_PROPERTY_LIST_ROWS = 8;
+const UI_PROPERTY_DIALOG_OPEN = 9;
+const UI_PROPERTY_REQUEST_FOCUS = 10;
+
+// KUP1's mutually exclusive property tag domain. The flat constants above
+// remain source-compatible aliases for existing applications.
+enum UiProperty {
+    Text = 1,
+    Enabled,
+    Visible,
+    Checked,
+    Selection,
+    TextValue,
+    Bounds,
+    ListRows,
+    DialogOpen,
+    RequestFocus,
+}
+
+// Packet capacity constructors. The compiler evaluates these two calls in a
+// top-level const declaration; ordinary expressions use the same checked SDK
+// implementation. Data capacity is the caller-owned arena after the fixed
+// header and record table.
+fn ui_mount_capacity(records: int, data_capacity: int) -> int {
+    if records < 1 || records > UI_MAX_NODES || data_capacity < 0 ||
+       data_capacity > UI_MAX_DATA_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let capacity = UI_MOUNT_HEADER_BYTES + records * UI_NODE_RECORD_BYTES + data_capacity;
+    if capacity > UI_MAX_MOUNT_BYTES { return UI_SDK_BAD_ARGUMENT; }
+    return capacity;
+}
+
+fn ui_update_capacity(records: int, data_capacity: int) -> int {
+    if records < 1 || records > UI_MAX_UPDATE_RECORDS || data_capacity < 0 ||
+       data_capacity > UI_MAX_DATA_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let capacity = UI_UPDATE_HEADER_BYTES + records * UI_UPDATE_RECORD_BYTES + data_capacity;
+    if capacity > UI_MAX_UPDATE_BYTES { return UI_SDK_BAD_ARGUMENT; }
+    return capacity;
+}
+
+// Storage capacity constructors (KOTO-0236): the caller-owned regions behind
+// `TextResource::parse` and `UiListRowsBuilder::begin`, sized from semantic
+// line/row counts plus a payload arena instead of the SDK-private table
+// strides in `resources.koto`. The compiler folds both in `const`, `buf`, and
+// struct buffer-field declarations with the same boundary diagnostics; the
+// checked implementations below serve ordinary expressions.
+fn ui_text_resource_capacity(line_capacity: int, payload_capacity: int) -> int {
+    // parse's own bounds: line table indexes with u16 offsets over a
+    // <= 65535-byte destination, so at most 16383 four-byte entries.
+    if line_capacity < 1 || line_capacity > 16383 || payload_capacity < 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let capacity = line_capacity * 4 + payload_capacity;
+    if capacity > 65535 { return UI_SDK_BAD_ARGUMENT; }
+    return capacity;
+}
+
+fn ui_list_rows_capacity(row_capacity: int, label_capacity: int) -> int {
+    if row_capacity < 1 || row_capacity > UI_MAX_LIST_ROWS || label_capacity < 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let capacity = row_capacity * 12 + label_capacity;
+    if capacity > 65535 { return UI_SDK_BAD_ARGUMENT; }
+    return capacity;
+}
+
+fn ui_sdk_put_u32(dst: int, offset: int, value: int) {
+    heap_set_u16(dst + offset, value & 65535);
+    heap_set_u16(dst + offset + 2, (value >> 16) & 65535);
+}
+
+fn ui_sdk_get_u32(src: int, offset: int) -> int {
+    return heap_get_u16(src + offset) | (heap_get_u16(src + offset + 2) << 16);
+}
+
+fn ui_sdk_node(
+    dst: int, max_len: int, index: int, id: int, parent: int,
+    kind: int, flags: int, state: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int,
+    value_offset: int, value_len: int, value_capacity: int,
+    arg0: int, arg1: int, arg2: int, arg3: int
+) -> int {
+    if index < 0 || index >= UI_MAX_NODES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let record = UI_MOUNT_HEADER_BYTES + index * UI_NODE_RECORD_BYTES;
+    if max_len < UI_MOUNT_HEADER_BYTES || record + UI_NODE_RECORD_BYTES > max_len {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if id < 1 || id >= 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if parent < UI_PARENT_ROOT || parent == 0 || parent >= 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if kind < UiNodeKind::Label || kind > UiNodeKind::Dialog || flags < 0 || flags > 255 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    // 0xe8 is the complement of the four supported v1 flag bits in a u8.
+    if (flags & 232) != 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if state < 0 || state > 65535 || x < -32768 || x > 32767 || y < -32768 || y > 32767 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if width < 1 || width > 32767 || height < 1 || height > 32767 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if text_offset < 0 || text_len < 0 || text_capacity < text_len || text_capacity > 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if value_offset < 0 || value_len < 0 || value_capacity < value_len || value_capacity > 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if text_offset + text_len > UI_MAX_DATA_BYTES || value_offset + value_len > UI_MAX_DATA_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+
+    ui_sdk_zero(dst + record, UI_NODE_RECORD_BYTES);
+    heap_set_u16(dst + record + 0, id);
+    heap_set_u16(dst + record + 2, parent);
+    heap_set_u8(dst + record + 4, kind);
+    heap_set_u8(dst + record + 5, flags);
+    heap_set_u16(dst + record + 6, state);
+    heap_set_u16(dst + record + 8, x);
+    heap_set_u16(dst + record + 10, y);
+    heap_set_u16(dst + record + 12, width);
+    heap_set_u16(dst + record + 14, height);
+    ui_sdk_put_u32(dst, record + 16, text_offset);
+    heap_set_u16(dst + record + 20, text_len);
+    heap_set_u16(dst + record + 22, text_capacity);
+    ui_sdk_put_u32(dst, record + 24, value_offset);
+    heap_set_u16(dst + record + 28, value_len);
+    heap_set_u16(dst + record + 30, value_capacity);
+    ui_sdk_put_u32(dst, record + 32, arg0);
+    ui_sdk_put_u32(dst, record + 36, arg1);
+    ui_sdk_put_u32(dst, record + 40, arg2);
+    ui_sdk_put_u32(dst, record + 44, arg3);
+    return UI_SDK_OK;
+}
+
+// The stateful builder has already checked its record/data cursors and the
+// kind-specific scalar arguments. The complete cross-record and UTF-8 checks
+// still run in ui_mount_finish before lengths are sealed.
+fn ui_sdk_builder_node_write(
+    dst: int, index: int, id: int, parent: int,
+    kind: int, flags: int, state: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int,
+    value_offset: int, value_len: int, value_capacity: int,
+    arg0: int, arg1: int, arg2: int, arg3: int
+) {
+    let record = UI_MOUNT_HEADER_BYTES + index * UI_NODE_RECORD_BYTES;
+    ui_sdk_zero(dst + record, UI_NODE_RECORD_BYTES);
+    heap_set_u16(dst + record, id);
+    heap_set_u16(dst + record + 2, parent);
+    heap_set_u8(dst + record + 4, kind);
+    heap_set_u8(dst + record + 5, flags);
+    heap_set_u16(dst + record + 6, state);
+    heap_set_u16(dst + record + 8, x);
+    heap_set_u16(dst + record + 10, y);
+    heap_set_u16(dst + record + 12, width);
+    heap_set_u16(dst + record + 14, height);
+    ui_sdk_put_u32(dst, record + 16, text_offset);
+    heap_set_u16(dst + record + 20, text_len);
+    heap_set_u16(dst + record + 22, text_capacity);
+    ui_sdk_put_u32(dst, record + 24, value_offset);
+    heap_set_u16(dst + record + 28, value_len);
+    heap_set_u16(dst + record + 30, value_capacity);
+    ui_sdk_put_u32(dst, record + 32, arg0);
+    ui_sdk_put_u32(dst, record + 36, arg1);
+    ui_sdk_put_u32(dst, record + 40, arg2);
+    ui_sdk_put_u32(dst, record + 44, arg3);
+}
+
+fn ui_sdk_builder_node_args_valid(
+    id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int
+) -> int {
+    if id < 1 || id >= 65535 || parent < UI_PARENT_ROOT || parent == 0 || parent >= 65535 ||
+       flags < 0 || flags > 255 || (flags & 232) != 0 ||
+       x < -32768 || x > 32767 || y < -32768 || y > 32767 ||
+       width < 1 || width > 32767 || height < 1 || height > 32767 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_mount_add_label(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int, alignment: int
+) -> int {
+    if alignment < UI_ALIGN_START || alignment > UI_ALIGN_END {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_node(dst, max_len, index, id, parent, UiNodeKind::Label, flags, 0,
+        x, y, width, height, text_offset, text_len, text_capacity, 0, 0, 0,
+        alignment, 0, 0, 0);
+}
+
+fn ui_mount_add_button(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int, closes_dialog: int
+) -> int {
+    if closes_dialog < 0 || closes_dialog > 1 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_node(dst, max_len, index, id, parent, UiNodeKind::Button, flags, closes_dialog,
+        x, y, width, height, text_offset, text_len, text_capacity, 0, 0, 0, 0, 0, 0, 0);
+}
+
+fn ui_mount_add_checkbox(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int, checked: int
+) -> int {
+    return ui_mount_add_checkbox_with_mark_offset(dst, max_len, index, id, parent, flags,
+        x, y, width, height, text_offset, text_len, text_capacity, checked, 0, 0);
+}
+
+fn ui_mount_add_checkbox_with_mark_offset(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int, checked: int,
+    mark_offset_x: int, mark_offset_y: int
+) -> int {
+    if checked < 0 || checked > 1 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let side = height;
+    if side > 12 { side = 12; }
+    let mark_y = (height - side) / 2 + mark_offset_y;
+    if side <= 0 || mark_offset_x < 0 || mark_offset_x + side > width ||
+       mark_y < 0 || mark_y + side > height {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_node(dst, max_len, index, id, parent, UiNodeKind::Checkbox, flags, checked,
+        x, y, width, height, text_offset, text_len, text_capacity, 0, 0, 0,
+        mark_offset_x, mark_offset_y, 0, 0);
+}
+
+fn ui_mount_add_list(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    value_offset: int, value_len: int, value_capacity: int,
+    row_count: int, selected: int, row_height: int, show_scrollbar: int
+) -> int {
+    if row_count < 0 || row_count > UI_MAX_LIST_ROWS || selected < UI_SELECTION_NONE || selected >= row_count {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if row_height < 1 || row_height > 32767 || show_scrollbar < 0 || show_scrollbar > 1 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if value_len < row_count * 12 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_node(dst, max_len, index, id, parent, UiNodeKind::List, flags, show_scrollbar,
+        x, y, width, height, 0, 0, 0, value_offset, value_len, value_capacity,
+        row_count, selected, row_height, 0);
+}
+
+fn ui_mount_add_text_field(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int,
+    value_offset: int, value_len: int, value_capacity: int, cursor: int, ime: int
+) -> int {
+    if cursor < UI_CURSOR_END || cursor > value_len || ime < 0 || ime > 1 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if value_capacity > UI_MAX_TEXT_FIELD_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_node(dst, max_len, index, id, parent, UiNodeKind::TextField, flags, ime,
+        x, y, width, height, text_offset, text_len, text_capacity,
+        value_offset, value_len, value_capacity, cursor, 0, 0, 0);
+}
+
+fn ui_mount_add_panel(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int, padding: int, title_height: int
+) -> int {
+    if padding < 0 || padding > 32 || title_height < 0 || title_height > 64 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_node(dst, max_len, index, id, parent, UiNodeKind::Panel, flags, 0,
+        x, y, width, height, text_offset, text_len, text_capacity, 0, 0, 0,
+        padding, title_height, 0, 0);
+}
+
+fn ui_mount_add_dialog(
+    dst: int, max_len: int, index: int, id: int, parent: int, flags: int,
+    x: int, y: int, width: int, height: int,
+    text_offset: int, text_len: int, text_capacity: int,
+    padding: int, title_height: int, default_action: int, cancel_action: int, open: int
+) -> int {
+    if padding < 0 || padding > 32 || title_height < 0 || title_height > 64 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if default_action < UI_ACTION_NONE || default_action == 0 || default_action >= 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if cancel_action < UI_ACTION_NONE || cancel_action == 0 || cancel_action >= 65535 || open < 0 || open > 1 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_node(dst, max_len, index, id, parent, UiNodeKind::Dialog, flags, open,
+        x, y, width, height, text_offset, text_len, text_capacity, 0, 0, 0,
+        padding, title_height, default_action, cancel_action);
+}
+
+fn ui_sdk_zero(dst: int, len: int) {
+    let i = 0;
+    while i < len {
+        heap_set_u8(dst + i, 0);
+        i = i + 1;
+    }
+}
+
+fn ui_packet_copy(dst: int, max_len: int, dst_offset: int, src: int, len: int) -> int {
+    if dst_offset < 0 || len < 0 || dst_offset + len > max_len {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let i = 0;
+    while i < len {
+        heap_set_u8(dst + dst_offset + i, heap_get_u8(src + i));
+        i = i + 1;
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_utf8_valid(src: int, len: int) -> int {
+    let i = 0;
+    while i < len {
+        let b0 = heap_get_u8(src + i);
+        if b0 < 128 {
+            i = i + 1;
+        } else if b0 >= 194 && b0 <= 223 {
+            if i + 1 >= len { return UI_SDK_BAD_ARGUMENT; }
+            let b1 = heap_get_u8(src + i + 1);
+            if b1 < 128 || b1 > 191 { return UI_SDK_BAD_ARGUMENT; }
+            i = i + 2;
+        } else if b0 >= 224 && b0 <= 239 {
+            if i + 2 >= len { return UI_SDK_BAD_ARGUMENT; }
+            let b1 = heap_get_u8(src + i + 1);
+            let b2 = heap_get_u8(src + i + 2);
+            if b2 < 128 || b2 > 191 { return UI_SDK_BAD_ARGUMENT; }
+            if b0 == 224 && (b1 < 160 || b1 > 191) { return UI_SDK_BAD_ARGUMENT; }
+            if b0 == 237 && (b1 < 128 || b1 > 159) { return UI_SDK_BAD_ARGUMENT; }
+            if b0 != 224 && b0 != 237 && (b1 < 128 || b1 > 191) {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            i = i + 3;
+        } else if b0 >= 240 && b0 <= 244 {
+            if i + 3 >= len { return UI_SDK_BAD_ARGUMENT; }
+            let b1 = heap_get_u8(src + i + 1);
+            let b2 = heap_get_u8(src + i + 2);
+            let b3 = heap_get_u8(src + i + 3);
+            if b2 < 128 || b2 > 191 || b3 < 128 || b3 > 191 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            if b0 == 240 && (b1 < 144 || b1 > 191) { return UI_SDK_BAD_ARGUMENT; }
+            if b0 == 244 && (b1 < 128 || b1 > 143) { return UI_SDK_BAD_ARGUMENT; }
+            if b0 != 240 && b0 != 244 && (b1 < 128 || b1 > 191) {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            i = i + 4;
+        } else {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_prior_kind(dst: int, index: int, id: int) -> int {
+    let i = 0;
+    while i < index {
+        let record = dst + UI_MOUNT_HEADER_BYTES + i * UI_NODE_RECORD_BYTES;
+        if heap_get_u16(record) == id { return heap_get_u8(record + 4); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ui_sdk_action_valid(dst: int, count: int, dialog_id: int, action_id: int) -> int {
+    if action_id == UI_ACTION_NONE { return 1; }
+    let i = 0;
+    while i < count {
+        let record = dst + UI_MOUNT_HEADER_BYTES + i * UI_NODE_RECORD_BYTES;
+        if heap_get_u16(record) == action_id && heap_get_u16(record + 2) == dialog_id &&
+           heap_get_u8(record + 4) == UiNodeKind::Button &&
+           (heap_get_u8(record + 5) & (UI_FLAG_VISIBLE | UI_FLAG_ENABLED)) ==
+               (UI_FLAG_VISIBLE | UI_FLAG_ENABLED) &&
+           (heap_get_u16(record + 6) & 1) == 1 {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ui_sdk_list_valid(dst: int, record: int, data_offset: int, data_len: int) -> int {
+    let value_offset = ui_sdk_get_u32(dst, record + 24);
+    let value_len = heap_get_u16(dst + record + 28);
+    let rows = ui_sdk_get_u32(dst, record + 32);
+    let selected = ui_sdk_get_u32(dst, record + 36);
+    if rows < 0 || rows > UI_MAX_LIST_ROWS || selected < UI_SELECTION_NONE || selected >= rows {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if ui_sdk_get_u32(dst, record + 40) < 1 || ui_sdk_get_u32(dst, record + 44) != 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if rows * 12 > value_len || value_offset + value_len > data_len {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let row = 0;
+    while row < rows {
+        let rr = dst + data_offset + value_offset + row * 12;
+        let label_offset = heap_get_u16(rr);
+        let label_len = heap_get_u16(rr + 2);
+        if label_offset < rows * 12 || label_offset + label_len > value_len {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if (heap_get_u16(rr + 4) & 65534) != 0 || heap_get_u16(rr + 6) != 0 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if ui_sdk_utf8_valid(dst + data_offset + value_offset + label_offset, label_len) != 0 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if row == selected && (heap_get_u16(rr + 4) & 1) == 0 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        row = row + 1;
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_mount_structure_valid(dst: int, total_len: int, data_offset: int) -> int {
+    let count = heap_get_u16(dst + 12);
+    let nodes_end = UI_MOUNT_HEADER_BYTES + count * UI_NODE_RECORD_BYTES;
+    if heap_get_u8(dst) != 75 || heap_get_u8(dst + 1) != 85 ||
+       heap_get_u8(dst + 2) != 73 || heap_get_u8(dst + 3) != 49 ||
+       heap_get_u16(dst + 4) != UI_ABI_MAJOR || heap_get_u16(dst + 6) != UI_ABI_MINOR {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if count < 1 || count > UI_MAX_NODES || heap_get_u16(dst + 14) != UI_NODE_RECORD_BYTES ||
+       ui_sdk_get_u32(dst, 16) != UI_MOUNT_HEADER_BYTES || ui_sdk_get_u32(dst, 20) != data_offset ||
+       ui_sdk_get_u32(dst, 32) != 0 || ui_sdk_get_u32(dst, 36) != 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if nodes_end > data_offset || total_len < data_offset {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let padding = nodes_end;
+    while padding < data_offset {
+        if heap_get_u8(dst + padding) != 0 { return UI_SDK_BAD_ARGUMENT; }
+        padding = padding + 1;
+    }
+    let roots = 0;
+    let i = 0;
+    while i < count {
+        let record = UI_MOUNT_HEADER_BYTES + i * UI_NODE_RECORD_BYTES;
+        let id = heap_get_u16(dst + record);
+        let parent = heap_get_u16(dst + record + 2);
+        let kind = heap_get_u8(dst + record + 4);
+        let flags = heap_get_u8(dst + record + 5);
+        let width = heap_get_u16(dst + record + 12);
+        let height = heap_get_u16(dst + record + 14);
+        if id == 0 || id == 65535 || kind < UiNodeKind::Label || kind > UiNodeKind::Dialog ||
+           (flags & 232) != 0 || ui_sdk_prior_kind(dst, i, id) != 0 ||
+           width < 1 || width > 32767 || height < 1 || height > 32767 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if parent == 65535 {
+            roots = roots + 1;
+            if id != heap_get_u16(dst + 28) || kind != UiNodeKind::Panel ||
+               (flags & (UI_FLAG_VISIBLE | UI_FLAG_ENABLED)) !=
+                   (UI_FLAG_VISIBLE | UI_FLAG_ENABLED) ||
+               heap_get_i16(dst + record + 8) != 0 || heap_get_i16(dst + record + 10) != 0 ||
+               width != 320 || height != 320 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+        } else {
+            let parent_kind = ui_sdk_prior_kind(dst, i, parent);
+            if parent_kind != UiNodeKind::Panel && parent_kind != UiNodeKind::Dialog {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            if kind == UiNodeKind::Dialog && parent != heap_get_u16(dst + 28) {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            let p = 0;
+            while p < i && heap_get_u16(dst + UI_MOUNT_HEADER_BYTES + p * UI_NODE_RECORD_BYTES) != parent {
+                p = p + 1;
+            }
+            let pr = UI_MOUNT_HEADER_BYTES + p * UI_NODE_RECORD_BYTES;
+            let x = heap_get_i16(dst + record + 8);
+            let y = heap_get_i16(dst + record + 10);
+            let px = heap_get_i16(dst + pr + 8);
+            let py = heap_get_i16(dst + pr + 10);
+            if x < px || y < py || x + width > px + heap_get_u16(dst + pr + 12) ||
+               y + height > py + heap_get_u16(dst + pr + 14) {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+        }
+        i = i + 1;
+    }
+    if roots != 1 { return UI_SDK_BAD_ARGUMENT; }
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_mount_data_valid(dst: int, total_len: int, data_offset: int) -> int {
+    let count = heap_get_u16(dst + 12);
+    let data_len = total_len - data_offset;
+    let arena = 0;
+    let text_fields = 0;
+    let text_field_capacity = 0;
+    let i = 0;
+    while i < count {
+        let record = UI_MOUNT_HEADER_BYTES + i * UI_NODE_RECORD_BYTES;
+        let text_offset = ui_sdk_get_u32(dst, record + 16);
+        let text_len = heap_get_u16(dst + record + 20);
+        let text_capacity = heap_get_u16(dst + record + 22);
+        let value_offset = ui_sdk_get_u32(dst, record + 24);
+        let value_len = heap_get_u16(dst + record + 28);
+        let value_capacity = heap_get_u16(dst + record + 30);
+        if text_len > text_capacity || value_len > value_capacity || text_offset < 0 ||
+           value_offset < 0 || text_offset + text_len > data_len || value_offset + value_len > data_len {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        arena = arena + text_capacity + value_capacity;
+        if arena > UI_MAX_DATA_BYTES || ui_sdk_utf8_valid(dst + data_offset + text_offset, text_len) != 0 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if heap_get_u8(dst + record + 4) == UiNodeKind::TextField {
+            text_fields = text_fields + 1;
+            text_field_capacity = text_field_capacity + value_capacity;
+            let cursor = ui_sdk_get_u32(dst, record + 32);
+            if value_capacity > UI_MAX_TEXT_FIELD_BYTES || text_fields > UI_MAX_TEXT_FIELDS ||
+               text_field_capacity > 512 || cursor < UI_CURSOR_END || cursor > value_len ||
+               ui_sdk_utf8_valid(dst + data_offset + value_offset, value_len) != 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            if cursor >= 0 && cursor < value_len {
+                let cursor_byte = heap_get_u8(dst + data_offset + value_offset + cursor);
+                if cursor_byte >= 128 && cursor_byte <= 191 { return UI_SDK_BAD_ARGUMENT; }
+            }
+        }
+        i = i + 1;
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_mount_kinds_valid(dst: int, total_len: int, data_offset: int) -> int {
+    let count = heap_get_u16(dst + 12);
+    let list_rows = 0;
+    let dialogs = 0;
+    let open_dialogs = 0;
+    let i = 0;
+    while i < count {
+        let record = UI_MOUNT_HEADER_BYTES + i * UI_NODE_RECORD_BYTES;
+        let kind = heap_get_u8(dst + record + 4);
+        let state = heap_get_u16(dst + record + 6);
+        let value_len = heap_get_u16(dst + record + 28);
+        let arg0 = ui_sdk_get_u32(dst, record + 32);
+        let arg1 = ui_sdk_get_u32(dst, record + 36);
+        let arg2 = ui_sdk_get_u32(dst, record + 40);
+        let arg3 = ui_sdk_get_u32(dst, record + 44);
+        if state > 1 || ((kind == UiNodeKind::Label || kind == UiNodeKind::Panel) && state != 0) {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if kind == UiNodeKind::Label {
+            if arg0 < UI_ALIGN_START || arg0 > UI_ALIGN_END || arg1 != 0 || arg2 != 0 || arg3 != 0 || value_len != 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+        } else if kind == UiNodeKind::Button {
+            if arg0 != 0 || arg1 != 0 || arg2 != 0 || arg3 != 0 || value_len != 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+        } else if kind == UiNodeKind::Checkbox {
+            let width = heap_get_u16(dst + record + 12);
+            let height = heap_get_u16(dst + record + 14);
+            let side = height;
+            if side > 12 { side = 12; }
+            let mark_y = (height - side) / 2 + arg1;
+            if arg0 < 0 || arg0 + side > width || mark_y < 0 || mark_y + side > height ||
+               arg2 != 0 || arg3 != 0 || value_len != 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+        } else if kind == UiNodeKind::List {
+            if ui_sdk_list_valid(dst, record, data_offset, total_len - data_offset) != 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            list_rows = list_rows + arg0;
+            if list_rows > UI_MAX_LIST_ROWS { return UI_SDK_BAD_ARGUMENT; }
+        } else if kind == UiNodeKind::TextField {
+            if arg1 != 0 || arg2 != 0 || arg3 != 0 { return UI_SDK_BAD_ARGUMENT; }
+        } else {
+            if arg0 < 0 || arg0 > 32 || arg1 < 0 || arg1 > 64 || value_len != 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            if kind == UiNodeKind::Panel && (arg2 != 0 || arg3 != 0) {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            if kind == UiNodeKind::Dialog {
+                dialogs = dialogs + 1;
+                open_dialogs = open_dialogs + state;
+            }
+        }
+        i = i + 1;
+    }
+    if dialogs > 2 || open_dialogs > UI_MAX_OPEN_MODALS { return UI_SDK_BAD_ARGUMENT; }
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_mount_actions_valid(dst: int) -> int {
+    let count = heap_get_u16(dst + 12);
+    let i = 0;
+    while i < count {
+        let record = UI_MOUNT_HEADER_BYTES + i * UI_NODE_RECORD_BYTES;
+        if heap_get_u8(dst + record + 4) == UiNodeKind::Dialog {
+            let dialog_id = heap_get_u16(dst + record);
+            if ui_sdk_action_valid(dst, count, dialog_id, ui_sdk_get_u32(dst, record + 40)) == 0 ||
+               ui_sdk_action_valid(dst, count, dialog_id, ui_sdk_get_u32(dst, record + 44)) == 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+        }
+        i = i + 1;
+    }
+    return UI_SDK_OK;
+}
+
+// Starts a canonical KUI1 packet. `data_offset` reserves the complete node
+// table (`40 + node_count * 48`) and may include only zero padding after it.
+// total_len/data_len remain zero until ui_mount_finish succeeds.
+fn ui_mount_begin(
+    dst: int,
+    max_len: int,
+    node_count: int,
+    data_offset: int,
+    root_id: int,
+    initial_focus_id: int
+) -> int {
+    if max_len < UI_MOUNT_HEADER_BYTES || max_len > UI_MAX_MOUNT_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if node_count < 1 || node_count > UI_MAX_NODES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if data_offset < UI_MOUNT_HEADER_BYTES + node_count * UI_NODE_RECORD_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if data_offset > max_len || root_id < 1 || root_id >= 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if initial_focus_id < UI_FOCUS_FIRST || initial_focus_id >= 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+
+    ui_sdk_zero(dst, data_offset);
+    heap_set_u8(dst + 0, 75); // K
+    heap_set_u8(dst + 1, 85); // U
+    heap_set_u8(dst + 2, 73); // I
+    heap_set_u8(dst + 3, 49); // 1
+    heap_set_u16(dst + 4, UI_ABI_MAJOR);
+    heap_set_u16(dst + 6, UI_ABI_MINOR);
+    heap_set_u16(dst + 12, node_count);
+    heap_set_u16(dst + 14, UI_NODE_RECORD_BYTES);
+    ui_sdk_put_u32(dst, 16, UI_MOUNT_HEADER_BYTES);
+    ui_sdk_put_u32(dst, 20, data_offset);
+    heap_set_u16(dst + 28, root_id);
+    heap_set_u16(dst + 30, initial_focus_id);
+    return UI_SDK_OK;
+}
+
+// Seals lengths after every node and data byte has been written. On failure it
+// does not change the header produced by ui_mount_begin.
+fn ui_mount_finish(dst: int, max_len: int, total_len: int, data_offset: int) -> int {
+    if total_len < data_offset || total_len > max_len || total_len > UI_MAX_MOUNT_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if data_offset < UI_MOUNT_HEADER_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if total_len - data_offset > UI_MAX_DATA_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if ui_sdk_mount_structure_valid(dst, total_len, data_offset) != 0 ||
+       ui_sdk_mount_data_valid(dst, total_len, data_offset) != 0 ||
+       ui_sdk_mount_kinds_valid(dst, total_len, data_offset) != 0 ||
+       ui_sdk_mount_actions_valid(dst) != 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    ui_sdk_put_u32(dst, 8, total_len);
+    ui_sdk_put_u32(dst, 24, total_len - data_offset);
+    return UI_SDK_OK;
+}
+
+fn ui_update_begin(dst: int, max_len: int, update_count: int, data_offset: int) -> int {
+    if max_len < UI_UPDATE_HEADER_BYTES || max_len > UI_MAX_UPDATE_BYTES ||
+       update_count < 1 || update_count > UI_MAX_UPDATE_RECORDS ||
+       data_offset < UI_UPDATE_HEADER_BYTES + update_count * UI_UPDATE_RECORD_BYTES ||
+       data_offset > max_len {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    ui_sdk_zero(dst, data_offset);
+    heap_set_u8(dst + 0, 75); // K
+    heap_set_u8(dst + 1, 85); // U
+    heap_set_u8(dst + 2, 80); // P
+    heap_set_u8(dst + 3, 49); // 1
+    heap_set_u16(dst + 4, UI_ABI_MAJOR);
+    heap_set_u16(dst + 6, UI_ABI_MINOR);
+    heap_set_u16(dst + 12, update_count);
+    heap_set_u16(dst + 14, UI_UPDATE_RECORD_BYTES);
+    ui_sdk_put_u32(dst, 16, UI_UPDATE_HEADER_BYTES);
+    ui_sdk_put_u32(dst, 20, data_offset);
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_update_record(
+    dst: int, max_len: int, index: int, widget_id: int, property: int,
+    data_offset: int, data_len: int,
+    arg0: int, arg1: int, arg2: int, arg3: int
+) -> int {
+    if index < 0 || index >= UI_MAX_UPDATE_RECORDS || widget_id < 1 || widget_id >= 65535 ||
+       property < UiProperty::Text || property > UiProperty::RequestFocus ||
+       data_offset < 0 || data_len < 0 || data_len > 65535 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let record = UI_UPDATE_HEADER_BYTES + index * UI_UPDATE_RECORD_BYTES;
+    if max_len < UI_UPDATE_HEADER_BYTES || record + UI_UPDATE_RECORD_BYTES > max_len {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    ui_sdk_zero(dst + record, UI_UPDATE_RECORD_BYTES);
+    heap_set_u16(dst + record, widget_id);
+    heap_set_u8(dst + record + 2, property);
+    ui_sdk_put_u32(dst, record + 4, data_offset);
+    heap_set_u16(dst + record + 8, data_len);
+    ui_sdk_put_u32(dst, record + 12, arg0);
+    ui_sdk_put_u32(dst, record + 16, arg1);
+    ui_sdk_put_u32(dst, record + 20, arg2);
+    ui_sdk_put_u32(dst, record + 24, arg3);
+    return UI_SDK_OK;
+}
+
+fn ui_update_set_text(dst: int, max_len: int, index: int, widget_id: int, data_offset: int, data_len: int) -> int {
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::Text,
+        data_offset, data_len, 0, 0, 0, 0);
+}
+
+fn ui_update_set_enabled(dst: int, max_len: int, index: int, widget_id: int, enabled: int) -> int {
+    if enabled < 0 || enabled > 1 { return UI_SDK_BAD_ARGUMENT; }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::Enabled,
+        0, 0, enabled, 0, 0, 0);
+}
+
+fn ui_update_set_visible(dst: int, max_len: int, index: int, widget_id: int, visible: int) -> int {
+    if visible < 0 || visible > 1 { return UI_SDK_BAD_ARGUMENT; }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::Visible,
+        0, 0, visible, 0, 0, 0);
+}
+
+fn ui_update_set_checked(dst: int, max_len: int, index: int, widget_id: int, checked: int) -> int {
+    if checked < 0 || checked > 1 { return UI_SDK_BAD_ARGUMENT; }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::Checked,
+        0, 0, checked, 0, 0, 0);
+}
+
+fn ui_update_set_selection(dst: int, max_len: int, index: int, widget_id: int, selected: int) -> int {
+    if selected < UI_SELECTION_NONE { return UI_SDK_BAD_ARGUMENT; }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::Selection,
+        0, 0, selected, 0, 0, 0);
+}
+
+fn ui_update_set_text_value(
+    dst: int, max_len: int, index: int, widget_id: int,
+    data_offset: int, data_len: int, cursor: int
+) -> int {
+    if cursor < UI_CURSOR_END || cursor > data_len { return UI_SDK_BAD_ARGUMENT; }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::TextValue,
+        data_offset, data_len, cursor, 0, 0, 0);
+}
+
+fn ui_update_set_bounds(
+    dst: int, max_len: int, index: int, widget_id: int,
+    x: int, y: int, width: int, height: int
+) -> int {
+    if x < -32768 || x > 32767 || y < -32768 || y > 32767 ||
+       width < 1 || width > 32767 || height < 1 || height > 32767 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::Bounds,
+        0, 0, x, y, width, height);
+}
+
+fn ui_update_set_list_rows(
+    dst: int, max_len: int, index: int, widget_id: int,
+    data_offset: int, data_len: int, row_count: int, selected: int
+) -> int {
+    if row_count < 0 || row_count > UI_MAX_LIST_ROWS || selected < UI_SELECTION_NONE || selected >= row_count ||
+       data_len < row_count * 12 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::ListRows,
+        data_offset, data_len, row_count, selected, 0, 0);
+}
+
+fn ui_update_set_dialog_open(dst: int, max_len: int, index: int, widget_id: int, open: int) -> int {
+    if open < 0 || open > 1 { return UI_SDK_BAD_ARGUMENT; }
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::DialogOpen,
+        0, 0, open, 0, 0, 0);
+}
+
+fn ui_update_request_focus(dst: int, max_len: int, index: int, widget_id: int) -> int {
+    return ui_sdk_update_record(dst, max_len, index, widget_id, UiProperty::RequestFocus,
+        0, 0, 0, 0, 0, 0);
+}
+
+fn ui_sdk_update_rows_valid(dst: int, data_offset: int, data_len: int, rows: int, selected: int) -> int {
+    if rows < 0 || rows > UI_MAX_LIST_ROWS || selected < UI_SELECTION_NONE || selected >= rows || rows * 12 > data_len {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let row = 0;
+    while row < rows {
+        let rr = dst + data_offset + row * 12;
+        let label_offset = heap_get_u16(rr);
+        let label_len = heap_get_u16(rr + 2);
+        if label_offset < rows * 12 || label_offset + label_len > data_len ||
+           (heap_get_u16(rr + 4) & 65534) != 0 || heap_get_u16(rr + 6) != 0 ||
+           ui_sdk_utf8_valid(dst + data_offset + label_offset, label_len) != 0 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if row == selected && (heap_get_u16(rr + 4) & 1) == 0 { return UI_SDK_BAD_ARGUMENT; }
+        row = row + 1;
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_update_finish(dst: int, max_len: int, total_len: int, data_offset: int) -> int {
+    if total_len < data_offset || total_len > max_len || total_len > UI_MAX_UPDATE_BYTES ||
+       ui_sdk_get_u32(dst, 20) != data_offset {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let count = heap_get_u16(dst + 12);
+    let records_end = UI_UPDATE_HEADER_BYTES + count * UI_UPDATE_RECORD_BYTES;
+    if count < 1 || count > UI_MAX_UPDATE_RECORDS || records_end > data_offset ||
+       total_len - data_offset > UI_MAX_DATA_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let padding = records_end;
+    while padding < data_offset {
+        if heap_get_u8(dst + padding) != 0 { return UI_SDK_BAD_ARGUMENT; }
+        padding = padding + 1;
+    }
+    let focus_requests = 0;
+    let i = 0;
+    while i < count {
+        let record = UI_UPDATE_HEADER_BYTES + i * UI_UPDATE_RECORD_BYTES;
+        let widget = heap_get_u16(dst + record);
+        let property = heap_get_u8(dst + record + 2);
+        let offset = ui_sdk_get_u32(dst, record + 4);
+        let len = heap_get_u16(dst + record + 8);
+        let arg0 = ui_sdk_get_u32(dst, record + 12);
+        if widget < 1 || widget >= 65535 || property < 1 || property > 10 ||
+           heap_get_u8(dst + record + 3) != 0 || heap_get_u16(dst + record + 10) != 0 ||
+           ui_sdk_get_u32(dst, record + 28) != 0 || offset < 0 || offset + len > total_len - data_offset {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        let prior = 0;
+        while prior < i {
+            let p = UI_UPDATE_HEADER_BYTES + prior * UI_UPDATE_RECORD_BYTES;
+            if heap_get_u16(dst + p) == widget && heap_get_u8(dst + p + 2) == property {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            prior = prior + 1;
+        }
+        if property == UiProperty::Text || property == UiProperty::TextValue {
+            if ui_sdk_utf8_valid(dst + data_offset + offset, len) != 0 {
+                return UI_SDK_BAD_ARGUMENT;
+            }
+            if property == UiProperty::TextValue && arg0 >= 0 && arg0 < len {
+                let cursor_byte = heap_get_u8(dst + data_offset + offset + arg0);
+                if cursor_byte >= 128 && cursor_byte <= 191 { return UI_SDK_BAD_ARGUMENT; }
+            }
+        }
+        if property == UiProperty::ListRows &&
+           ui_sdk_update_rows_valid(dst, data_offset + offset, len, arg0, ui_sdk_get_u32(dst, record + 16)) != 0 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if property == UiProperty::RequestFocus {
+            focus_requests = focus_requests + 1;
+            if focus_requests > 1 { return UI_SDK_BAD_ARGUMENT; }
+        }
+        i = i + 1;
+    }
+    ui_sdk_put_u32(dst, 8, total_len);
+    ui_sdk_put_u32(dst, 24, total_len - data_offset);
+    return UI_SDK_OK;
+}

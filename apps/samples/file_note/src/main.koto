@@ -1,40 +1,441 @@
-// Sandboxed file sample: write and read a note through the app save sandbox.
+// KOTO-0221: the sandboxed File Note sample as the first application-facing
+// KotoUI adoption. The original save-sandbox round trip (first-run creation,
+// read-back, exit route) is preserved; the per-frame draw_rect/draw_text loop
+// is replaced by one retained form: a note TextField, Save and Reload buttons,
+// and a status Label. KotoUI owns pixels, focus, and damage; this app owns the
+// bounded note bytes and reacts to semantic component events.
+include <sdk/koto_ui.koto>;
 
-fn write_note() {
-    let handle = file_open("note.txt", 8, MODE_WRITE);
-    if handle >= 0 {
-        file_write(handle, "saved from SDK sample", 21);
-        file_close(handle);
+enum NoteLocale {
+    En,
+    Ja,
+    QpsPloc,
+}
+
+enum NoteWidget {
+    Panel = 1,
+    Status,
+    Field,
+    Save,
+    Reload,
+}
+
+// Every fixed diagnostic exit code is a named member (KOTO-0234 pattern), so
+// the sites read by transaction: -1x resource load/parse/line-cap, -20
+// capabilities, -2x/-3x mount, -4x event text intake, -5x status sync,
+// -6x/-7x locale apply, -8x focus/locale events. Values are the established
+// codes, unchanged, so scenario expectations and field reports stay valid.
+enum NoteError {
+    ResourceLoad = -10,
+    ResourceParse = -11,
+    ResourceLineCap = -12,
+    Capabilities = -20,
+    MountBegin = -21,
+    MountFinish = -36,
+    MountSubmit = -37,
+    MountPresent = -38,
+    EventTextLen = -40,
+    EventTextCopy = -41,
+    SyncBegin = -50,
+    SyncSubmit = -57,
+    SyncPresent = -58,
+    ApplyBegin = -60,
+    ApplySubmit = -72,
+    ApplyPresent = -73,
+    FocusPresent = -80,
+    LocaleValidate = -81,
+}
+
+// Status indexes select locale resource line 4 + index (see locales/*.txt).
+enum NoteStatus {
+    None = -1,
+    Loaded = 0,
+    Created,
+    Missing,
+    Oversized,
+    Invalid,
+    Saved,
+    FileError,
+    Editing,
+    Capacity,
+}
+
+// Locale assets are UTF-8 text: 4 component strings (panel title, field
+// label, Save, Reload) followed by the status strings. At load time they
+// become a compact SDK-private line table plus payload in app-owned heap
+// memory. Every capacity below folds from the real packaged locale files at
+// build time (KOTO-0236/0237/0238), so a translation that grows a line
+// re-sizes the retained slot, the mount arena, and the update packets on the
+// next build instead of failing at load.
+const NOTE_RESOURCE_LINES = asset_text_line_count(
+    "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const NOTE_RESOURCE_RAW_BYTES =
+    asset_len("locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+// The 4-component/9-status layout is NoteWidget/NoteStatus structure the
+// asset schema itself does not encode, so the first status line stays
+// app-declared. Component slots hold exactly one indexed line each, and the
+// Status slot holds *one of* the status lines at a time, so every retained
+// capacity is a single-line maximum across locales (KOTO-0238), not a range
+// sum.
+const NOTE_STATUS_FIRST_LINE = 4;
+const NOTE_DOC_BYTES = 64;
+const NOTE_TITLE_BYTES = asset_text_max_line_bytes(
+    0, 1, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const NOTE_FIELD_LABEL_BYTES = asset_text_max_line_bytes(
+    1, 1, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const NOTE_SAVE_BYTES = asset_text_max_line_bytes(
+    2, 1, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const NOTE_RELOAD_BYTES = asset_text_max_line_bytes(
+    3, 1, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const NOTE_STATUS_BYTES = asset_text_max_line_bytes(
+    NOTE_STATUS_FIRST_LINE, NOTE_RESOURCE_LINES - NOTE_STATUS_FIRST_LINE,
+    "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const NOTE_MOUNT_RECORDS = 5;
+// The mount data arena is the five component slots plus the note document,
+// composed from the derived capacities (KOTO-0238).
+const NOTE_MOUNT_DATA_CAPACITY = NOTE_TITLE_BYTES + NOTE_STATUS_BYTES
+    + NOTE_FIELD_LABEL_BYTES + NOTE_DOC_BYTES + NOTE_SAVE_BYTES
+    + NOTE_RELOAD_BYTES;
+
+static note_mount_builder: UiMountBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+static note_update_builder: UiUpdateBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+static note_text: TextResource = {
+    storage: 0, capacity: 0, line_capacity: 0, line_count: 0,
+    payload_offset: 0, payload_len: 0, status: 0, complete: false,
+};
+
+// All app state lives in one compiler-owned record (KOTO-0235) so the deeply
+// inlined SDK packet validators fit the VM's bounded local frame: helpers
+// receive this one typed base reference, and every region offset and the
+// total size are derived from the declaration order below. Declared after the
+// initialized builder statics so its zero regions add no KBC image bytes.
+struct NoteStorage {
+    raw: buf[NOTE_RESOURCE_RAW_BYTES],      // largest packaged locale asset
+    // Parsed line table + payload; parse strips delimiters, so the raw bound
+    // also bounds the payload (KOTO-0236).
+    resource: buf[ui_text_resource_capacity(NOTE_RESOURCE_LINES, NOTE_RESOURCE_RAW_BYTES)],
+    doc: buf[NOTE_DOC_BYTES],               // note bytes
+    state: buf[4],                          // len u16 / dirty u8 / status u8
+    event: buf[96],
+    mount: buf[ui_mount_capacity(NOTE_MOUNT_RECORDS, NOTE_MOUNT_DATA_CAPACITY)],
+}
+
+static note_app: NoteStorage = {};
+
+fn note_fail(status: int) {
+    ui_reset();
+    exit(status);
+}
+
+// Per-line byte capacities shared by the mount arena and every locale; the
+// runtime loop keeps guarding stale SD-card assets against exactly the
+// capacities the build derived from the packaged locales.
+fn note_line_cap(line: int) -> int {
+    if line == 0 { return NOTE_TITLE_BYTES; }
+    if line == 1 { return NOTE_FIELD_LABEL_BYTES; }
+    if line == 2 { return NOTE_SAVE_BYTES; }
+    if line == 3 { return NOTE_RELOAD_BYTES; }
+    return NOTE_STATUS_BYTES;
+}
+
+fn note_status_line(app: NoteStorage) -> int {
+    return NOTE_STATUS_FIRST_LINE + heap_get_u8(app.state + 3);
+}
+
+fn note_load_resource(kind: int, app: NoteStorage) {
+    let loaded = 0;
+    if kind == NoteLocale::Ja {
+        loaded = asset_load("locales/ja-JP.txt", 17, app.raw, len(app.raw));
+    } else if kind == NoteLocale::QpsPloc {
+        loaded = asset_load("locales/qps-ploc.txt", 20, app.raw, len(app.raw));
+    } else {
+        loaded = asset_load("locales/en-US.txt", 17, app.raw, len(app.raw));
+    }
+    if loaded <= 0 { note_fail(NoteError::ResourceLoad); }
+
+    if note_text.parse(app.raw, loaded, app.resource,
+        len(app.resource), NOTE_RESOURCE_LINES) != NOTE_RESOURCE_LINES {
+        note_fail(NoteError::ResourceParse);
+    }
+    let line = 0;
+    while line < NOTE_RESOURCE_LINES {
+        if note_text.line_len(line) > note_line_cap(line) { note_fail(NoteError::ResourceLineCap); }
+        line = line + 1;
     }
 }
 
-fn main() {
-    buf doc[64];
-    let len = 0;
+fn note_select_resource(locale: int, locale_len: int) -> int {
+    // The host already validated the canonical tag. Match the language subtag;
+    // every other locale follows the documented embedded en-US fallback.
+    if ui_locale_match(locale, locale_len, "locales/ja-JP.txt" + 8, 2) != UiLocaleMatch::None {
+        return NoteLocale::Ja;
+    }
+    if ui_locale_match(locale, locale_len,
+        "locales/qps-ploc.txt" + 8, 8) == UiLocaleMatch::Exact {
+        return NoteLocale::QpsPloc;
+    }
+    return NoteLocale::En;
+}
 
-    let handle = file_open("note.txt", 8, MODE_READ);
-    if handle >= 0 {
-        len = file_read(handle, doc, 64);
-        file_close(handle);
-    } else {
-        write_note();
-        let created = file_open("note.txt", 8, MODE_READ);
-        if created >= 0 {
-            len = file_read(created, doc, 64);
-            file_close(created);
-        }
+fn note_host_resource() -> int {
+    buf capabilities[64];
+    let capability_len = ui_capabilities(capabilities, 64);
+    if capability_len < 0 { exit(capability_len); }
+    if ui_capabilities_validate(capabilities, capability_len) != 0 {
+        exit(NoteError::Capabilities);
+    }
+    return note_select_resource(
+        ui_capabilities_locale_ptr(capabilities), ui_capabilities_locale_len(capabilities));
+}
+
+// A live locale change re-selects and re-parses the translator asset from the
+// validated LocaleChanged event; the note bytes themselves never change.
+fn note_locale_changed(app: NoteStorage) {
+    if ui_locale_changed_validate(app.event,
+        ui_sdk_get_u32(app.event, 8)) != 0 { note_fail(NoteError::LocaleValidate); }
+    note_load_resource(note_select_resource(
+        ui_locale_changed_tag_ptr(app.event),
+        ui_locale_changed_tag_len(app.event)), app);
+}
+
+// Startup note load with the preserved first-run behavior: a missing note.txt
+// is created with the original sample content, then read back like any note.
+fn note_boot_load(app: NoteStorage) -> int {
+    // Four spare bytes so an oversized note.txt is detected, not truncated.
+    buf tmp[NOTE_DOC_BYTES + 4];
+    let handle = file_open("note.txt", 8, FileMode::Read);
+    let created = 0;
+    if handle < 0 {
+        let writer = file_open("note.txt", 8, FileMode::Write);
+        if writer < 0 { return NoteStatus::FileError; }
+        let written = file_write(writer, "saved from SDK sample", 21);
+        file_close(writer);
+        if written != 21 { return NoteStatus::FileError; }
+        created = 1;
+        handle = file_open("note.txt", 8, FileMode::Read);
+        if handle < 0 { return NoteStatus::FileError; }
+    }
+    let len = file_read(handle, tmp, len(tmp));
+    file_close(handle);
+    if len < 0 { return NoteStatus::FileError; }
+    if len > len(app.doc) { return NoteStatus::Oversized; }
+    if ui_sdk_utf8_valid(tmp, len) != 0 { return NoteStatus::Invalid; }
+    ui_packet_copy(app.doc, len(app.doc), 0, tmp, len);
+    heap_set_u16(app.state, len);
+    if created != 0 { return NoteStatus::Created; }
+    return NoteStatus::Loaded;
+}
+
+// Reload keeps the field untouched on every abnormal outcome so unsaved text
+// is never lost; only a normal read replaces the app-owned note bytes.
+fn note_reload(app: NoteStorage) -> int {
+    // Four spare bytes so an oversized note.txt is detected, not truncated.
+    buf tmp[NOTE_DOC_BYTES + 4];
+    let handle = file_open("note.txt", 8, FileMode::Read);
+    if handle < 0 { return NoteStatus::Missing; }
+    let len = file_read(handle, tmp, len(tmp));
+    file_close(handle);
+    if len < 0 { return NoteStatus::FileError; }
+    if len > len(app.doc) { return NoteStatus::Oversized; }
+    if ui_sdk_utf8_valid(tmp, len) != 0 { return NoteStatus::Invalid; }
+    ui_packet_copy(app.doc, len(app.doc), 0, tmp, len);
+    heap_set_u16(app.state, len);
+    heap_set_u8(app.state + 2, 0);
+    return NoteStatus::Loaded;
+}
+
+// Save writes exactly the current note bytes; a failure reports its status
+// without touching the field or the dirty flag, so no text is lost.
+fn note_save(app: NoteStorage) -> int {
+    let len = heap_get_u16(app.state);
+    let handle = file_open("note.txt", 8, FileMode::Write);
+    if handle < 0 { return NoteStatus::FileError; }
+    let written = file_write(handle, app.doc, len);
+    file_close(handle);
+    if written != len { return NoteStatus::FileError; }
+    heap_set_u8(app.state + 2, 0);
+    return NoteStatus::Saved;
+}
+
+// TextChanged/Submitted events carry the complete field value; copy it into
+// the app-owned bounded document and mark it unsaved.
+fn note_take_event_text(app: NoteStorage) {
+    let len = ui_event_text_len(app.event);
+    if len > len(app.doc) { note_fail(NoteError::EventTextLen); }
+    if ui_packet_copy(app.doc, len(app.doc), 0,
+        ui_event_text_ptr(app.event), len) != 0 { note_fail(NoteError::EventTextCopy); }
+    heap_set_u16(app.state, len);
+    heap_set_u8(app.state + 2, 1);
+}
+
+fn note_mount(app: NoteStorage) {
+    if note_mount_builder.begin(app.mount, len(app.mount),
+        NOTE_MOUNT_RECORDS, NoteWidget::Panel, NoteWidget::Field) != 0 {
+        note_fail(NoteError::MountBegin);
     }
 
+    note_mount_builder.panel(
+        NoteWidget::Panel, UI_PARENT_ROOT, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        0, 0, 320, 320, note_text.line_ptr(0), note_text.line_len(0),
+        NOTE_TITLE_BYTES, 8, 20);
+    note_mount_builder.label(
+        NoteWidget::Status, NoteWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED | UI_FLAG_ELLIPSIS,
+        12, 28, 296, 20, note_text.line_ptr(note_status_line(app)),
+        note_text.line_len(note_status_line(app)), NOTE_STATUS_BYTES,
+        UiAlignment::Start);
+    note_mount_builder.text_field(
+        NoteWidget::Field, NoteWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 56, 296, 32, note_text.line_ptr(1), note_text.line_len(1),
+        NOTE_FIELD_LABEL_BYTES,
+        app.doc, heap_get_u16(app.state), len(app.doc),
+        UI_CURSOR_END, true);
+    // Save mounts visible but disabled: the field still matches the file, and
+    // keyboard focus must skip the disabled control until an edit enables it.
+    note_mount_builder.button(
+        NoteWidget::Save, NoteWidget::Panel, UI_FLAG_VISIBLE,
+        12, 100, 142, 28, note_text.line_ptr(2), note_text.line_len(2),
+        NOTE_SAVE_BYTES, false);
+    note_mount_builder.button(
+        NoteWidget::Reload, NoteWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        166, 100, 142, 28, note_text.line_ptr(3), note_text.line_len(3),
+        NOTE_RELOAD_BYTES, false);
+
+    let packet_len = note_mount_builder.finish();
+    if packet_len < 0 { note_fail(NoteError::MountFinish); }
+    if ui_mount(app.mount, packet_len) != 0 { note_fail(NoteError::MountSubmit); }
+    if ui_present() != 0 { note_fail(NoteError::MountPresent); }
+}
+
+// One atomic packet per reaction: the localized status text, the Save enabled
+// state, and (only when a reload succeeded) the refreshed field value. The
+// host damages only records whose value actually changed.
+// `focus_home` returns focus to the note field in the same packet. It is
+// required exactly when the Save button saves while holding focus: the packet
+// disables Save, and the host atomically rejects an update whose final focus
+// lands on a disabled widget. Every other reaction leaves focus untouched.
+fn note_sync(app: NoteStorage, refresh: int, focus_home: int) {
+    // Four records; only the status (single-line locale maximum) and field
+    // value (the note document) carry data.
+    buf update[ui_update_capacity(4, NOTE_STATUS_BYTES + NOTE_DOC_BYTES)];
+    if note_update_builder.begin(update, len(update), 4) != 0 {
+        note_fail(NoteError::SyncBegin);
+    }
+    note_update_builder.text_resource(NoteWidget::Status, note_text,
+        note_status_line(app));
+    note_update_builder.enabled(NoteWidget::Save,
+        heap_get_u8(app.state + 2) != 0);
+    if refresh != 0 {
+        note_update_builder.text_value(NoteWidget::Field, app.doc,
+            heap_get_u16(app.state), UI_CURSOR_END);
+    }
+    if focus_home != 0 {
+        note_update_builder.request_focus(NoteWidget::Field);
+    }
+    if note_update_builder.submit() != 0 { note_fail(NoteError::SyncSubmit); }
+    if ui_present() != 0 { note_fail(NoteError::SyncPresent); }
+}
+
+// Re-label every component and re-localize the current status in one packet.
+fn note_apply_locale(app: NoteStorage) {
+    // Five component text records in one atomic packet: the largest locale's
+    // fixed component text (lines 0..3 as one copied range) plus the
+    // single-line status maximum.
+    buf update[ui_update_capacity(5,
+        asset_text_max_range_bytes(0, NOTE_STATUS_FIRST_LINE,
+            "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt")
+        + NOTE_STATUS_BYTES)];
+    if note_update_builder.begin(update, len(update), 5) != 0 {
+        note_fail(NoteError::ApplyBegin);
+    }
+    note_update_builder.text_resource(NoteWidget::Panel, note_text, 0);
+    note_update_builder.text_resource(NoteWidget::Status, note_text,
+        note_status_line(app));
+    note_update_builder.text_resource(NoteWidget::Field, note_text, 1);
+    note_update_builder.text_resource(NoteWidget::Save, note_text, 2);
+    note_update_builder.text_resource(NoteWidget::Reload, note_text, 3);
+
+    if note_update_builder.submit() != 0 { note_fail(NoteError::ApplySubmit); }
+    if ui_present() != 0 { note_fail(NoteError::ApplyPresent); }
+}
+
+fn main() {
+    // The `note_app` record holds the locale asset, parsed resource table,
+    // note bytes, retained state (length/dirty/status), event storage, and
+    // the mount packet; passing the one typed base reference keeps the
+    // deepest inlined SDK call chain inside the 45 user slots.
+    note_load_resource(note_host_resource(), note_app);
+    yield_frame();
+    // Keep the sandbox round trip and the mount-packet validation on separate
+    // deterministic frames, below the fixed per-frame instruction budget.
+    heap_set_u8(note_app.state + 3, note_boot_load(note_app));
+    yield_frame();
+    note_mount(note_app);
+
     loop {
+        // F10 is an app-lifecycle command, not a retained KotoUI component
+        // event. Poll the normalized intent explicitly so device Shift+F5
+        // (bridge code 0x90) and KotoSim F10 both return to the shell.
         let intent = text_intent();
         if (intent & INTENT_EXIT) != 0 {
+            ui_reset();
             exit(0);
         }
-
-        draw_rect(0, 0, 320, 320, 0);
-        draw_text(16, 24, "sandbox note:", 13);
-        if len >= 0 {
-            draw_text(16, 44, doc, len);
+        let event_len = ui_poll_event(note_app.event, len(note_app.event));
+        if event_len < 0 { note_fail(event_len); }
+        while event_len > 0 {
+            if ui_event_validate(note_app.event, event_len) != 0 {
+                note_fail(UI_SDK_BAD_ARGUMENT);
+            }
+            let response = ui_event_response(note_app.event);
+            let widget = ui_event_widget_id(note_app.event);
+            let status_index = NoteStatus::None;
+            let refresh = 0;
+            let focus_home = 0;
+            if response == UiResponse::TextChanged && widget == NoteWidget::Field {
+                note_take_event_text(note_app);
+                status_index = NoteStatus::Editing;
+            } else if response == UiResponse::Submitted && widget == NoteWidget::Field {
+                note_take_event_text(note_app);
+                status_index = note_save(note_app);
+            } else if response == UiResponse::Activated && widget == NoteWidget::Save {
+                status_index = note_save(note_app);
+                // Saving from the focused Save button disables it; the sync
+                // packet must move focus back to the field in the same step.
+                if status_index == NoteStatus::Saved { focus_home = 1; }
+            } else if response == UiResponse::Activated && widget == NoteWidget::Reload {
+                status_index = note_reload(note_app);
+                if status_index == NoteStatus::Loaded { refresh = 1; }
+            } else if response == UiResponse::CapacityRejected {
+                status_index = NoteStatus::Capacity;
+            } else if response == UiResponse::FocusChanged {
+                let focus_status = ui_present();
+                if focus_status != 0 { note_fail(NoteError::FocusPresent); }
+            } else if response == UiResponse::LocaleChanged {
+                note_locale_changed(note_app);
+                // Keep worst-case qps-ploc parsing and the retained-tree
+                // update on separate deterministic frames.
+                yield_frame();
+                note_apply_locale(note_app);
+            } else if response == UiResponse::Cancelled {
+                ui_reset();
+                exit(0);
+            }
+            if status_index != NoteStatus::None {
+                heap_set_u8(note_app.state + 3, status_index);
+                note_sync(note_app, refresh, focus_home);
+            }
+            event_len = ui_poll_event(note_app.event, len(note_app.event));
+            if event_len < 0 { note_fail(event_len); }
         }
         yield_frame();
     }

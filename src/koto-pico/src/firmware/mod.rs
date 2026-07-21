@@ -8,8 +8,8 @@
 //! the input normalization and KPA-manifest parsing shared by the main loop.
 
 use koto_core::{
-    Buttons, InputState, ManifestFields, PackageIconStyle, PackageIconTheme, PackageInfo,
-    PackageManifest,
+    parse_manifest_fetch_permission, Buttons, InputState, ManifestFetchPermission, ManifestFields,
+    PackageIconStyle, PackageIconTheme, PackageInfo, PackageManifest,
 };
 
 use crate::keyboard::{
@@ -19,18 +19,61 @@ use crate::keyboard::{
 pub mod app_host;
 pub mod app_render;
 pub mod app_runtime;
+pub mod arena_future;
 pub mod audio;
 pub mod audio_cues;
+pub mod audio_residency;
+pub mod audio_scratch;
 pub mod config;
+pub mod config_render;
+pub mod config_store;
 pub mod diag;
 pub mod display_service;
+#[cfg(any(
+    feature = "app_fetch_tls_socket_adapter_probe",
+    feature = "app_fetch_https"
+))]
+pub mod fetch_tls_adapter;
+#[cfg(any(feature = "app_fetch_tls_verifier_probe", feature = "app_fetch_https"))]
+pub mod fetch_tls_verifier;
+// KOTO-0245 product HTTPS session: the SPKI-pinned TLS 1.3 + streaming-HTTP
+// pump that occupies the TLS/audio-exclusive workspace ownership interval.
+#[cfg(all(
+    feature = "app_fetch_https",
+    any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w")
+))]
+pub mod fetch_https;
+#[cfg(all(feature = "app_fetch_https", feature = "mcu-rp235xa"))]
+pub mod fetch_tls_workspace;
+// KOTO-0239 NetworkService binding. Only meaningful on radio boards with the
+// IP stack linked in.
+#[cfg(all(
+    feature = "network_service",
+    any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w")
+))]
+pub mod network;
 pub mod power;
+pub mod resident;
+// KOTO-0240 Wi-Fi credential persistence. Only built when the network service
+// is linked; offline product builds link none of it.
+#[cfg(feature = "network_service")]
+pub mod secret_store;
 pub mod shell_prefs;
 pub mod shell_render;
 pub mod spi_bench;
 pub mod splash_render;
 pub mod stack_canary;
+// KOTO-0245 dedicated-stack trampoline for the TLS handshake crypto.
+#[cfg(all(
+    feature = "app_fetch_https",
+    any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w")
+))]
+pub mod stack_switch;
 pub mod storage;
+// KOTO-0227 five-minute WifiStreamAudio product-path soak (validation only).
+#[cfg(all(feature = "wifi_stream_soak_probe", feature = "board-picocalc-picow"))]
+pub mod stream_soak;
+pub mod wifi_residency;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FirmwareInput {
@@ -116,9 +159,15 @@ fn button_delta(current: Buttons, previous: Buttons) -> Buttons {
 /// parser deliberately accepts only unescaped JSON strings for those fields.
 pub fn parse_package_summary(bytes: &[u8]) -> Option<PackageInfo> {
     let text = core::str::from_utf8(bytes).ok()?;
+    let version = json_number(text, "version")?;
+    // Unlike the launcher's deliberately small flat field reader, this parser
+    // structurally walks the complete JSON value. It rejects malformed,
+    // duplicate, oversized, wildcard, or version-mismatched Fetch permissions
+    // before a package can enter the device catalog.
+    let fetch = parse_manifest_fetch_permission(text, version).ok()?;
     PackageManifest::new(ManifestFields {
         format: json_string(text, "format")?,
-        version: json_number(text, "version")?,
+        version,
         app_id: json_string(text, "app_id")?,
         name: json_string(text, "name")?,
         runtime: json_string(text, "runtime")?,
@@ -126,7 +175,7 @@ pub fn parse_package_summary(bytes: &[u8]) -> Option<PackageInfo> {
         icon: json_optional_string(text, "icon"),
         shell_icon: parse_shell_icon_theme(text),
         fs_permission: json_optional_string(text, "fs"),
-        network_permission: None,
+        network_permission: fetch.legacy,
         sram_work_bytes: None,
         psram_cache_bytes: None,
         description: json_optional_string(text, "description"),
@@ -134,6 +183,26 @@ pub fn parse_package_summary(bytes: &[u8]) -> Option<PackageInfo> {
     })
     .ok()
     .map(PackageManifest::package)
+}
+
+/// Rebuild the full fixed-capacity Fetch permission at app launch. The shell
+/// catalog deliberately retains only [`PackageInfo`]; keeping every package's
+/// origin and pin tables there would multiply the SRAM cost by `MAX_PACKAGES`.
+///
+/// Writes through `out` (KOTO-0252): returning the ~1.3 KiB permission by
+/// value stacked another copy on the launch path's frames. On `false`, `out`
+/// holds an unspecified partial value and must not be used.
+pub(crate) fn parse_package_fetch_permission_into(
+    bytes: &[u8],
+    out: &mut ManifestFetchPermission,
+) -> bool {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some(version) = json_number(text, "version") else {
+        return false;
+    };
+    koto_core::parse_manifest_fetch_permission_into(text, version, out).is_ok()
 }
 
 fn json_optional_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -289,6 +358,34 @@ mod tests {
         .unwrap();
         assert_eq!(package.app_id(), "dev.koto.memo");
         assert_eq!(package.name(), "Koto Memo");
+    }
+
+    #[test]
+    fn device_summary_validates_versioned_fetch_permission() {
+        let package = parse_package_summary(
+            br#"{"format":"kpa-manifest","version":2,"app_id":"dev.koto.fetch","name":"Fetch","runtime":"kotoruntime-bytecode","entry":"bytecode/fetch.kbc","permissions":{"network":{"origins":["https://weather.example"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(package.app_id(), "dev.koto.fetch");
+        assert_eq!(package.network_permission(), None);
+
+        assert!(parse_package_summary(
+            br#"{"format":"kpa-manifest","version":2,"app_id":"dev.koto.fetch","name":"Fetch","runtime":"kotoruntime-bytecode","entry":"bytecode/fetch.kbc","permissions":{"network":{"origins":["https://*.example"]}}}"#,
+        )
+        .is_none());
+        assert!(parse_package_summary(
+            br#"{"format":"kpa-manifest","version":1,"app_id":"dev.koto.fetch","name":"Fetch","runtime":"kotoruntime-bytecode","entry":"bytecode/fetch.kbc","permissions":{"network":{"origins":[]}}}"#,
+        )
+        .is_none());
+
+        assert!(parse_package_summary(
+            br#"{"format":"kpa-manifest","version":2,"app_id":"dev.koto.fetch","name":"Fetch","runtime":"kotoruntime-bytecode","entry":"bytecode/fetch.kbc","permissions":{"network":{"origins":[{"origin":"https://secure.example","spki_sha256":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}]}}}"#,
+        )
+        .is_some());
+        assert!(parse_package_summary(
+            br#"{"format":"kpa-manifest","version":2,"app_id":"dev.koto.fetch","name":"Fetch","runtime":"kotoruntime-bytecode","entry":"bytecode/fetch.kbc","permissions":{"network":{"origins":[{"origin":"https://secure.example","spki_sha256":[]}]}}}"#,
+        )
+        .is_none());
     }
 
     #[test]

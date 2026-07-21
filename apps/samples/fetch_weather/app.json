@@ -1,0 +1,27 @@
+{
+  "app_id": "dev.koto.samples.fetch-weather",
+  "kind": "koto",
+  "package": "sample_fetch_weather",
+  "name": "SDK Fetch Weather",
+  "description": "Reads bounded weather JSON without blocking frames.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": {
+      "origins": [
+        {
+          "origin": "https://siska-tech.jp",
+          "spki_sha256": [
+            "e611a2493609ee56b711de32dfa162d5f2f803c0eb73942824ff0480174c7a47"
+          ]
+        }
+      ]
+    }
+  }
+}

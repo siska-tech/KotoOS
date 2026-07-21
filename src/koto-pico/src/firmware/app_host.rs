@@ -1,7 +1,7 @@
 //! The `VmHost` adapter the device presents to a running app: bounded draw
 //! commands, sandboxed file handles, and the memo IME bridge (KOTO-0129).
 
-use core::{cell::UnsafeCell, fmt::Write};
+use core::{fmt::Write, mem::ManuallyDrop};
 
 use embassy_time::Instant;
 use embedded_sdmmc::{
@@ -13,19 +13,27 @@ use koto_audio::{
 };
 use koto_core::runtime::{host_call, ime_key};
 use koto_core::{
-    CellMetrics, HostCallOutcome, HostErrorCode, KotoMemoIme, MemoEditor, MemoImeKey, MemoImeLine,
-    MemoImeMode, MemoMove, PixelFormat, RenderSurface, SkkError, SkkLeadingIndex, SkkRead,
-    TextLayout, VmHost, VmInputSnapshot, WindowedDict, MAX_VIRTUAL_PATH_LEN,
-    SKK_LOOKUP_WINDOW_BYTES,
+    AppContext, AppFetchController, BackendPoll, CellMetrics, ConfigSnapshot, FetchAllowlist,
+    FetchBackend, FetchError, FetchPinSet, FetchPinTable, FetchPoll, FetchRequestId,
+    HostCallOutcome, HostErrorCode, JsonHostSession, KotoMemoIme, MemoEditor, MemoImeKey,
+    MemoImeLine, MemoImeMode, MemoMove, PixelFormat, RenderSurface, SkkError, SkkLeadingIndex,
+    SkkRead, TextLayout, UiCapabilities, UiMountError, UiPollError, UiSession, VmHost,
+    VmInputSnapshot, WindowedDict, MAX_VIRTUAL_PATH_LEN, SKK_LOOKUP_WINDOW_BYTES,
 };
 
 use crate::dashboard::LineBuffer;
-use crate::firmware::audio::{PcmSubmitError, PicoAudioBackend, RUNTIME_CLIP_IMAGE_CAPACITY};
+use crate::firmware::audio::{
+    AudioRequestError, PcmSubmitError, PicoAudioBackend, RUNTIME_CLIP_IMAGE_CAPACITY,
+};
 use crate::firmware::audio_cues::{builtin_bgm_cue, sfx_id_cue};
+use crate::firmware::audio_residency::ResidencyState;
+use crate::firmware::audio_scratch::{
+    try_with_stream, STREAM_PCM16_BYTES, STREAM_REFILL_FRAMES, STREAM_SLD4_BYTES,
+};
 use crate::firmware::config::{
     DiagClass, FirmwareClock, DEVICE_CELL_HEIGHT, DEVICE_CELL_WIDTH, DIAG_PROFILE,
     GAME2D_MAX_SPRITES, GAME2D_MAX_STAMPS, GAME2D_MAX_TEXT_ITEMS, MANIFEST_LFN_BYTES,
-    MAX_APP_DRAW_COMMANDS, MAX_APP_TEXT_BYTES, MAX_DEVICE_OPEN_FILES,
+    MAX_APP_DRAW_COMMANDS, MAX_APP_TEXT_BYTES, MAX_DEVICE_OPEN_FILES, MAX_MANIFEST_BYTES,
 };
 
 // The retained Game2D layer data model — the POD layout of the immediate command
@@ -187,6 +195,13 @@ pub(crate) struct AudioHostStats {
     pub(crate) worker_max_jitter_us: u32,
     pub(crate) worker_heartbeat: u32,
     pub(crate) core1_stack_free_min: u32,
+    pub(crate) residency_state: ResidencyState,
+    pub(crate) residency_generation: u32,
+    pub(crate) worker_offline_generation: u32,
+    pub(crate) worker_online_generation: u32,
+    pub(crate) worker_rich_active: bool,
+    pub(crate) transition_failures: u32,
+    pub(crate) arena_guard_failures: u32,
 }
 
 /// [`SkkRead`] over an open SD-card dictionary file: each window fetch is one
@@ -222,10 +237,51 @@ where
     }
 }
 
-pub(crate) struct DeviceHost<'a, D>
+/// SKK dictionary state for the running app session, hosted in its own
+/// binary-owned static cell (the KOTO-0134 `app_draw` pattern, KOTO-0252).
+///
+/// The leading-character index is built at app startup (`load_skk`) by
+/// streaming the dictionary once off the SD card; the dictionary body never
+/// becomes SRAM-resident — conversions re-open the file and scan through
+/// `window` (KOTO-0089 windowed SD reader). `index` is `None` when the dict
+/// file was not found. All fields are lifetime-free, so keeping them out of
+/// `DeviceHost` shrinks the app-session future by their full size.
+pub struct DeviceHostSkk {
+    index: SkkLeadingIndex,
+    // Whether `index` holds a successfully built index for this session.
+    index_loaded: bool,
+    // Resolved SD-card name of the dictionary file, cached by `load_skk` so a
+    // conversion skips the directory scan and opens the file directly.
+    file: Option<ShortFileName>,
+    // Scan window shared by index build and per-conversion lookups; sized by
+    // the koto-core packaging contract (every dictionary line must fit).
+    window: [u8; SKK_LOOKUP_WINDOW_BYTES],
+}
+
+impl DeviceHostSkk {
+    pub const fn new() -> Self {
+        Self {
+            index: SkkLeadingIndex::empty(),
+            index_loaded: false,
+            file: None,
+            window: [0u8; SKK_LOOKUP_WINDOW_BYTES],
+        }
+    }
+
+    /// Per-session reset: a stale index from the previous app must never serve
+    /// conversions if this session's `load_skk` fails. The window is pure
+    /// scratch and needs no clearing.
+    fn reset(&mut self) {
+        self.index_loaded = false;
+        self.file = None;
+    }
+}
+
+pub(crate) struct DeviceHost<'a, D, B>
 where
     D: BlockDevice,
     D::Error: core::fmt::Debug,
+    B: crate::firmware::app_runtime::AppBackgroundService,
 {
     // Borrowed from a `StaticCell` owned by the binary so this ~30 KiB list does
     // not live inside the embassy main-task future (KOTO-0134).
@@ -244,6 +300,9 @@ where
     package_stream_file: Option<RawFile>,
     package_stream_volume: Option<RawVolume>,
     app_id: &'a str,
+    config_snapshot: ConfigSnapshot,
+    ui_session: &'a mut UiSession,
+    ui_ime_owner: u16,
     package_file: ShortFileName,
     files: [Option<DeviceOpenFile>; MAX_DEVICE_OPEN_FILES],
     editor: MemoEditor<1024>,
@@ -255,18 +314,13 @@ where
     // One deferred UART diagnostic line from `asset_load`; drained by the
     // frame loop in `app_runtime` after each `step_frame_with` (KOTO-0130).
     pub(crate) diag: LineBuffer,
-    // SKK leading-character index, built at app startup (`load_skk`) by
-    // streaming the dictionary once off the SD card. The dictionary body never
-    // becomes SRAM-resident: conversions re-open the file and scan through
-    // `skk_window` (KOTO-0089 windowed SD reader). `None` when the dict file
-    // was not found.
-    skk_index: Option<SkkLeadingIndex>,
-    // Resolved SD-card name of the dictionary file, cached by `load_skk` so a
-    // conversion skips the directory scan and opens the file directly.
-    skk_file: Option<ShortFileName>,
-    // Scan window shared by index build and per-conversion lookups; sized by
-    // the koto-core packaging contract (every dictionary line must fit).
-    skk_window: [u8; SKK_LOOKUP_WINDOW_BYTES],
+    // SKK dictionary bulk (KOTO-0252): borrowed from a binary-owned static
+    // cell instead of held by value. `DeviceHost` is a local of the
+    // app-session future, so every by-value byte here is coroutine layout —
+    // and moving that future through `run_device_app`'s poll frame reserves
+    // two future-sized stack slots for the whole app session. The ~2.8 KiB
+    // index + scan window are the future's largest lifetime-free members.
+    skk: &'a mut DeviceHostSkk,
     audio_events: u32,
     // Per-frame hostcall wall time (KOTO-0169 Stage 0b, observe-only): the VM
     // brackets every HOST_CALL dispatch with `hostcall_dispatch_begin`/`_end`;
@@ -282,7 +336,200 @@ where
     // Resolving a KPA path walks its table and string pool, so retain the most
     // recent exact path/range across frames and pay that cost only once.
     asset_range_cache: Option<PackageAssetRangeCache>,
+    fetch: &'a mut DeviceFetchSession,
+    background: &'a mut B,
 }
+
+/// Device-resident Fetch control plane. It is held in one static cell rather
+/// than the async app frame and is rebuilt from the selected KPA metadata on
+/// every launch. The backend remains deliberately unavailable until the live
+/// DNS/TCP/TLS executor is wired into this seam.
+pub struct DeviceFetchSession {
+    controller: AppFetchController,
+    allowlist: FetchAllowlist,
+    pins: FetchPinTable,
+    app: AppContext,
+    /// Host-owned bounded JSON decoder session behind the `json_*` host calls
+    /// (KOTO-0246). It shares this app-session control block — and therefore
+    /// the manifest-scratch union — so the 320-byte decoder costs no extra
+    /// static SRAM as long as the block stays within `MAX_MANIFEST_BYTES`
+    /// (asserted below). The same `koto_core::JsonHostSession` backs KotoSim.
+    json: JsonHostSession,
+}
+
+struct BackgroundFetchBackend<'a, B>(&'a mut B);
+
+impl<B: crate::firmware::app_runtime::AppBackgroundService> FetchBackend
+    for BackgroundFetchBackend<'_, B>
+{
+    fn available(&self) -> bool {
+        self.0.fetch_available()
+    }
+
+    fn start(
+        &mut self,
+        request: FetchRequestId,
+        url: &str,
+        pins: FetchPinSet,
+    ) -> Result<(), FetchError> {
+        self.0.fetch_start(request, url, pins)
+    }
+
+    fn poll(&mut self, request: FetchRequestId) -> BackendPoll {
+        self.0.fetch_poll(request)
+    }
+
+    fn read(&mut self, request: FetchRequestId, dst: &mut [u8]) -> Result<usize, FetchError> {
+        self.0.fetch_read(request, dst)
+    }
+
+    fn cancel(&mut self, request: FetchRequestId) {
+        self.0.fetch_cancel(request);
+    }
+}
+
+impl DeviceFetchSession {
+    pub const fn new() -> Self {
+        Self {
+            controller: AppFetchController::new(),
+            allowlist: FetchAllowlist::empty(),
+            pins: FetchPinTable::empty(),
+            app: AppContext {
+                app_id: 0,
+                generation: 0,
+            },
+            json: JsonHostSession::new(),
+        }
+    }
+
+    pub(crate) fn begin_app(
+        &mut self,
+        app_id: &str,
+        generation: u16,
+        allowlist: &FetchAllowlist,
+        pins: &FetchPinTable,
+    ) {
+        let mut backend = koto_core::UnavailableFetchBackend;
+        self.controller.reset_generation(&mut backend, generation);
+        self.allowlist = *allowlist;
+        self.pins = *pins;
+        self.app = AppContext {
+            app_id: stable_app_id(app_id),
+            generation,
+        };
+        // A prior app's parse state (including token scratch bytes) must never
+        // leak into the next session.
+        self.json.reset();
+    }
+
+    pub(crate) fn end_app<B: FetchBackend>(&mut self, backend: &mut B) {
+        self.controller.teardown(backend);
+        self.allowlist = FetchAllowlist::empty();
+        self.pins = FetchPinTable::empty();
+    }
+}
+
+impl Default for DeviceFetchSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[repr(C)]
+union ManifestFetchStorage {
+    scratch: ManuallyDrop<[u8; MAX_MANIFEST_BYTES]>,
+    fetch: ManuallyDrop<DeviceFetchSession>,
+}
+
+/// Catalog manifest scratch overlaid by the running app's Fetch control plane.
+/// These lifetimes are mutually exclusive, saving another permanent control
+/// block on SRAM-constrained RP2040 builds.
+#[repr(C, align(8))]
+pub struct ManifestFetchResident {
+    storage: ManifestFetchStorage,
+    generation: u16,
+    fetch_active: bool,
+}
+
+impl ManifestFetchResident {
+    pub const fn new() -> Self {
+        Self {
+            storage: ManifestFetchStorage {
+                scratch: ManuallyDrop::new([0; MAX_MANIFEST_BYTES]),
+            },
+            generation: 0,
+            fetch_active: false,
+        }
+    }
+
+    pub fn scratch(&mut self) -> &mut [u8; MAX_MANIFEST_BYTES] {
+        assert!(!self.fetch_active, "manifest scratch is a Fetch session");
+        unsafe { &mut self.storage.scratch }
+    }
+
+    // KOTO-0252: `inline(never)` + by-reference permission halves. Inlined into
+    // `run_device_app`, the session-sized union rewrite and the by-value
+    // allowlist/pin copies landed in the app-session poll frame and stayed
+    // resident under the whole frame loop; a dedicated frame pops them before
+    // the session runs deep (the KOTO-0172/0251 by-value-ctor playbook).
+    #[inline(never)]
+    pub(crate) fn activate_fetch(
+        &mut self,
+        app_id: &str,
+        allowlist: &FetchAllowlist,
+        pins: &FetchPinTable,
+    ) {
+        assert!(!self.fetch_active, "Fetch session already active");
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.storage.fetch = ManuallyDrop::new(DeviceFetchSession::new());
+        self.fetch_active = true;
+        let generation = self.generation;
+        self.fetch_mut()
+            .begin_app(app_id, generation, allowlist, pins);
+    }
+
+    pub(crate) fn fetch_mut(&mut self) -> &mut DeviceFetchSession {
+        assert!(self.fetch_active, "Fetch session is not active");
+        unsafe { &mut self.storage.fetch }
+    }
+
+    // KOTO-0252: `inline(never)` for the same reason as `activate_fetch`, and
+    // the scratch handover zeroes the union in place — assigning a whole
+    // `[0; MAX_MANIFEST_BYTES]` array materializes it on the caller's frame
+    // first. `write_bytes` never reads the union, so the retag from the
+    // outgoing Fetch session needs no readable bytes.
+    #[inline(never)]
+    pub(crate) fn deactivate_fetch<B: crate::firmware::app_runtime::AppBackgroundService>(
+        &mut self,
+        background: &mut B,
+    ) {
+        if self.fetch_active {
+            let mut backend = BackgroundFetchBackend(background);
+            self.fetch_mut().end_app(&mut backend);
+            unsafe {
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!(self.storage.scratch).cast::<u8>(),
+                    0,
+                    MAX_MANIFEST_BYTES,
+                );
+            }
+            self.fetch_active = false;
+        }
+    }
+}
+
+impl Default for ManifestFetchResident {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<DeviceFetchSession>() <= MAX_MANIFEST_BYTES);
+const _: () = assert!(core::mem::align_of::<ManifestFetchResident>() >= 8);
+// The Fetch/JSON app-session control block must stay inside the manifest
+// scratch overlay; growing past it would silently enlarge the union and cost
+// permanent static SRAM (KOTO-0246).
+const _: () = assert!(core::mem::size_of::<DeviceFetchSession>() <= MAX_MANIFEST_BYTES);
 
 #[derive(Clone, Copy)]
 struct PackageAudioStream {
@@ -295,31 +542,6 @@ struct PackageAudioStream {
     looping: bool,
     bgm: bool,
 }
-
-struct AudioStreamScratch {
-    encoded: [u8; AUDIO_STREAM_PCM16_BYTES],
-    decoded: [i16; AUDIO_STREAM_DECODE_FRAMES],
-}
-
-struct Cpu0AudioStreamScratch(UnsafeCell<AudioStreamScratch>);
-unsafe impl Sync for Cpu0AudioStreamScratch {}
-static AUDIO_STREAM_SCRATCH: Cpu0AudioStreamScratch =
-    Cpu0AudioStreamScratch(UnsafeCell::new(AudioStreamScratch {
-        encoded: [0; AUDIO_STREAM_PCM16_BYTES],
-        decoded: [0; AUDIO_STREAM_DECODE_FRAMES],
-    }));
-
-/// Refill half of the 256 ms PCM ring at a time. Device measurements showed
-/// that reopening and seeking the KPA for a 1024-frame refill could consume the
-/// entire 64 ms lead. A 2048-frame refill leaves 128 ms of audio queued and
-/// reduces the open/seek frequency by two without the 24 KiB SRAM increase of
-/// the larger 8192-frame experiment.
-const AUDIO_STREAM_REFILL_FRAMES: usize = 2048;
-/// Reused four times per refill so the full 2048-frame decoded block never
-/// needs to exist in SRAM at once.
-const AUDIO_STREAM_DECODE_FRAMES: usize = 512;
-const AUDIO_STREAM_PCM16_BYTES: usize = AUDIO_STREAM_REFILL_FRAMES * 2;
-const AUDIO_STREAM_SLD4_BYTES: usize = AUDIO_STREAM_REFILL_FRAMES / 2;
 
 /// A frame may legitimately start a one-shot cue and BGM together. Four slots
 /// also cover a short SFX burst without making package I/O re-entrant.
@@ -338,20 +560,27 @@ impl AudioAssetRequest {
     }
 }
 
-impl<'a, D> DeviceHost<'a, D>
+impl<'a, D, B> DeviceHost<'a, D, B>
 where
     D: BlockDevice,
     D::Error: core::fmt::Debug,
+    B: crate::firmware::app_runtime::AppBackgroundService,
 {
     pub(crate) fn new(
         volume_mgr: &'a VolumeManager<D, FirmwareClock>,
         app_id: &'a str,
+        config_snapshot: ConfigSnapshot,
+        ui_session: &'a mut UiSession,
         heap: &[u8],
         draw: &'a mut DeviceRuntimeHost,
         static_layer: &'a mut AppStaticLayer,
         audio: &'a mut PicoAudioBackend,
         package_file: ShortFileName,
+        skk: &'a mut DeviceHostSkk,
+        fetch: &'a mut DeviceFetchSession,
+        background: &'a mut B,
     ) -> Self {
+        skk.reset();
         // The shared StaticCells may carry stale state (the boot pixel diagnostic
         // borrows the same draw buffer; a prior app left its board/static layer);
         // start each app clean. The tilemap and static layer survive `clear_frame`,
@@ -364,6 +593,7 @@ where
         static_layer.len = 0;
         static_layer.rebuilt = false;
         audio.set_pcm_stream_active(false);
+        ui_session.reset();
         let surface = RenderSurface::new(320, 320, PixelFormat::Rgb565);
         let layout = TextLayout::new(
             surface,
@@ -383,6 +613,9 @@ where
             package_stream_file: None,
             package_stream_volume: None,
             app_id,
+            config_snapshot,
+            ui_session,
+            ui_ime_owner: u16::MAX,
             package_file,
             files: core::array::from_fn(|_| None),
             editor: MemoEditor::new(layout),
@@ -390,9 +623,7 @@ where
             heap_base: heap.as_ptr() as usize,
             heap_len: heap.len(),
             diag: LineBuffer::new(),
-            skk_index: None,
-            skk_file: None,
-            skk_window: [0u8; SKK_LOOKUP_WINDOW_BYTES],
+            skk,
             audio_events: 0,
             hostcall_started: Instant::MIN,
             host_us: 0,
@@ -400,7 +631,13 @@ where
             pending_audio_asset_len: 0,
             audio_stream: None,
             asset_range_cache: None,
+            fetch,
+            background,
         }
+    }
+
+    pub(crate) fn poll_background_once(&mut self, context: &mut core::task::Context<'_>) {
+        self.background.poll_once(context);
     }
 
     fn cached_package_asset_range(&mut self, path: &str) -> Result<(u32, u32), HostErrorCode> {
@@ -449,6 +686,13 @@ where
     pub(crate) fn service_audio(&mut self) {
         self.service_audio_stream();
         self.audio.service();
+        self.background.service_tls_audio_exclusion(self.audio);
+    }
+
+    pub(crate) fn begin_background_shutdown(&mut self) {
+        let mut backend = BackgroundFetchBackend(&mut *self.background);
+        self.fetch.end_app(&mut backend);
+        self.background.cancel_tls_audio_exclusion();
     }
 
     /// Starts host-managed streaming for a KACL too large for the owned fast path.
@@ -506,11 +750,17 @@ where
     }
 
     fn service_audio_stream(&mut self) {
+        if !matches!(
+            self.audio.residency_state(),
+            ResidencyState::FullAudio | ResidencyState::WifiStreamAudio
+        ) {
+            return;
+        }
         let Some(mut stream) = self.audio_stream else {
             return;
         };
         let free = self.audio.pcm_free_frames();
-        if free < AUDIO_STREAM_REFILL_FRAMES {
+        if free < STREAM_REFILL_FRAMES {
             return;
         }
         if stream.decoder.is_finished() {
@@ -526,54 +776,46 @@ where
             return;
         }
 
-        // CPU0 is the sole accessor; keeping these buffers in BSS avoids growing
-        // the async main-task future by ~5 KiB. The small decoded buffer is
-        // reused while draining one encoded SD read into the PCM ring.
-        let scratch = unsafe { &mut *AUDIO_STREAM_SCRATCH.0.get() };
         let codec_bytes = match stream.codec {
-            CodecId::Pcm16 => AUDIO_STREAM_PCM16_BYTES,
-            CodecId::Sldpcm4 => AUDIO_STREAM_SLD4_BYTES,
+            CodecId::Pcm16 => STREAM_PCM16_BYTES,
+            CodecId::Sldpcm4 => STREAM_SLD4_BYTES,
             CodecId::Unsupported(_) => 0,
         };
         let encoded_len = remaining.min(codec_bytes);
-        if self
-            .read_package_range(
-                stream.payload_offset.saturating_add(stream.payload_cursor),
-                &mut scratch.encoded[..encoded_len],
-            )
-            .is_err()
-        {
-            self.audio.record_drop();
-            self.audio_stream = None;
-            self.audio.set_pcm_stream_active(false);
-            return;
-        }
-        let mut encoded_cursor = 0usize;
-        let mut decoded_frames = 0usize;
-        let mut failed = false;
-        while decoded_frames < AUDIO_STREAM_REFILL_FRAMES && !stream.decoder.is_finished() {
-            let output_len =
-                (AUDIO_STREAM_REFILL_FRAMES - decoded_frames).min(scratch.decoded.len());
-            let (consumed, written) = stream.decoder.decode_chunk(
-                &scratch.encoded[encoded_cursor..encoded_len],
-                &mut scratch.decoded[..output_len],
-            );
-            if consumed == 0 && written == 0 {
-                failed = true;
-                break;
+        let scratch_result = try_with_stream(|encoded, decoded| {
+            if self
+                .read_package_range(
+                    stream.payload_offset.saturating_add(stream.payload_cursor),
+                    &mut encoded[..encoded_len],
+                )
+                .is_err()
+            {
+                return false;
             }
-            encoded_cursor = encoded_cursor.saturating_add(consumed);
-            stream.payload_cursor = stream.payload_cursor.saturating_add(consumed as u32);
-            decoded_frames = decoded_frames.saturating_add(written);
-            if !matches!(
-                self.audio
-                    .submit_pcm_mono_i16(16_000, &scratch.decoded[..written]),
-                Ok(accepted) if accepted as usize == written
-            ) {
-                failed = true;
-                break;
+            let mut encoded_cursor = 0usize;
+            let mut decoded_frames = 0usize;
+            while decoded_frames < STREAM_REFILL_FRAMES && !stream.decoder.is_finished() {
+                let output_len = (STREAM_REFILL_FRAMES - decoded_frames).min(decoded.len());
+                let (consumed, written) = stream.decoder.decode_chunk(
+                    &encoded[encoded_cursor..encoded_len],
+                    &mut decoded[..output_len],
+                );
+                if consumed == 0 && written == 0 {
+                    return false;
+                }
+                encoded_cursor = encoded_cursor.saturating_add(consumed);
+                stream.payload_cursor = stream.payload_cursor.saturating_add(consumed as u32);
+                decoded_frames = decoded_frames.saturating_add(written);
+                if !matches!(
+                    self.audio.submit_pcm_mono_i16(16_000, &decoded[..written]),
+                    Ok(accepted) if accepted as usize == written
+                ) {
+                    return false;
+                }
             }
-        }
+            true
+        });
+        let failed = !matches!(scratch_result, Ok(true));
         if failed {
             self.audio.record_drop();
             self.audio_stream = None;
@@ -740,19 +982,18 @@ where
         path: &str,
         dst: &mut [u8],
     ) -> Result<usize, HostErrorCode> {
-        match <Self as VmHost>::asset_load(self, path, dst) {
-            HostCallOutcome::Ok1(len) => usize::try_from(len).map_err(|_| HostErrorCode::IO_ERROR),
-            HostCallOutcome::Err(error) => Err(error),
-            _ => Err(HostErrorCode::IO_ERROR),
+        // Package streaming keeps one raw FAT volume/file open for the whole
+        // app session. Re-entering the general `asset_load` implementation here
+        // would try to open that same volume a second time and fail precisely
+        // when a runtime cue is requested during an active PCM stream. Resolve
+        // and read the cue through the shared seekable package handle instead.
+        let (start, size) = self.cached_package_asset_range(path)?;
+        let len = usize::try_from(size).map_err(|_| HostErrorCode::NO_MEMORY)?;
+        if len > dst.len() {
+            return Err(HostErrorCode::NO_MEMORY);
         }
-    }
-
-    pub(crate) fn play_loaded_audio_image(&mut self, image: &[u8], bgm: bool) -> bool {
-        if image.starts_with(b"KACL") {
-            self.audio.play_runtime_clip(image)
-        } else {
-            self.audio.play_runtime_cue(image, bgm)
-        }
+        self.read_package_range(start, &mut dst[..len])?;
+        Ok(len)
     }
 
     pub(crate) fn audio_asset_diag(&mut self, reason: &str, path: &str) {
@@ -803,6 +1044,13 @@ where
             worker_max_jitter_us: backend.worker_max_jitter_us,
             worker_heartbeat: backend.worker_heartbeat,
             core1_stack_free_min: backend.core1_stack_free_min,
+            residency_state: backend.residency_state,
+            residency_generation: backend.residency_generation,
+            worker_offline_generation: backend.worker_offline_generation,
+            worker_online_generation: backend.worker_online_generation,
+            worker_rich_active: backend.worker_rich_active,
+            transition_failures: backend.transition_failures,
+            arena_guard_failures: backend.arena_guard_failures,
         }
     }
 
@@ -845,15 +1093,19 @@ where
     /// window — the dictionary body itself stays on the card. Writes a
     /// diagnostic to `self.diag`; drain it with `uart_write_line` before the
     /// frame loop.
+    // KOTO-0252: keep the ~5 KiB dictionary-index build (its `SkkLeadingIndex`
+    // by-value temporary plus the LFN scan buffer) in its own frame; today it
+    // is the deepest launch-phase call under the app-session poll frames.
+    #[inline(never)]
     pub(crate) fn load_skk(&mut self) {
         let loaded = self.try_load_skk_dict();
         self.diag.clear();
         let _ = if loaded {
-            let (dict_len, buckets) = self
-                .skk_index
-                .as_ref()
-                .map(|i| (i.dict_len(), i.entry_count()))
-                .unwrap_or((0, 0));
+            let (dict_len, buckets) = if self.skk.index_loaded {
+                (self.skk.index.dict_len(), self.skk.index.entry_count())
+            } else {
+                (0, 0)
+            };
             write!(
                 self.diag,
                 "phase=159 skk-loaded dict_len={} buckets={}\r\n",
@@ -905,13 +1157,23 @@ where
             return false;
         };
         let mut reader = SdDictFile { file };
-        match SkkLeadingIndex::build_from_reader(&mut reader, &mut self.skk_window) {
-            Ok(index) => {
-                self.skk_index = Some(index);
-                self.skk_file = Some(short_name);
+        // In-place build (KOTO-0252): the ~2.3 KiB index is written directly
+        // into its resident cell instead of returned by value through this
+        // launch-path frame.
+        match SkkLeadingIndex::build_from_reader_into(
+            &mut reader,
+            &mut self.skk.window,
+            &mut self.skk.index,
+        ) {
+            Ok(()) => {
+                self.skk.index_loaded = true;
+                self.skk.file = Some(short_name);
                 true
             }
-            Err(_) => false,
+            Err(_) => {
+                self.skk.index_loaded = false;
+                false
+            }
         }
     }
 
@@ -926,6 +1188,39 @@ where
         // Per-frame hostcall wall time (KOTO-0169 Stage 0b): read by the frame
         // loop after `step_frame_with`, so it resets with the other frame state.
         self.host_us = 0;
+    }
+
+    fn present_ui(&mut self) -> HostCallOutcome {
+        let before = self.draw.len;
+        let result = {
+            let mut painter = DeviceUiPainter { draw: self.draw };
+            self.ui_session
+                .paint_full_if_damaged(&mut painter, &koto_ui::Theme::DARK)
+        };
+        match result {
+            Ok(false) => HostCallOutcome::Ok0,
+            Ok(true) if self.draw.len - before <= self.static_layer.commands.len() => {
+                let built_end = self.draw.len;
+                self.static_layer.begin();
+                for command in self.draw.commands[before..built_end].iter().copied() {
+                    let _ = self.static_layer.try_push(command);
+                }
+                for command in &mut self.draw.commands[before..built_end] {
+                    *command = AppDrawCommand::Empty;
+                }
+                self.draw.len = before;
+                self.ui_session.complete_present();
+                HostCallOutcome::Ok0
+            }
+            Ok(true) | Err(_) => {
+                let failed_end = self.draw.len;
+                for command in &mut self.draw.commands[before..failed_end] {
+                    *command = AppDrawCommand::Empty;
+                }
+                self.draw.len = before;
+                HostCallOutcome::Err(HostErrorCode::NO_MEMORY)
+            }
+        }
     }
 
     /// Wall time (µs) this frame's `HOST_CALL` dispatches spent in the host,
@@ -985,11 +1280,445 @@ fn map_game2d_result(result: koto_game2d::Game2dResult) -> HostCallOutcome {
     }
 }
 
-impl<D> VmHost for DeviceHost<'_, D>
+fn map_audio_request_error(_error: AudioRequestError) -> HostCallOutcome {
+    HostCallOutcome::Err(HostErrorCode::WOULD_BLOCK)
+}
+
+struct DeviceUiPainter<'a> {
+    draw: &'a mut DeviceRuntimeHost,
+}
+
+impl koto_ui::TextMetrics for DeviceUiPainter<'_> {
+    fn measure_text(&mut self, text: &str) -> Result<i32, koto_ui::PaintError> {
+        Ok(text
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii() {
+                    i32::from(DEVICE_CELL_WIDTH)
+                } else {
+                    i32::from(DEVICE_CELL_WIDTH) * 2
+                }
+            })
+            .sum())
+    }
+
+    fn line_height(&self) -> Option<i32> {
+        Some(i32::from(DEVICE_CELL_HEIGHT))
+    }
+}
+
+impl koto_ui::Painter for DeviceUiPainter<'_> {
+    fn fill_rect(
+        &mut self,
+        clip: koto_ui::UiRect,
+        rect: koto_ui::UiRect,
+        color: koto_ui::Rgb565,
+    ) -> Result<(), koto_ui::PaintError> {
+        let Some(rect) = rect.intersection(clip) else {
+            return Ok(());
+        };
+        match self.draw.push(AppDrawCommand::Rect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: rect.h,
+            rgb565: color.0,
+        }) {
+            HostCallOutcome::Ok0 => Ok(()),
+            _ => Err(koto_ui::PaintError::Backend),
+        }
+    }
+    fn stroke_rect(
+        &mut self,
+        clip: koto_ui::UiRect,
+        rect: koto_ui::UiRect,
+        color: koto_ui::Rgb565,
+        width: u8,
+    ) -> Result<(), koto_ui::PaintError> {
+        let width = i32::from(width).max(1);
+        for edge in [
+            koto_ui::UiRect::new(rect.x, rect.y, rect.w, width),
+            koto_ui::UiRect::new(rect.x, rect.y + rect.h - width, rect.w, width),
+            koto_ui::UiRect::new(rect.x, rect.y, width, rect.h),
+            koto_ui::UiRect::new(rect.x + rect.w - width, rect.y, width, rect.h),
+        ] {
+            self.fill_rect(clip, edge, color)?;
+        }
+        Ok(())
+    }
+    fn draw_text(
+        &mut self,
+        clip: koto_ui::UiRect,
+        bounds: koto_ui::UiRect,
+        run: koto_ui::TextRun<'_>,
+    ) -> Result<(), koto_ui::PaintError> {
+        if bounds.intersection(clip).is_none() {
+            return Ok(());
+        }
+        let width = <Self as koto_ui::TextMetrics>::measure_text(self, run.text)?;
+        let x = match run.align {
+            koto_ui::TextAlign::Start => bounds.x,
+            koto_ui::TextAlign::Center => bounds.x + (bounds.w - width).max(0) / 2,
+            koto_ui::TextAlign::End => bounds.x + (bounds.w - width).max(0),
+        };
+        let mut len = run.text.len().min(MAX_APP_TEXT_BYTES);
+        while !run.text.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut bytes = [0u8; MAX_APP_TEXT_BYTES];
+        bytes[..len].copy_from_slice(&run.text.as_bytes()[..len]);
+        match self.draw.push(AppDrawCommand::Text {
+            x,
+            y: bounds.y + (bounds.h - i32::from(DEVICE_CELL_HEIGHT)).max(0) / 2,
+            rgb565: run.color.0,
+            bytes,
+            len: len as u8,
+        }) {
+            HostCallOutcome::Ok0 => Ok(()),
+            _ => Err(koto_ui::PaintError::Backend),
+        }
+    }
+    fn draw_glyphs(
+        &mut self,
+        clip: koto_ui::UiRect,
+        bounds: koto_ui::UiRect,
+        run: koto_ui::GlyphRun<'_>,
+    ) -> Result<(), koto_ui::PaintError> {
+        let mut x = bounds.x;
+        for id in run.glyphs {
+            let Some(ch) = char::from_u32(u32::from(*id)) else {
+                return Err(koto_ui::PaintError::InvalidGeometry);
+            };
+            let mut encoded = [0; 4];
+            let text = ch.encode_utf8(&mut encoded);
+            self.draw_text(
+                clip,
+                koto_ui::UiRect::new(x, bounds.y, bounds.w, bounds.h),
+                koto_ui::TextRun {
+                    text,
+                    color: run.color,
+                    align: koto_ui::TextAlign::Start,
+                },
+            )?;
+            x += (if ch.is_ascii() { 8 } else { 16 }) + i32::from(run.spacing);
+        }
+        Ok(())
+    }
+    fn draw_focus_mark(
+        &mut self,
+        clip: koto_ui::UiRect,
+        rect: koto_ui::UiRect,
+        color: koto_ui::Rgb565,
+        width: u8,
+    ) -> Result<(), koto_ui::PaintError> {
+        self.stroke_rect(clip, rect, color, width)
+    }
+}
+
+impl<D, B> VmHost for DeviceHost<'_, D, B>
 where
     D: BlockDevice,
     D::Error: core::fmt::Debug,
+    B: crate::firmware::app_runtime::AppBackgroundService,
 {
+    fn fetch_start(&mut self, url: &str) -> HostCallOutcome {
+        let mut backend = BackgroundFetchBackend(&mut *self.background);
+        match self.fetch.controller.start_pinned(
+            &mut backend,
+            self.fetch.app,
+            &self.fetch.allowlist,
+            &self.fetch.pins,
+            url,
+            Instant::now().as_millis(),
+        ) {
+            Ok(id) => HostCallOutcome::Ok1(id.raw() as i32),
+            Err(error) => HostCallOutcome::Err(fetch_host_error(error)),
+        }
+    }
+
+    fn fetch_poll(&mut self, request_id: i32) -> HostCallOutcome {
+        let id = FetchRequestId::from_raw(request_id as u32);
+        let mut backend = BackgroundFetchBackend(&mut *self.background);
+        let (state, metadata) = match self.fetch.controller.poll(
+            &mut backend,
+            self.fetch.app,
+            id,
+            Instant::now().as_millis(),
+        ) {
+            Ok(FetchPoll::Pending) => (0, 0),
+            Ok(FetchPoll::Headers { status }) => (1, i32::from(status)),
+            Ok(FetchPoll::Body) => (2, 0),
+            Ok(FetchPoll::Complete) => (3, 0),
+            Ok(FetchPoll::Failed(error)) | Err(error) => (4, error as i32),
+        };
+        HostCallOutcome::Ok2(state, metadata)
+    }
+
+    fn fetch_read(&mut self, request_id: i32, dst: &mut [u8]) -> HostCallOutcome {
+        let id = FetchRequestId::from_raw(request_id as u32);
+        let mut backend = BackgroundFetchBackend(&mut *self.background);
+        match self
+            .fetch
+            .controller
+            .read(&mut backend, self.fetch.app, id, dst)
+        {
+            Ok(len) => HostCallOutcome::Ok1(len as i32),
+            Err(error) => HostCallOutcome::Err(fetch_host_error(error)),
+        }
+    }
+
+    fn fetch_cancel(&mut self, request_id: i32) -> HostCallOutcome {
+        let id = FetchRequestId::from_raw(request_id as u32);
+        let mut backend = BackgroundFetchBackend(&mut *self.background);
+        match self
+            .fetch
+            .controller
+            .cancel(&mut backend, self.fetch.app, id)
+        {
+            Ok(()) => HostCallOutcome::Ok0,
+            Err(error) => HostCallOutcome::Err(fetch_host_error(error)),
+        }
+    }
+
+    fn json_reset(&mut self) -> HostCallOutcome {
+        self.fetch.json.reset();
+        HostCallOutcome::Ok0
+    }
+
+    fn json_next(&mut self, src: &[u8]) -> HostCallOutcome {
+        HostCallOutcome::Ok1(self.fetch.json.next(src))
+    }
+
+    fn json_finish(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Ok1(self.fetch.json.finish())
+    }
+
+    fn json_token(&mut self, dst: &mut [u8]) -> HostCallOutcome {
+        let token = self.fetch.json.token();
+        if dst.len() < token.len() {
+            return HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT);
+        }
+        dst[..token.len()].copy_from_slice(token);
+        HostCallOutcome::Ok1(token.len() as i32)
+    }
+
+    fn json_error(&mut self) -> HostCallOutcome {
+        let (code, offset) = self.fetch.json.error();
+        HostCallOutcome::Ok2(code, offset)
+    }
+
+    fn json_status(&mut self) -> HostCallOutcome {
+        let (consumed, depth) = self.fetch.json.status();
+        HostCallOutcome::Ok2(consumed, depth)
+    }
+
+    /// Advisory time (Host ABI minor 21, KOTO-0247): the KOTO-0244 SNTP
+    /// publication plus the KotoConfig UTC offset already carried by the
+    /// config snapshot. Unauthenticated display/cache-age data only; before
+    /// the first synchronization (and past the `i32` range) UTC reads `-1`.
+    fn time_query(&mut self, kind: i32) -> HostCallOutcome {
+        use koto_core::time::app_time_query as time_query;
+        match kind {
+            time_query::UTC_SECONDS => {
+                // Builds without the network service have no SNTP source, so
+                // UTC stays the documented unknown value.
+                #[cfg(feature = "network_service")]
+                match crate::firmware::network::sntp_utc_seconds() {
+                    Some((seconds, _generation))
+                        if (0..=i64::from(i32::MAX)).contains(&seconds) =>
+                    {
+                        HostCallOutcome::Ok1(seconds as i32)
+                    }
+                    _ => HostCallOutcome::Ok1(-1),
+                }
+                #[cfg(not(feature = "network_service"))]
+                HostCallOutcome::Ok1(-1)
+            }
+            time_query::OFFSET_MINUTES => {
+                HostCallOutcome::Ok1(i32::from(self.config_snapshot.utc_offset.minutes()))
+            }
+            time_query::MONOTONIC_MS => HostCallOutcome::Ok1(
+                (Instant::now().as_millis() as i64 & i64::from(time_query::MONOTONIC_MASK)) as i32,
+            ),
+            _ => HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT),
+        }
+    }
+
+    fn ui_frame_begin(&mut self, input: VmInputSnapshot) {
+        let Some(target) = self.ui_session.ime_target() else {
+            if self.ui_ime_owner != u16::MAX {
+                let _ = self.ime.process_key(MemoImeKey::Cancel, &mut self.editor);
+                self.ui_session.clear_ime_composition();
+                self.ui_ime_owner = u16::MAX;
+            }
+            self.ui_session.frame_begin(input, self.config_snapshot);
+            return;
+        };
+        let widget_id = target.widget_id;
+        let cursor = target.cursor;
+        let mut initial = [0u8; 256];
+        let initial_len = target.value.len();
+        initial[..initial_len].copy_from_slice(target.value.as_bytes());
+        if self.ui_ime_owner != widget_id {
+            let _ = self.ime.process_key(MemoImeKey::Cancel, &mut self.editor);
+            self.ui_session.clear_ime_composition();
+            self.ui_ime_owner = widget_id;
+        }
+        let initial_text = core::str::from_utf8(&initial[..initial_len]).unwrap_or("");
+        let _ = self.editor.load_str(initial_text);
+        let _ = self.editor.set_cursor(cursor);
+
+        let mut forwarded = input;
+        let intents = input.intent_bits;
+        if intents & koto_core::runtime::text_intent::IME_TOGGLE != 0 {
+            let _ = self.ime.process_key(MemoImeKey::Toggle, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::IME_TOGGLE;
+        }
+        if intents & koto_core::runtime::text_intent::SHIFT != 0 {
+            let _ = self.ime.process_key(MemoImeKey::Shift, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::SHIFT;
+        }
+        if intents & koto_core::runtime::text_intent::NEWLINE != 0
+            && self.ime.line().mode != MemoImeMode::Empty
+        {
+            let _ = self.ime.process_key(MemoImeKey::Commit, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::NEWLINE;
+            forwarded.pressed_bits &= !(1 << 4);
+        }
+        if intents & koto_core::runtime::text_intent::CONVERT != 0 {
+            let _ = self.ime_convert();
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::CONVERT;
+        }
+        if intents & koto_core::runtime::text_intent::COMMIT != 0 {
+            let _ = self.ime.process_key(MemoImeKey::Commit, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::COMMIT;
+        }
+        if intents & koto_core::runtime::text_intent::CANCEL != 0
+            && self.ime.line().mode != MemoImeMode::Empty
+        {
+            let _ = self.ime.process_key(MemoImeKey::Cancel, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::CANCEL;
+            forwarded.pressed_bits &= !(1 << 5);
+            forwarded.text_codepoint = 0;
+        }
+        if intents & koto_core::runtime::text_intent::BACKSPACE != 0
+            && self.ime.line().mode != MemoImeMode::Empty
+        {
+            let _ = self
+                .ime
+                .process_key(MemoImeKey::Backspace, &mut self.editor);
+            forwarded.intent_bits &= !koto_core::runtime::text_intent::BACKSPACE;
+        }
+        if let Some(ch) = char::from_u32(forwarded.text_codepoint).filter(|ch| *ch != '\0') {
+            let _ = self
+                .ime
+                .process_key(MemoImeKey::Character(ch), &mut self.editor);
+            forwarded.text_codepoint = 0;
+        }
+
+        let mut value = [0u8; 256];
+        let value_len = self.editor.as_str().len().min(value.len());
+        value[..value_len].copy_from_slice(&self.editor.as_str().as_bytes()[..value_len]);
+        let mut composition = [0u8; 128];
+        let mut composition_len = 0usize;
+        let mut candidate = [0u8; 64];
+        let mut candidate_len = 0usize;
+        let line = self.ime.line();
+        for part in [line.reading, line.pending_romaji] {
+            let len = part.len().min(composition.len() - composition_len);
+            composition[composition_len..composition_len + len]
+                .copy_from_slice(&part.as_bytes()[..len]);
+            composition_len += len;
+        }
+        if let Some(text) = line.candidate {
+            candidate_len = text.len().min(candidate.len());
+            candidate[..candidate_len].copy_from_slice(&text.as_bytes()[..candidate_len]);
+        }
+        let value = core::str::from_utf8(&value[..value_len]).unwrap_or("");
+        let composition = core::str::from_utf8(&composition[..composition_len]).unwrap_or("");
+        let candidate = (candidate_len != 0)
+            .then(|| core::str::from_utf8(&candidate[..candidate_len]).unwrap_or(""));
+        let value_changed = initial_text != value;
+        let ime_changed = self
+            .ui_session
+            .apply_ime_snapshot(
+                widget_id,
+                value,
+                self.editor.cursor(),
+                composition,
+                candidate,
+            )
+            .unwrap_or(false);
+        self.ui_session.frame_begin(forwarded, self.config_snapshot);
+        // Composition-only changes have no App semantic event. Present their
+        // retained TextField damage here so device behavior matches KotoSim
+        // without forcing bytecode to issue an idle `ui_present` every frame.
+        if ime_changed && !value_changed {
+            let _ = self.present_ui();
+        }
+    }
+
+    fn ui_capabilities(&mut self, dst: &mut [u8]) -> HostCallOutcome {
+        match UiCapabilities::from_config(self.config_snapshot).encode(dst) {
+            Ok(written) => HostCallOutcome::Ok1(written as i32),
+            Err(_) => HostCallOutcome::Err(HostErrorCode::NO_MEMORY),
+        }
+    }
+
+    fn ui_mount(&mut self, src: &[u8]) -> HostCallOutcome {
+        match self.ui_session.mount(src) {
+            Ok(()) => {
+                self.ime = KotoMemoIme::new();
+                self.ui_ime_owner = u16::MAX;
+                HostCallOutcome::Ok0
+            }
+            Err(UiMountError::BadArgument) => HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT),
+            Err(UiMountError::Unsupported) => HostCallOutcome::Err(HostErrorCode::UNSUPPORTED),
+            Err(UiMountError::NoMemory) => HostCallOutcome::Err(HostErrorCode::NO_MEMORY),
+        }
+    }
+
+    fn ui_update(&mut self, src: &[u8]) -> HostCallOutcome {
+        if !self.ui_session.is_mounted() {
+            return HostCallOutcome::Err(HostErrorCode::NOT_FOUND);
+        }
+        match self.ui_session.update(src) {
+            Ok(()) => HostCallOutcome::Ok0,
+            Err(UiMountError::BadArgument) => HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT),
+            Err(UiMountError::Unsupported) => HostCallOutcome::Err(HostErrorCode::UNSUPPORTED),
+            Err(UiMountError::NoMemory) => HostCallOutcome::Err(HostErrorCode::NO_MEMORY),
+        }
+    }
+
+    fn ui_present(&mut self) -> HostCallOutcome {
+        if !self.ui_session.is_mounted() {
+            return HostCallOutcome::Err(HostErrorCode::NOT_FOUND);
+        }
+        self.present_ui()
+    }
+
+    fn ui_poll_event(&mut self, dst: &mut [u8]) -> HostCallOutcome {
+        match self.ui_session.poll_event(dst) {
+            Ok(written) => HostCallOutcome::Ok1(written as i32),
+            Err(UiPollError::NotMounted) => HostCallOutcome::Err(HostErrorCode::NOT_FOUND),
+            Err(UiPollError::NoMemory) => HostCallOutcome::Err(HostErrorCode::NO_MEMORY),
+        }
+    }
+
+    fn ui_reset(&mut self) -> HostCallOutcome {
+        if self.ui_ime_owner != u16::MAX {
+            self.ime = KotoMemoIme::new();
+        }
+        self.ui_ime_owner = u16::MAX;
+        self.ui_session.reset();
+        self.static_layer.begin();
+        HostCallOutcome::Ok0
+    }
+
+    fn ui_session_end(&mut self) {
+        let _ = self.ui_reset();
+    }
+
     fn hostcall_dispatch_begin(&mut self) {
         self.hostcall_started = Instant::now();
     }
@@ -1265,6 +1994,17 @@ where
                 );
                 HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
             }
+            Err(PcmSubmitError::TemporaryUnavailable) => {
+                self.log_audio_result(
+                    host_call::AUDIO_SUBMIT_I16,
+                    sample_rate,
+                    frames,
+                    channels,
+                    samples.len(),
+                    "temporarily-unavailable",
+                );
+                HostCallOutcome::Err(HostErrorCode::WOULD_BLOCK)
+            }
         }
     }
 
@@ -1272,18 +2012,26 @@ where
         self.audio_events = self.audio_events.saturating_add(1);
         // KOTO-0165: the id maps to a fixed authored blip sequence on the
         // KotoAudio SFX bus (the tone path is gone).
-        self.audio.play_sfx_cue(sfx_id_cue(id));
-        self.log_audio_result(host_call::PLAY_SFX, -1, 0, 0, 0, "seq-sfx");
-        HostCallOutcome::Ok0
+        match self.audio.play_sfx_cue(sfx_id_cue(id)) {
+            Ok(()) => {
+                self.log_audio_result(host_call::PLAY_SFX, -1, 0, 0, 0, "seq-sfx");
+                HostCallOutcome::Ok0
+            }
+            Err(error) => map_audio_request_error(error),
+        }
     }
 
     fn play_bgm(&mut self, id: i32) -> HostCallOutcome {
         self.audio_events = self.audio_events.saturating_add(1);
         // KOTO-0165: the id maps to a built-in authored loop on the KotoAudio
         // BGM bus (the built-in MML strings and tone stand-in are gone).
-        self.audio.play_bgm_cue(builtin_bgm_cue(id));
-        self.log_audio_result(host_call::PLAY_BGM, -1, 0, 0, 0, "seq-bgm");
-        HostCallOutcome::Ok0
+        match self.audio.play_bgm_cue(builtin_bgm_cue(id)) {
+            Ok(()) => {
+                self.log_audio_result(host_call::PLAY_BGM, -1, 0, 0, 0, "seq-bgm");
+                HostCallOutcome::Ok0
+            }
+            Err(error) => map_audio_request_error(error),
+        }
     }
 
     fn play_bgm_asset(&mut self, path: &str) -> HostCallOutcome {
@@ -1457,6 +2205,7 @@ where
 
     fn close_all_files(&mut self) {
         self.files.fill(None);
+        self.begin_background_shutdown();
     }
 
     fn asset_load(&mut self, path: &str, dst: &mut [u8]) -> HostCallOutcome {
@@ -1616,10 +2365,10 @@ where
     }
 
     fn ime_convert(&mut self) -> HostCallOutcome {
-        let Some(index) = self.skk_index.as_ref() else {
+        if !self.skk.index_loaded {
             return HostCallOutcome::Err(HostErrorCode::UNSUPPORTED);
-        };
-        let Some(name) = self.skk_file.clone() else {
+        }
+        let Some(name) = self.skk.file.clone() else {
             return HostCallOutcome::Err(HostErrorCode::UNSUPPORTED);
         };
         // Re-open the dictionary for this conversion and scan it through the
@@ -1639,9 +2388,9 @@ where
             return HostCallOutcome::Err(HostErrorCode::IO_ERROR);
         };
         let mut access = WindowedDict {
-            index,
+            index: &self.skk.index,
             reader: SdDictFile { file },
-            window: &mut self.skk_window,
+            window: &mut self.skk.window,
         };
         match self.ime.convert_with_access(&mut access, &mut self.editor) {
             Ok(()) => HostCallOutcome::Ok0,
@@ -1834,6 +2583,24 @@ where
         // yet supported. Report empty so the file-open dialog shows no entries.
         let _ = (index, dst);
         HostCallOutcome::Ok2(0, 0)
+    }
+}
+
+fn stable_app_id(app_id: &str) -> u32 {
+    app_id.bytes().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
+}
+
+fn fetch_host_error(error: FetchError) -> HostErrorCode {
+    match error {
+        FetchError::Denied | FetchError::ForeignRequest => HostErrorCode::PERMISSION_DENIED,
+        FetchError::Unavailable => HostErrorCode::UNSUPPORTED,
+        FetchError::Busy | FetchError::BufferTooLarge | FetchError::MalformedUrl => {
+            HostErrorCode::BAD_ARGUMENT
+        }
+        FetchError::StaleRequest => HostErrorCode::NOT_FOUND,
+        _ => HostErrorCode::IO_ERROR,
     }
 }
 

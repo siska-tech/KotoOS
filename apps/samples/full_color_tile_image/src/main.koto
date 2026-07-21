@@ -14,6 +14,38 @@ const IMAGE_BANDS = 40;
 const SCENE_COUNT = 4;
 const HOLD_FRAMES = 120;
 
+struct GalleryState {
+    scene: int,
+    phase: int,
+    timer: int,
+    step: int,
+}
+
+static gallery: GalleryState = {
+    scene: 0,
+    phase: 2,
+    timer: 0,
+    step: 0,
+};
+
+impl GalleryState {
+    fn begin_fade(self) {
+        self.phase = 1;
+        self.step = 0;
+    }
+
+    fn begin_next_scene(self) {
+        self.scene = (self.scene + 1) % SCENE_COUNT;
+        self.phase = 2;
+        self.step = 0;
+    }
+
+    fn begin_hold(self) {
+        self.phase = 0;
+        self.timer = 0;
+    }
+}
+
 fn load_band(scene: int, band: int, pixels: int) -> int {
     let offset = KIM_HEADER + band * BAND_BYTES;
     if scene == 0 {
@@ -60,44 +92,34 @@ fn main() {
     buf band_pixels[5120];
     buf black_tile[512];
 
-    let scene = 0;
-    let phase = 2; // 0 hold, 1 fade/wipe out, 2 row wipe in
-    let timer = 0;
-    let step = 0;
-    let intent = 0;
-
     play_bgm_asset("audio/gallery_music_sld4.kacl", 29);
 
     loop {
-        intent = text_intent();
+        let intent = text_intent();
         if (intent & INTENT_EXIT) != 0 {
             stop_bgm();
             exit(0);
         }
 
-        if phase == 0 {
-            timer = timer + 1;
-            if timer >= HOLD_FRAMES {
-                phase = 1;
-                step = 0;
+        if gallery.phase == 0 {
+            gallery.timer = gallery.timer + 1;
+            if gallery.timer >= HOLD_FRAMES {
+                gallery.begin_fade();
             }
         }
-        else if phase == 1 {
-            if scene % 2 == 0 { fade_step(step, black_tile); }
-            else { clear_column(step, black_tile); }
-            step = step + 1;
-            if step >= MAP_W {
-                scene = (scene + 1) % SCENE_COUNT;
-                phase = 2;
-                step = 0;
+        else if gallery.phase == 1 {
+            if gallery.scene % 2 == 0 { fade_step(gallery.step, black_tile); }
+            else { clear_column(gallery.step, black_tile); }
+            gallery.step = gallery.step + 1;
+            if gallery.step >= MAP_W {
+                gallery.begin_next_scene();
             }
         }
         else {
-            if draw_image_band(scene, step, band_pixels) < 0 { exit(2); }
-            step = step + 1;
-            if step >= IMAGE_BANDS {
-                phase = 0;
-                timer = 0;
+            if draw_image_band(gallery.scene, gallery.step, band_pixels) < 0 { exit(2); }
+            gallery.step = gallery.step + 1;
+            if gallery.step >= IMAGE_BANDS {
+                gallery.begin_hold();
             }
         }
 

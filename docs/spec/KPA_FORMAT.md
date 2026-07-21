@@ -105,7 +105,63 @@ Paths must use `/` separators, must be relative, and must not contain empty segm
 
 ## Manifest Relationship
 
-The source manifest remains JSON with `format: "kpa-manifest"` and `version: 1`. The packer copies a canonical UTF-8 JSON representation into the metadata region so loaders and diagnostics can inspect app metadata without external files.
+The source manifest is JSON with `format: "kpa-manifest"`. Manifest version 2
+adds the bounded Fetch permission below; version 1 remains loadable for existing
+offline packages. The binary container remains KPA v1. The packer copies a
+canonical UTF-8 JSON representation into the metadata region so loaders and
+diagnostics can inspect app metadata without external files.
+
+Network access is default-denied. A version 2 manifest may grant only a fixed
+list of canonical origins:
+
+```json
+"permissions": {
+  "network": {
+    "origins": ["https://api.example.com", "https://data.example.net:8443"]
+  }
+}
+```
+
+An HTTPS origin that is intended for a future device transport uses an object
+entry containing one current pin and optionally one next pin. Pins are the
+lower-case hexadecimal SHA-256 digest of the certificate's Subject Public Key
+Info (SPKI):
+
+```json
+"origins": [
+  {
+    "origin": "https://api.example.com",
+    "spki_sha256": [
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    ]
+  }
+]
+```
+
+Each digest is exactly 32 bytes represented by 64 lower-case hexadecimal
+characters. A pin set contains one or two distinct values and is permitted only
+for HTTPS. The first value is current and the second is the staged successor;
+either value authenticates the peer. Rotation requires installing a signed KPA
+update that overlaps old and new keys, followed by another signed update that
+removes the old key. Response data can never modify pins. String origin entries
+remain valid for deterministic KotoSim and offline packages, but an HTTPS
+device backend must remain `Unavailable` unless every requested HTTPS origin
+has a non-empty pin set.
+
+At most four exact `(scheme, hostname, port)` origins are accepted. Schemes are
+`https` and development-only `http`; DNS hostnames must be lower-case ASCII.
+Wildcards, user-info, IP literals, paths, queries, fragments, duplicates,
+explicit default ports, malformed/oversized names, and other fields are
+rejected. Absence or an empty list grants no access. Version 1's boolean
+`permissions.network` is legacy metadata and never grants Fetch access.
+KotoSim and the device catalog loader both apply the portable fixed-depth,
+allocation-free permission parser to the complete metadata JSON. Duplicate
+root permission declarations, duplicate network declarations, escaped origin
+text, excessive nesting, and malformed JSON are rejected before launch. Device
+builds retain no Fetch transport state until the authenticated backend is
+enabled, so a validated declaration does not by itself make networking
+available.
 
 Manifest fields map into KPA v1 as follows:
 

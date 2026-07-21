@@ -1,0 +1,6 @@
+# Boot the Weather app: load resources, settings/cache, mount the retained form.
+frame
+frame
+frame
+frame
+exit

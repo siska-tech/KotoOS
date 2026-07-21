@@ -1,0 +1,13 @@
+File Note
+Note
+Save
+Reload
+Note loaded
+Note created
+No note file
+Note too large
+Note not UTF-8
+Note saved
+File error
+Editing note
+Capacity full

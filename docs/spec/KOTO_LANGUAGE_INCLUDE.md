@@ -1,8 +1,9 @@
 # KOTO-0183: Koto Source-File Splitting — Design Note
 
 - Status: implemented (this note is the KOTO-0183 acceptance design note)
-- Decision: **flat, textual `include "file.koto";`** resolved by the compiler
-  front-end before lexing. No module system, no namespaces, no runtime linking.
+- Decision: **flat, textual include** resolved by the compiler front-end before
+  lexing. Quoted paths are source-relative; angle-bracket `sdk/` paths name
+  standard SDK libraries. No module system, namespaces, or runtime linking.
 
 ## Mechanism chosen: textual include (not modules)
 
@@ -18,6 +19,15 @@ as a single-file program. A side table (`SourceMap`) records, per expanded
 line, the originating file and line, and every diagnostic — lexer, parser, and
 codegen — is remapped through it, so errors report the real `file:line:col`
 across include boundaries.
+
+SDK standard libraries use a workspace-rooted form instead:
+
+```koto
+include <sdk/koto_ui.koto>;
+```
+
+This form is independent of the App source directory, so moving an App does
+not require rewriting its SDK imports.
 
 ### Why not modules
 
@@ -42,15 +52,18 @@ across include boundaries.
 
 ## Semantics
 
-- **Directive form:** a whole line whose trimmed content is
-  `include "relative/path.koto";`, optionally followed by a `//` comment.
-  Recognized only when the trimmed line starts with `include` followed by
-  whitespace and a `"` — an identifier like `include_x` or a call `include(x)`
-  is untouched. A line that starts like a directive but is malformed (missing
-  `;`, unterminated string) is a compile error, not silently passed through.
-- **Paths** are relative to the including file, use `/` separators, and may
-  not be absolute. `..` is allowed (see the code-size story for why sharing
+- **Directive form:** a whole line whose trimmed content is either
+  `include "relative/path.koto";` or `include <sdk/library.koto>;`, optionally
+  followed by a `//` comment. Recognized only when `include` is followed by
+  whitespace and a `"` or `<`; an identifier like `include_x` or a call
+  `include(x)` is untouched. Malformed directives are compile errors.
+- **Quoted paths** are relative to the including file, use `/` separators, and
+  may not be absolute. `..` is allowed (see the code-size story for why sharing
   across apps is legal but discouraged).
+- **Angle-bracket paths** resolve from the workspace root and are reserved for
+  `sdk/`. Every component must be a normal path component: `.`, `..`, absolute
+  paths, and backslashes are rejected. The canonical KotoUI import is
+  `include <sdk/koto_ui.koto>;`.
 - **Nesting** is allowed (an included file may include others), capped at
   depth 16.
 - **Each file may be included at most once** per program (the root file

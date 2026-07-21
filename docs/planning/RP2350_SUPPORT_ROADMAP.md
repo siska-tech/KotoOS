@@ -73,7 +73,9 @@ The feature and source boundary is specified in
    PicoCalc PSRAM and logs the selected backend.
 4. **Do not require Wi-Fi.** Pico 2 W and Pico Plus 2 W are supported as compute
    modules first. Network functionality remains out of scope, and the radio
-   must not be required to boot KotoOS.
+   must not be required to boot KotoOS. KOTO-0224 separately designs the
+   capability-gated NetworkService/KotoConfig boundary so a later Wi-Fi build
+   can expose settings without changing this offline boot guarantee.
 5. **Keep conservative defaults until measured.** RP2040 timing constants,
    DMA request IDs, SRAM hot-section choices, and stack canary thresholds are
    not copied blindly to RP2350. Each is either made MCU-specific or revalidated.

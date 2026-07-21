@@ -14,7 +14,10 @@ opcode_stats = ["koto-vm/opcode_stats"]
 # Forward the koto-vm interpreter-in-SRAM placement (KOTO-0169 Stage 2, H2-b)
 # so the firmware can enable it through `koto-core/ram_interpreter`.
 ram_interpreter = ["koto-vm/ram_interpreter"]
+app_fetch_tls_verifier = ["dep:p256"]
 
 [dependencies]
 koto-gfx = { path = "../koto-gfx" }
+koto-ui = { path = "../koto-ui" }
 koto-vm = { path = "../koto-vm" }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "sha256"], optional = true }

@@ -1,0 +1,219 @@
+// Validate one complete KUE1 record before using the field accessors below.
+fn ui_event_validate(src: int, len: int) -> int {
+    if len < UI_EVENT_HEADER_BYTES || len > UI_EVENT_HEADER_BYTES + UI_MAX_DATA_BYTES {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if heap_get_u8(src + 0) != 75 || heap_get_u8(src + 1) != 85 ||
+       heap_get_u8(src + 2) != 69 || heap_get_u8(src + 3) != 49 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if heap_get_u16(src + 4) != UI_ABI_MAJOR || heap_get_u16(src + 6) != UI_ABI_MINOR {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    if ui_sdk_get_u32(src, 8) != len || heap_get_u8(src + 13) != 0 || heap_get_u16(src + 30) != 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let kind = heap_get_u8(src + 12);
+    if kind < UI_RESPONSE_ACTIVATED || kind > UI_RESPONSE_LOCALE_CHANGED {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let text_offset = ui_sdk_get_u32(src, 24);
+    let text_len = heap_get_u16(src + 28);
+    if text_len == 0 {
+        if text_offset != 0 || len != UI_EVENT_HEADER_BYTES {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+    } else {
+        if text_offset != UI_EVENT_HEADER_BYTES || text_offset + text_len != len {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+        if ui_sdk_utf8_valid(src + text_offset, text_len) != 0 {
+            return UI_SDK_BAD_ARGUMENT;
+        }
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_sdk_bytes_equal(a: int, a_len: int, b: int, b_len: int) -> int {
+    if a_len != b_len { return 0; }
+    let i = 0;
+    while i < a_len {
+        if heap_get_u8(a + i) != heap_get_u8(b + i) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn ui_sdk_locale_tag_valid(src: int, len: int) -> int {
+    if len < 1 || len > 23 || heap_get_u8(src) == 45 || heap_get_u8(src + len - 1) == 45 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let i = 0;
+    let previous_hyphen = 0;
+    while i < len {
+        let b = heap_get_u8(src + i);
+        let alnum = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+        if !alnum && b != 45 { return UI_SDK_BAD_ARGUMENT; }
+        if b == 45 {
+            if previous_hyphen != 0 { return UI_SDK_BAD_ARGUMENT; }
+            previous_hyphen = 1;
+        } else {
+            previous_hyphen = 0;
+        }
+        i = i + 1;
+    }
+    return UI_SDK_OK;
+}
+
+// Canonical locale classification is policy-free: exact means byte-for-byte,
+// language means a plain language candidate followed by '-' in the locale,
+// and malformed/unrelated tags do not match.
+enum UiLocaleMatch {
+    None,
+    Language,
+    Exact,
+}
+
+fn ui_locale_match(locale: int, locale_len: int, candidate: int, candidate_len: int) -> int {
+    if ui_sdk_locale_tag_valid(locale, locale_len) != UI_SDK_OK ||
+       ui_sdk_locale_tag_valid(candidate, candidate_len) != UI_SDK_OK {
+        return UiLocaleMatch::None;
+    }
+    if ui_sdk_bytes_equal(locale, locale_len, candidate, candidate_len) != 0 {
+        return UiLocaleMatch::Exact;
+    }
+    let i = 0;
+    while i < candidate_len {
+        if heap_get_u8(candidate + i) == 45 { return UiLocaleMatch::None; }
+        i = i + 1;
+    }
+    if locale_len > candidate_len && heap_get_u8(locale + candidate_len) == 45 &&
+       ui_sdk_bytes_equal(locale, candidate_len, candidate, candidate_len) != 0 {
+        return UiLocaleMatch::Language;
+    }
+    return UiLocaleMatch::None;
+}
+
+// Returns 0 for an exact resource tag, 1 for the requested language tag,
+// 2 for en-US, or -1 when the candidate does not participate in fallback.
+// If every candidate returns -1, the caller uses its embedded default string.
+fn ui_locale_fallback_rank(locale: int, locale_len: int, candidate: int, candidate_len: int) -> int {
+    if ui_sdk_locale_tag_valid(locale, locale_len) != 0 ||
+       ui_sdk_locale_tag_valid(candidate, candidate_len) != 0 {
+        return -1;
+    }
+    if ui_sdk_bytes_equal(locale, locale_len, candidate, candidate_len) != 0 { return 0; }
+    let language_len = 0;
+    while language_len < locale_len && heap_get_u8(locale + language_len) != 45 {
+        language_len = language_len + 1;
+    }
+    if candidate_len == language_len && ui_sdk_bytes_equal(locale, language_len, candidate, candidate_len) != 0 {
+        return 1;
+    }
+    if candidate_len == 5 && heap_get_u8(candidate) == 101 && heap_get_u8(candidate + 1) == 110 &&
+       heap_get_u8(candidate + 2) == 45 && heap_get_u8(candidate + 3) == 85 &&
+       heap_get_u8(candidate + 4) == 83 {
+        return 2;
+    }
+    return -1;
+}
+
+fn ui_capabilities_validate(src: int, len: int) -> int {
+    if len != UI_CAPABILITIES_BYTES || heap_get_u8(src) != 75 || heap_get_u8(src + 1) != 85 ||
+       heap_get_u8(src + 2) != 67 || heap_get_u8(src + 3) != 49 ||
+       heap_get_u16(src + 4) != UI_ABI_MAJOR || heap_get_u16(src + 6) != UI_ABI_MINOR {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let locale_len = heap_get_u8(src + 32);
+    let direction = heap_get_u8(src + 33);
+    if direction != 0 || heap_get_u16(src + 34) != 0 || ui_sdk_get_u32(src, 36) == 0 ||
+       ui_sdk_locale_tag_valid(src + 40, locale_len) != 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    let i = 40 + locale_len;
+    while i < UI_CAPABILITIES_BYTES {
+        if heap_get_u8(src + i) != 0 { return UI_SDK_BAD_ARGUMENT; }
+        i = i + 1;
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_capabilities_locale_ptr(src: int) -> int {
+    return src + 40;
+}
+
+fn ui_capabilities_locale_len(src: int) -> int {
+    return heap_get_u8(src + 32);
+}
+
+fn ui_capabilities_direction(src: int) -> int {
+    return heap_get_u8(src + 33);
+}
+
+fn ui_capabilities_locale_generation(src: int) -> int {
+    return ui_sdk_get_u32(src, 36);
+}
+
+fn ui_capabilities_flags(src: int) -> int {
+    return heap_get_u16(src + 30);
+}
+
+fn ui_capabilities_has(src: int, capability: int) -> int {
+    if (ui_capabilities_flags(src) & capability) != 0 { return 1; }
+    return 0;
+}
+
+fn ui_locale_changed_validate(src: int, len: int) -> int {
+    if ui_event_validate(src, len) != 0 || ui_event_response(src) != UI_RESPONSE_LOCALE_CHANGED ||
+       ui_event_widget_id(src) != 0 || ui_event_value(src) == 0 || ui_event_aux(src) != 0 ||
+       ui_sdk_locale_tag_valid(ui_event_text_ptr(src), ui_event_text_len(src)) != 0 {
+        return UI_SDK_BAD_ARGUMENT;
+    }
+    return UI_SDK_OK;
+}
+
+fn ui_locale_changed_generation(src: int) -> int {
+    return ui_event_value(src);
+}
+
+fn ui_locale_changed_direction(src: int) -> int {
+    return ui_event_aux(src);
+}
+
+fn ui_locale_changed_tag_ptr(src: int) -> int {
+    return ui_event_text_ptr(src);
+}
+
+fn ui_locale_changed_tag_len(src: int) -> int {
+    return ui_event_text_len(src);
+}
+
+fn ui_event_response(src: int) -> int {
+    return heap_get_u8(src + 12);
+}
+
+fn ui_event_widget_id(src: int) -> int {
+    return heap_get_u16(src + 14);
+}
+
+fn ui_event_value(src: int) -> int {
+    return ui_sdk_get_u32(src, 16);
+}
+
+fn ui_event_index(src: int) -> int {
+    return ui_event_value(src);
+}
+
+fn ui_event_aux(src: int) -> int {
+    return ui_sdk_get_u32(src, 20);
+}
+
+fn ui_event_text_ptr(src: int) -> int {
+    let offset = ui_sdk_get_u32(src, 24);
+    if offset == 0 { return 0; }
+    return src + offset;
+}
+
+fn ui_event_text_len(src: int) -> int {
+    return heap_get_u16(src + 28);
+}

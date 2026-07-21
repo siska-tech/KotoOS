@@ -110,6 +110,111 @@ throughput and audio starvation during image loads.
 | :--------------------------------------------------------------------- | :---------- | :----------------------------------------- |
 | [KOTO-0207](issues/main/KOTO-0207-sd-spi-init-and-throughput.md)         | done        | SD SPI initialization and transfer throughput |
 
+### RP2040 Memory And Audio Reliability
+
+The RP2040 product profile keeps a measured stack canary margin while sharing
+bounded CPU0/CPU1 audio state. Changes in this section require product-path
+audio stress and ELF SRAM measurements rather than build-only validation.
+
+| Issue                                                                  | Status | Title                                      |
+| :--------------------------------------------------------------------- | :----- | :----------------------------------------- |
+| [KOTO-0226](issues/main/KOTO-0226-cpu0-audio-scratch-sharing-regression-harness.md) | done | CPU0 audio scratch sharing regression harness |
+| [KOTO-0227](issues/main/KOTO-0227-pico-w-switchable-audio-wifi-sram-residency.md) | done | Pico W switchable Audio/Wi-Fi SRAM residency |
+
+### KotoUI GUI Components
+
+Filed 2026-07-15 from the
+[KotoUI GUI component roadmap](planning/KOTOUI_ROADMAP.md). The work keeps UI
+state allocation-free and keyboard-first, builds components on an abstract
+painter/damage contract, validates them in the simulator, and finishes with a
+bounded KotoShell production pilot.
+
+| Issue                                                                  | Status | Title                                           |
+| :--------------------------------------------------------------------- | :----- | :---------------------------------------------- |
+| [KOTO-0208](issues/main/KOTO-0208-koto-ui-foundation.md)                   | done   | KotoUI allocation-free foundation           |
+| [KOTO-0209](issues/main/KOTO-0209-koto-ui-focus-events.md)                   | done   | KotoUI keyboard events and focus routing    |
+| [KOTO-0210](issues/main/KOTO-0210-koto-ui-basic-controls.md)                 | done   | KotoUI label, button, and checkbox controls |
+| [KOTO-0211](issues/main/KOTO-0211-koto-ui-list.md)                           | done   | KotoUI bounded list and selection control   |
+| [KOTO-0212](issues/main/KOTO-0212-koto-ui-text-field.md)                     | done   | KotoUI single-line text field and IME composition |
+| [KOTO-0213](issues/main/KOTO-0213-koto-ui-dialog-composition.md)             | done   | KotoUI panel and modal dialog composition       |
+| [KOTO-0214](issues/main/KOTO-0214-koto-ui-rendering-integration.md)          | done   | KotoUI rendering and platform integration       |
+| [KOTO-0215](issues/main/KOTO-0215-koto-ui-gallery-validation.md)             | done   | KotoUI component gallery and regression harness |
+| [KOTO-0216](issues/main/KOTO-0216-koto-ui-shell-pilot.md)                    | done   | KotoShell pilot adoption of KotoUI              |
+
+### KotoUI App ABI
+
+Filed 2026-07-15 from the
+[KotoUI App ABI roadmap](planning/KOTOUI_APP_ABI_ROADMAP.md). This phase exposes
+the bounded native component model to sandboxed KotoRuntime applications through
+a versioned retained description, semantic events, SDK builders, an app-authored
+Gallery, and an existing-app pilot.
+
+| Issue                                                                  | Status | Title                                      |
+| :--------------------------------------------------------------------- | :----- | :----------------------------------------- |
+| [KOTO-0217](issues/main/KOTO-0217-koto-ui-app-abi-design.md)              | done   | App-facing KotoUI ABI and locale contract  |
+| [KOTO-0218](issues/main/KOTO-0218-koto-ui-vm-session-host-calls.md)        | done   | KotoUI VM session and host calls        |
+| [KOTO-0219](issues/main/KOTO-0219-koto-ui-sdk-builders.md)                 | done   | KotoSDK UI builders and event API       |
+| [KOTO-0220](issues/main/KOTO-0220-koto-ui-app-gallery.md)                  | in-progress | App-authored KotoUI component Gallery      |
+| [KOTO-0221](issues/main/KOTO-0221-file-note-koto-ui-pilot.md)              | done   | File Note app pilot migration to KotoUI    |
+| [KOTO-0222](issues/main/KOTO-0222-kotoshell-ja-en-localization.md)          | done   | KotoShell Japanese/English localization    |
+| [KOTO-0229](issues/main/KOTO-0229-koto-ui-stateful-builders.md)             | done   | KotoUI stateful App builders               |
+| [KOTO-0230](issues/main/KOTO-0230-sdk-text-resources-list-row-builders.md)   | done   | SDK text resources and List row builders   |
+| [KOTO-0231](issues/main/KOTO-0231-koto-ui-sdk-transaction-resource-locale-ergonomics.md) | done | KotoUI SDK transaction/resource/locale ergonomics |
+| [KOTO-0232](issues/main/KOTO-0232-koto-ui-compile-time-packet-capacity-helpers.md) | done | KotoUI compile-time packet capacity helpers |
+| [KOTO-0233](issues/main/KOTO-0233-koto-buffer-capacity-at-ui-builder-call-sites.md) | done | Koto buffer capacity at KotoUI builder call sites |
+| [KOTO-0234](issues/main/KOTO-0234-gallery-named-failure-codes-and-storage.md) | done | Gallery failure codes and storage offsets as named declarations |
+| [KOTO-0235](issues/main/KOTO-0235-koto-fixed-buffer-fields-structured-storage.md) | done | Koto fixed buffer fields in static records (structured storage) |
+| [KOTO-0236](issues/main/KOTO-0236-asset-len-and-sdk-storage-capacity-helpers.md) | done | Compile-time asset sizes and SDK storage capacity helpers |
+| [KOTO-0237](issues/main/KOTO-0237-compile-time-text-asset-shape-helpers.md) | done | Compile-time text asset shape helpers |
+| [KOTO-0238](issues/main/KOTO-0238-text-asset-line-maxima-and-const-additive-sizing.md) | done | Text asset line maxima and compile-time additive sizing |
+
+### KotoConfig
+
+The [KotoConfig roadmap](planning/KOTOCONFIG_ROADMAP.md) separates the native
+settings UI and shared persistence service from Shell consumers. Wi-Fi remains
+optional future work behind explicit firmware capabilities.
+
+| Issue                                                                  | Status | Title                                      |
+| :--------------------------------------------------------------------- | :----- | :----------------------------------------- |
+| [KOTO-0223](issues/main/KOTO-0223-kotoconfig-foundation-language.md)       | done   | KotoConfig foundation and language settings |
+| [KOTO-0224](issues/main/KOTO-0224-kotoconfig-wifi-extension-design.md)     | done   | KotoConfig optional Wi-Fi extension design |
+| [KOTO-0227](issues/main/KOTO-0227-pico-w-switchable-audio-wifi-sram-residency.md) | done | Pico W switchable Audio/Wi-Fi SRAM residency |
+| [KOTO-0239](issues/main/KOTO-0239-bounded-network-service-embassy-net.md) | done | Bounded NetworkService and Embassy network integration |
+| [KOTO-0240](issues/main/KOTO-0240-wifi-secret-credential-provider.md) | in-progress | Wi-Fi secret credential provider and persistence |
+| [KOTO-0241](issues/main/KOTO-0241-kotoconfig-wifi-page.md) | done | KotoConfig Wi-Fi page and bilingual interaction |
+| [KOTO-0242](issues/main/KOTO-0242-kotosim-fake-network-service.md) | done | KotoSim deterministic fake NetworkService |
+| [KOTO-0243](issues/main/KOTO-0243-picocalc-wifi-config-validation.md) | in-progress | PicoCalc Wi-Fi configuration validation |
+| [KOTO-0244](issues/main/KOTO-0244-bounded-sntp-time-service.md) | done | Bounded SNTP time service and Shell clock |
+| [KOTO-0251](issues/main/KOTO-0251-pico-w-product-network-wiring.md) | in-progress | Pico W product NetworkService wiring on the residency arena |
+| [KOTO-0252](issues/main/KOTO-0252-rp2040-app-session-stack-peak-reduction.md) | todo | RP2040 app-session main-stack peak attribution and reduction |
+
+### Application Networking
+
+Applications use an OS-brokered, capability-gated service rather than owning
+raw sockets or network-stack handles.
+
+| Issue                                                                  | Status | Title                                      |
+| :--------------------------------------------------------------------- | :----- | :----------------------------------------- |
+| [KOTO-0245](issues/main/KOTO-0245-bounded-app-fetch-service.md) | done | Bounded app Fetch service and SDK |
+| [KOTO-0246](issues/main/KOTO-0246-bounded-json-data-decoder.md) | in progress | Bounded JSON data decoder for Koto apps |
+| [KOTO-0247](issues/main/KOTO-0247-weather-internet-data-reference-app.md) | todo | Weather Internet-data reference app |
+| [KOTO-0248](issues/main/KOTO-0248-app-network-credential-vault.md) | todo | Application network credential vault and grants |
+| [KOTO-0249](issues/main/KOTO-0249-bounded-app-mqtt-service.md) | in progress | Bounded application MQTT subscribe service and SDK |
+| [KOTO-0250](issues/main/KOTO-0250-iot-dashboard-mqtt-reference-app.md) | todo | IoT Dashboard MQTT reference app |
+
+### Koto Language And SDK Evolution
+
+Language additions stay compile-time-only unless a separate issue explicitly
+changes the VM ABI. SDK migrations preserve the existing flat constants while
+official Apps adopt clearer namespaced domains.
+
+| Issue                                                                  | Status | Title                                      |
+| :--------------------------------------------------------------------- | :----- | :----------------------------------------- |
+| [KOTO-0225](issues/main/KOTO-0225-koto-language-enum-sdk-domains.md)       | done   | Koto language enums and SDK constant domains |
+| [KOTO-0228](issues/main/KOTO-0228-koto-static-records-inline-methods.md)   | done        | Koto static records and inline methods       |
+| [KOTO-0237](issues/main/KOTO-0237-compile-time-text-asset-shape-helpers.md) | done | Compile-time text asset shape helpers |
+| [KOTO-0238](issues/main/KOTO-0238-text-asset-line-maxima-and-const-additive-sizing.md) | done | Text asset line maxima and compile-time additive sizing |
+
 ### Cleanup And Planning
 
 | Issue                                                          | Status | Title                                   |

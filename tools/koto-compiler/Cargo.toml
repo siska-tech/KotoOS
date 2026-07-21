@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 koto-core = { path = "../../src/koto-core" }
 kbc-asm = { path = "../kbc-asm" }
+serde_json = "1"

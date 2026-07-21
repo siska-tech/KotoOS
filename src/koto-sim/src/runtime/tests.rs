@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(events[2].selected_index, 1);
         match events[3].action {
             ShellAction::Launch(package) => assert_eq!(package.name(), "Two"),
-            ShellAction::None => panic!("expected launch action"),
+            ShellAction::None | ShellAction::OpenConfig => panic!("expected launch action"),
         }
     }
 
@@ -320,6 +320,73 @@ mod tests {
             host.asset_load("sprites/other.kim", &mut other),
             HostCallOutcome::Err(_)
         ));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// KOTO-0236 path identity: the same string literal names the same asset
+    /// for compile-time `asset_len` (resolved through the on-disk `app.json`
+    /// above the root source) and runtime `asset_load`, and the loaded byte
+    /// count equals the folded size for the sized asset.
+    #[test]
+    fn asset_len_folds_the_size_that_asset_load_reads_at_runtime() {
+        let root = test_root("asset_len_folds_the_size_that_asset_load_reads_at_runtime");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("locales")).unwrap();
+        let payload = b"Title\nBody line\n";
+        fs::write(root.join("locales").join("en-US.txt"), payload).unwrap();
+        fs::write(
+            root.join("app.json"),
+            br#"{"assets":[{"source":"locales/en-US.txt","output":"locales/en-US.txt"}]}"#,
+        )
+        .unwrap();
+        let source = "
+const RAW_BYTES = asset_len(\"locales/en-US.txt\");
+fn main() {
+    buf raw[RAW_BYTES];
+    let loaded = asset_load(\"locales/en-US.txt\", 17, raw, len(raw));
+    exit(loaded - RAW_BYTES);
+}
+";
+        let source_path = root.join("src").join("main.koto");
+        fs::write(&source_path, source).unwrap();
+
+        let bytecode = koto_compiler::compile(source_path.to_str().unwrap(), source).unwrap();
+        let program =
+            koto_core::verify_kbc(&bytecode, koto_core::RuntimeLimits::simulator_default())
+                .unwrap();
+        assert!(
+            program.header().max_heap_bytes >= payload.len() as u32,
+            "folded buffer must reserve the packaged bytes"
+        );
+        let mut vm = koto_core::BytecodeVm::<16, 4>::new(&program).unwrap();
+        let mut heap = vec![0u8; program.header().max_heap_bytes as usize];
+        if let Some((start, end)) = program.rodata_range() {
+            heap[..end - start].copy_from_slice(&bytecode[start..end]);
+        }
+        let audio = Arc::new(Mutex::new(SimAudio::new(DEFAULT_SAMPLE_RATE)));
+        let mut host = SimRuntimeHost::with_audio_and_assets(
+            HostFs::mounted(&root).unwrap(),
+            "dev.koto.test",
+            audio,
+            vec!["locales/en-US.txt".to_string()],
+        )
+        .unwrap();
+
+        // Exit code is `loaded - folded`: zero exactly when the runtime read
+        // the byte count the compiler folded.
+        assert_eq!(
+            vm.execute_frame(
+                &bytecode,
+                &program,
+                &mut host,
+                VmInputSnapshot::empty(),
+                SIM_FRAME_FUEL,
+                &mut heap,
+            )
+            .unwrap(),
+            koto_core::VmRunResult::Exited(0)
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -860,7 +927,7 @@ mod tests {
     #[test]
     fn parses_app_script_chars_intents_and_frames() {
         let inputs = parse_app_script(
-            "'k'            # a character\nshift convert\nframe          # empty frame\ncommit exit ime-toggle",
+            "'k'            # a character\nshift convert\nframe          # empty frame\ncommit exit ime-toggle activate confirm",
         )
         .unwrap();
         assert_eq!(inputs.len(), 4);
@@ -876,6 +943,7 @@ mod tests {
                 | koto_core::runtime::text_intent::EXIT
                 | koto_core::runtime::text_intent::IME_TOGGLE
         );
+        assert_eq!(inputs[3].pressed_bits, 1 << 4);
     }
 
     #[test]
@@ -1655,6 +1723,12 @@ mod tests {
     /// The committed SDK sample bytecode, compiled from `apps/samples/*` and kept
     /// in sync by the app build loop (`harness/build_apps.py --check`). The
     /// KOTO-0178 sweep below drives every sample the way the shell would.
+    ///
+    /// KotoUI-authored samples (`koto-ui-gallery`, and `file-note` since
+    /// KOTO-0221) are deliberately absent: they draw through the retained UI
+    /// session instead of per-frame `draw_*` calls and need their package
+    /// assets, so their launch/run/exit coverage lives in the dedicated
+    /// `koto_ui_app_gallery` / `koto_ui_file_note` integration suites.
     const SDK_SAMPLES: &[(&str, &str, &[u8])] = &[
         (
             "dev.koto.samples.hello-text",
@@ -1670,11 +1744,6 @@ mod tests {
             "dev.koto.samples.counter-loop",
             "sample_counter_loop.kbc",
             include_bytes!("../../../../package_inputs/bytecode/sample_counter_loop.kbc"),
-        ),
-        (
-            "dev.koto.samples.file-note",
-            "sample_file_note.kbc",
-            include_bytes!("../../../../package_inputs/bytecode/sample_file_note.kbc"),
         ),
         (
             "dev.koto.samples.ime-playground",
@@ -1714,9 +1783,7 @@ mod tests {
                 fs::create_dir_all(root.join("maps")).unwrap();
                 fs::write(
                     root.join("maps").join("world.map"),
-                    include_bytes!(
-                        "../../../../apps/samples/retained_tilemap/maps/world.map"
-                    ),
+                    include_bytes!("../../../../apps/samples/retained_tilemap/maps/world.map"),
                 )
                 .unwrap();
                 r#", "assets": [{ "path": "maps/world.map", "type": "data" }]"#
@@ -1869,6 +1936,11 @@ mod tests {
         assert!(budget.host_calls_per_frame_peak >= 1);
         assert!(budget.draw_rects_peak >= 1);
         assert!(budget.heap_bytes_peak <= budget.heap_request);
+        assert_eq!(
+            budget.ui_session_sram_bytes,
+            koto_core::UI_SESSION_SRAM_BYTES
+        );
+        assert_eq!(budget.ui_render_commands_peak, 0);
 
         // describe round-trips into the parseable one-line key=value form.
         let line = describe_app_budget_report(budget);
@@ -1876,6 +1948,9 @@ mod tests {
         assert!(line.contains(&format!("stack_cap={SIM_VM_STACK_SLOTS}")));
         assert!(line.contains("heap_request="));
         assert!(line.contains("heap_budget="));
+        assert!(line.contains("frame_time_us_peak="));
+        assert!(line.contains("ui_session_sram="));
+        assert!(line.contains("ui_render_commands_peak="));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2598,6 +2673,295 @@ mod tests {
             .unwrap_or(false);
         assert!(b_favorite);
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn legacy_shell_locale_preference_is_ignored_without_losing_launcher_state() {
+        let root = test_root("shell_prefs_locale_migration");
+        let prefs_dir = root.join("data").join(SHELL_PREFS_APP_ID);
+        fs::create_dir_all(&prefs_dir).unwrap();
+        fs::write(
+            prefs_dir.join("prefs.txt"),
+            "locale=ja-JP\nsort=Favorite\ncategory=Tools\nfav=dev.koto.b\n",
+        )
+        .unwrap();
+
+        let mut packages = PackageList::new();
+        packages.push(PackageInfo::new("dev.koto.a", "A").unwrap());
+        packages.push(PackageInfo::new("dev.koto.b", "B").unwrap());
+        let mut shell = ShellState::new(packages);
+        apply_shell_prefs(&mut shell, &root);
+
+        assert_eq!(shell.locale(), koto_core::Locale::EnUs);
+        assert_eq!(shell.sort_mode(), SortMode::Favorite);
+        assert_eq!(shell.category_filter(), Some("Tools"));
+        assert!(shell
+            .packages()
+            .iter()
+            .find(|package| package.app_id() == "dev.koto.b")
+            .unwrap()
+            .is_favorite());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn shell_frames_differ_for_english_japanese_and_pseudolocale() {
+        const FONT: &[u8] = include_bytes!("../../../../assets/fonts/mplus12.kfont");
+
+        let font = BitmapFont::from_bytes(FONT).unwrap();
+        let mut packages = PackageList::new();
+        packages.push(PackageInfo::new("dev.koto.one", "One").unwrap());
+        let mut shell = ShellState::new(packages);
+        shell.set_save_status(koto_core::shell::SaveStatus::Saved);
+
+        let mut hashes = [0u64; 3];
+        for (index, locale) in [
+            koto_core::Locale::EnUs,
+            koto_core::Locale::JaJp,
+            koto_core::Locale::QpsPloc,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut config = koto_core::ConfigService::new();
+            config.set_locale(locale);
+            shell.apply_config_snapshot(config.snapshot());
+            let mut framebuffer = Framebuffer::new(320, 320);
+            shell.paint(&mut framebuffer.as_canvas(), &font);
+            hashes[index] = framebuffer
+                .as_canvas()
+                .pixels()
+                .iter()
+                .fold(0xcbf29ce484222325u64, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+                });
+        }
+
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[0], hashes[2]);
+        assert_ne!(hashes[1], hashes[2]);
+    }
+
+    #[test]
+    fn system_config_uses_newest_valid_slot_and_survives_corruption() {
+        let root = test_root("system_config_slots");
+        let mut config = koto_core::ConfigService::default();
+        save_system_config(&config, &root).unwrap();
+        assert_eq!(load_system_config(&root).locale(), koto_core::Locale::EnUs);
+
+        assert!(config.set_locale(koto_core::Locale::JaJp));
+        assert!(config.set_utc_offset(koto_core::UtcOffset::from_minutes(9 * 60).unwrap()));
+        assert!(config.set_sntp_server(koto_core::SntpServer::NictJapan));
+        save_system_config(&config, &root).unwrap();
+        let loaded = load_system_config(&root);
+        assert_eq!(loaded.locale(), koto_core::Locale::JaJp);
+        assert_eq!(loaded.utc_offset().minutes(), 9 * 60);
+        assert_eq!(loaded.sntp_server(), koto_core::SntpServer::NictJapan);
+
+        fs::write(root.join("data/dev.koto.config/config-b.bin"), b"torn").unwrap();
+        let recovered = load_system_config(&root);
+        assert_eq!(recovered.locale(), koto_core::Locale::EnUs);
+        assert_eq!(recovered.utc_offset(), koto_core::UtcOffset::default());
+        assert_eq!(recovered.sntp_server(), koto_core::SntpServer::NtpPool);
+        assert_eq!(recovered.generation(), 1);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ui_capabilities_host_call_uses_saved_locale_snapshot() {
+        use koto_core::runtime::{host_call, opcode};
+
+        let root = test_root("ui_capabilities_locale");
+        let mut config = koto_core::ConfigService::new();
+        assert!(config.set_locale(koto_core::Locale::JaJp));
+        save_system_config(&config, &root).unwrap();
+
+        let instructions = [
+            insn(opcode::PUSH_I16, 0, 0),  // dst_ptr
+            insn(opcode::PUSH_I16, 0, 64), // dst_max
+            insn(opcode::HOST_CALL, host_call::UI_CAPABILITIES, 0),
+            insn(opcode::DROP, 0, 0),      // status
+            insn(opcode::DROP, 0, 0),      // bytes_written
+            insn(opcode::PUSH_I16, 0, 0),  // x
+            insn(opcode::PUSH_I16, 0, 0),  // y
+            insn(opcode::PUSH_I16, 0, 32), // width: expose all 64 bytes
+            insn(opcode::PUSH_I16, 0, 1),  // height
+            insn(opcode::PUSH_I16, 0, 0),  // ptr
+            insn(opcode::PUSH_I16, 0, 64), // len
+            insn(opcode::HOST_CALL, host_call::DRAW_PIXELS_RGB565, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 0),
+            insn(opcode::HOST_CALL, host_call::EXIT, 0),
+        ];
+        write_runtime_package(
+            &root,
+            KOTORUNTIME_BYTECODE,
+            &kbc_with_heap(&instructions, 256),
+        );
+
+        let mut session = BytecodeAppSession::launch(&root, "dev.koto.test").unwrap();
+        assert_eq!(
+            session.step_frame(VmInputSnapshot::empty()).unwrap(),
+            VmRunResult::Exited(0)
+        );
+        let bytes = &session.draw_pixels()[0].4;
+        assert_eq!(&bytes[0..4], b"KUC1");
+        assert_eq!(bytes[32], 5);
+        assert_eq!(u32::from_le_bytes(bytes[36..40].try_into().unwrap()), 2);
+        assert_eq!(&bytes[40..45], b"ja-JP");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ui_present_builds_retained_commands_and_idle_keeps_them() {
+        let root = test_root("ui_present_retained");
+        fs::create_dir_all(&root).unwrap();
+        let mut host =
+            SimRuntimeHost::new(HostFs::mounted(&root).unwrap(), "dev.koto.test").unwrap();
+        let hex =
+            include_str!("../../../../harness/fixtures/koto_ui_abi/valid_panel_button_mount.hex")
+                .trim()
+                .as_bytes();
+        let nibble = |byte| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => panic!("bad fixture hex"),
+        };
+        let packet: Vec<u8> = (0..hex.len() / 2)
+            .map(|index| nibble(hex[index * 2]) << 4 | nibble(hex[index * 2 + 1]))
+            .collect();
+
+        assert_eq!(host.ui_mount(&packet), HostCallOutcome::Ok0);
+        assert_eq!(host.ui_present(), HostCallOutcome::Ok0);
+        // The representative ABI scene expands two frame strokes and one focus
+        // stroke into retained rectangles: 15 rects + 2 text commands. This is
+        // the simulator/device parity boundary used by the KOTO-0218 record.
+        assert_eq!(host.ui_rects.len(), 15);
+        assert_eq!(host.ui_text.len(), 2);
+        assert!(host.ui_text.iter().any(|(_, _, text)| text == "OK"));
+        let retained = (host.ui_rects.clone(), host.ui_text.clone());
+
+        host.clear_frame_draw();
+        assert_eq!(host.ui_present(), HostCallOutcome::Ok0);
+        assert_eq!((host.ui_rects.clone(), host.ui_text.clone()), retained);
+        assert!(host.draw_rects.is_empty());
+        assert!(host.text.is_empty());
+
+        let mut bad_utf8 = packet.clone();
+        bad_utf8[141] = 0xff;
+        assert_eq!(
+            host.ui_mount(&bad_utf8),
+            HostCallOutcome::Err(koto_core::HostErrorCode::BAD_ARGUMENT)
+        );
+        let mut unsupported = packet.clone();
+        unsupported[4..6].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            host.ui_mount(&unsupported),
+            HostCallOutcome::Err(koto_core::HostErrorCode::UNSUPPORTED)
+        );
+        let mut too_many = packet.clone();
+        too_many[12..14].copy_from_slice(&33u16.to_le_bytes());
+        assert_eq!(
+            host.ui_mount(&too_many),
+            HostCallOutcome::Err(koto_core::HostErrorCode::NO_MEMORY)
+        );
+        assert_eq!((host.ui_rects.clone(), host.ui_text.clone()), retained);
+        assert_eq!(host.ui_present(), HostCallOutcome::Ok0);
+        assert_eq!((host.ui_rects.clone(), host.ui_text.clone()), retained);
+
+        host.ui_frame_begin(VmInputSnapshot {
+            pressed_bits: 1 << 4,
+            ..VmInputSnapshot::empty()
+        });
+        let mut event = [0u8; 64];
+        assert_eq!(host.ui_poll_event(&mut event), HostCallOutcome::Ok1(32));
+        assert_eq!(&event[..4], b"KUE1");
+        assert_eq!(event[12], 1);
+        assert_eq!(u16::from_le_bytes([event[14], event[15]]), 2);
+
+        assert_eq!(host.ui_reset(), HostCallOutcome::Ok0);
+        assert!(host.ui_rects.is_empty());
+        assert!(host.ui_text.is_empty());
+        assert_eq!(
+            host.ui_poll_event(&mut event),
+            HostCallOutcome::Err(koto_core::HostErrorCode::NOT_FOUND)
+        );
+
+        let mut ime_packet = packet.clone();
+        ime_packet.resize(174, 0);
+        ime_packet[8..12].copy_from_slice(&174u32.to_le_bytes());
+        ime_packet[24..28].copy_from_slice(&38u32.to_le_bytes());
+        ime_packet[92] = 5;
+        ime_packet[94..96].copy_from_slice(&1u16.to_le_bytes());
+        ime_packet[112..116].copy_from_slice(&6u32.to_le_bytes());
+        ime_packet[118..120].copy_from_slice(&32u16.to_le_bytes());
+        ime_packet[120..124].copy_from_slice(&(-1i32).to_le_bytes());
+        assert_eq!(host.ui_mount(&ime_packet), HostCallOutcome::Ok0);
+        host.ui_frame_begin(VmInputSnapshot {
+            pressed_bits: 1 << 4,
+            ..VmInputSnapshot::empty()
+        });
+        host.ui_frame_begin(VmInputSnapshot {
+            intent_bits: koto_core::runtime::text_intent::IME_TOGGLE,
+            ..VmInputSnapshot::empty()
+        });
+        host.ui_frame_begin(VmInputSnapshot {
+            text_codepoint: 'k' as u32,
+            ..VmInputSnapshot::empty()
+        });
+        assert_eq!(host.ui_present(), HostCallOutcome::Ok0);
+        assert!(host.ui_text.iter().any(|(_, _, text)| text == "k"));
+        host.ui_frame_begin(VmInputSnapshot {
+            text_codepoint: 'a' as u32,
+            ..VmInputSnapshot::empty()
+        });
+        assert_eq!(host.ui_poll_event(&mut event), HostCallOutcome::Ok1(35));
+        assert_eq!(event[12], 3);
+        assert_eq!(&event[32..35], "か".as_bytes());
+        assert_eq!(host.ui_present(), HostCallOutcome::Ok0);
+        let text_x = host
+            .ui_text
+            .iter()
+            .find_map(|(x, _, text)| (text == "か").then_some(*x))
+            .expect("committed kana text");
+        assert!(
+            host.ui_rects.iter().any(|&(x, _, w, h, color)| {
+                x == text_x + 12
+                    && w == 1
+                    && h == 12
+                    && color == i32::from(koto_ui::Theme::DARK.focus.0)
+            }),
+            "text={:?} rects={:?}",
+            host.ui_text,
+            host.ui_rects
+        );
+        assert_eq!(host.ui_reset(), HostCallOutcome::Ok0);
+        assert!(!host.ime.is_enabled());
+        assert_eq!(host.ui_ime_owner, u16::MAX);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn invalid_or_oversized_system_config_falls_back_to_defaults() {
+        let root = test_root("system_config_invalid");
+        let dir = root.join("data/dev.koto.config");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config-a.bin"),
+            vec![0xff; koto_core::CONFIG_FORMAT_MAX_BYTES + 1],
+        )
+        .unwrap();
+        fs::write(dir.join("config-b.bin"), b"bad").unwrap();
+
+        assert_eq!(
+            load_system_config(&root),
+            koto_core::ConfigService::default()
+        );
         fs::remove_dir_all(&root).ok();
     }
 

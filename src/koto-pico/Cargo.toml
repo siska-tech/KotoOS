@@ -12,10 +12,21 @@ cortex-m-rt = "0.7.5"
 critical-section = "1.2.0"
 cyw43 = "0.7.0"
 cyw43-firmware = { version = "0.1.0", features = ["wifi"] }
-cyw43-pio = "0.10.0"
+cyw43-pio = { path = "../cyw43-pio" }
 embassy-executor = { version = "0.10.0", features = ["executor-thread"] }
 embassy-embedded-hal = "0.6.0"
 embassy-futures = "0.1.2"
+embassy-net-driver = "0.2.0"
+# KOTO-0239: embassy-net 0.7 unifies onto this tree's embassy-time 0.5.1 and
+# embassy-net-driver 0.2.0 (pulls smoltcp 0.12). Optional and gated by the
+# `network_service` feature so default/offline product builds link none of it.
+embassy-net = { version = "0.7", default-features = false, features = [
+    "proto-ipv4",
+    "dhcpv4",
+    "dns",
+    "tcp",
+    "udp",
+], optional = true }
 embassy-rp = { version = "0.10.0", features = [
     "critical-section-impl",
     "executor-thread",
@@ -26,6 +37,18 @@ embassy-time = "0.5.1"
 embassy-usb = { version = "0.6.0", default-features = false }
 embedded-hal = "1.0.0"
 embedded-hal-bus = "0.2.0"
+# KOTO-0245 evaluation-only TLS target. These remain unreachable from every
+# product feature; only the isolated target-layout probe enables them.
+embedded-io = { version = "0.7.1", default-features = false, optional = true }
+embedded-io-async = { version = "0.7.0", default-features = false, optional = true }
+# embassy-net 0.7 still implements the 0.6 embedded-io traits. These aliases
+# are evaluation-only inputs to the fail-closed compatibility adapter below.
+embedded-io-06 = { package = "embedded-io", version = "0.6.1", default-features = false, optional = true }
+embedded-io-async-06 = { package = "embedded-io-async", version = "0.6.1", default-features = false, optional = true }
+embedded-tls = { version = "0.19.0", default-features = false, optional = true }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "sha256"], optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
+rand_core = { version = "0.6.4", default-features = false, optional = true }
 embedded-sdmmc = { version = "0.9.0", default-features = false }
 # Ported bounded audio runtime (sibling project, KOTO-0165). The CPU1 worker
 # drives its DefaultAudioService plus owned runtime-cue players. Package KMML is
@@ -36,6 +59,7 @@ koto-audio = { path = "../koto-audio/crates/koto-audio", features = [
 koto-core = { path = "../koto-core" }
 koto-game2d = { path = "../koto-game2d" }
 koto-gfx = { path = "../koto-gfx" }
+koto-ui = { path = "../koto-ui" }
 koto-psram = { path = "../koto-psram", optional = true }
 panic-halt = "1.0.0"
 pio = "0.3.0"
@@ -94,6 +118,47 @@ path = "src/bin/probe_audio.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "probe_wifi_residency"
+path = "src/bin/probe_wifi_residency.rs"
+test = false
+bench = false
+required-features = ["board-picocalc-picow"]
+
+[[bin]]
+name = "probe_wifi_minimal"
+path = "src/bin/probe_wifi_minimal.rs"
+test = false
+bench = false
+required-features = ["board-picocalc-pico2w"]
+
+# KOTO-0239 compile/link + SRAM-budget probe for the bounded embassy-net IP
+# stack. Exposes size symbols so the residency memory report can account the IP
+# stack row on both W boards.
+[[bin]]
+name = "probe_network_service"
+path = "src/bin/probe_network_service.rs"
+test = false
+bench = false
+required-features = ["network_service"]
+
+# KOTO-0245 target-layout probe for the portable app Fetch control plane. This
+# intentionally uses the zero-sized unavailable backend and links no IP/TLS.
+[[bin]]
+name = "probe_app_fetch_service"
+path = "src/bin/probe_app_fetch_service.rs"
+test = false
+bench = false
+
+# KOTO-0245 isolated embedded-tls layout/flash experiment. It is intentionally
+# unavailable to product firmware and must not be added to a board feature.
+[[bin]]
+name = "probe_app_fetch_tls"
+path = "src/bin/probe_app_fetch_tls.rs"
+test = false
+bench = false
+required-features = ["app_fetch_tls_probe"]
+
 [features]
 # `ram_interpreter` is default-on since KOTO-0170 Stage 1: the phase=176 stack
 # canary measured the real core-0 main-stack peak at 68,588 B on the worst-case
@@ -113,6 +178,7 @@ default = ["board-picocalc-pico", "ram_interpreter", "ram_audio_mixer"]
 # policy so adding a board does not spread MCU/board combinations across build
 # commands or runtime source. lib.rs rejects zero or multiple board selections.
 board-picocalc-pico = ["mcu-rp2040", "psram_fast_code_window"]
+board-picocalc-picow = ["mcu-rp2040", "psram_fast_code_window"]
 board-picocalc-pico2w = ["mcu-rp235xa", "psram_fast_code_window"]
 # Internal MCU selection used by Embassy, PAC-level code, and the linker. Build
 # entry points should select a board feature rather than either feature below.
@@ -157,6 +223,70 @@ legacy_psram = []
 # firmware boots and runs its bounded SRAM path when baseboard PSRAM is absent.
 # The normal artifact never enables this feature.
 force_psram_fallback = []
+# KOTO-0239 bounded NetworkService IP stack. Enables embassy-net and the
+# firmware net-stack storage/integration. Off by default so offline product
+# builds link no IP stack, sockets, or DHCP/DNS state.
+network_service = ["dep:embassy-net"]
+# Evaluation-only embedded-tls dependency island for probe_app_fetch_tls.
+app_fetch_tls_probe = [
+    "dep:embedded-io",
+    "dep:embedded-io-async",
+    "dep:embedded-tls",
+]
+# Links and instantiates the handshake state machine. Keeping this separate
+# produces a same-binary baseline for incremental flash measurement.
+app_fetch_tls_handshake_probe = ["app_fetch_tls_probe", "dep:rand_core"]
+# Compiles the embassy-net embedded-io 0.6 -> embedded-tls 0.7 adapter without
+# making TLS reachable from any product board feature.
+app_fetch_tls_socket_adapter_probe = [
+    "app_fetch_tls_handshake_probe",
+    "network_service",
+    "dep:embedded-io-06",
+    "dep:embedded-io-async-06",
+]
+# Adds the pin-only, time-independent P-256 CertificateVerify implementation
+# to the isolated TLS probe. It remains unreachable from product features.
+app_fetch_tls_verifier_probe = [
+    "app_fetch_tls_socket_adapter_probe",
+    "koto-core/app_fetch_tls_verifier",
+    "dep:p256",
+    "dep:sha2",
+]
+# KOTO-0245 product HTTPS Fetch transport. Links the SPKI-pinned TLS 1.3
+# session (embedded-tls + P-256 CertificateVerify) into the arena-owned
+# network future. RP2040 runs it inside the TLS/audio-exclusive PCM workspace;
+# RP2350A uses a dedicated static TLS workspace and keeps audio concurrent.
+# Additive on top of `network_service` product builds.
+app_fetch_https = [
+    "network_service",
+    "koto-core/app_fetch_tls_verifier",
+    "dep:embedded-io",
+    "dep:embedded-io-async",
+    "dep:embedded-io-06",
+    "dep:embedded-io-async-06",
+    "dep:embedded-tls",
+    "dep:rand_core",
+    "dep:p256",
+    "dep:sha2",
+]
+# Device-validation-only KOTO-0227 lifecycle probe. On Pico W this performs
+# the 100-round-trip audio -> CYW43 -> audio acceptance soak during boot.
+wifi_residency_probe = []
+# Device-validation-only KOTO-0227 five-minute WifiStreamAudio product-path
+# soak (Pico W only): after SD init it holds one residency transition while
+# alternating PCM16/SLDPCM4 KACL streams from sample_audio_codecs.kpa against
+# continuous bounded CYW43 packet staging. Replaces the boot-time 100-trip
+# loop in this image.
+wifi_stream_soak_probe = ["wifi_residency_probe"]
+# Diagnostic A/B profile for KOTO-0227. This restores the crates.io 0.10
+# TX-then-RX ordering while retaining separate DMA channel ownership.
+wifi_pio_sequential_probe = ["wifi_residency_probe", "cyw43-pio/sequential-dma-probe"]
+# Diagnostic A/B profile for the independent Pico 2 W Wi-Fi probe. It keeps
+# direct PioSpi but swaps the upstream-example DMA0/1 pair for product DMA2/3.
+wifi_minimal_dma23_probe = []
+# Diagnostic A/B profile that keeps the successful minimal DMA2/3 lifecycle
+# but wraps direct PioSpi in the product CooperativePioSpi implementation.
+wifi_minimal_cooperative_probe = ["wifi_minimal_dma23_probe"]
 # Fast CodeWindow refill (KOTO-0153; default-on since KOTO-0171 on RP2040 and
 # enabled by the RP2350A MCU profile after KOTO-0205 parity validation). The default
 # `koto-psram` backend attempts the hardware-validated `FastFallingClkdiv2`

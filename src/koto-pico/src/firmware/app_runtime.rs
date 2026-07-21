@@ -1,7 +1,7 @@
 //! Stage, verify, and run a launching app's bytecode (KOTO-0127), plus the
 //! keyboard FIFO read and per-frame input snapshot the app session consumes.
 
-use core::{cell::UnsafeCell, fmt::Write};
+use core::{fmt::Write, task::Context};
 
 use embassy_rp::i2c::I2c;
 use embassy_rp::peripherals;
@@ -24,7 +24,8 @@ use koto_gfx::{BudgetObservation, FullRepaintReason, APP_DRAW_BUDGET};
 
 use crate::dashboard::LineBuffer;
 use crate::firmware::app_host::{
-    AppDrawCommand, AppStaticLayer, DeviceHost, DeviceRuntimeHost, StaticLayerShadow,
+    AppDrawCommand, AppStaticLayer, DeviceFetchSession, DeviceHost, DeviceHostSkk,
+    DeviceRuntimeHost, ManifestFetchResident, StaticLayerShadow,
 };
 // DIAG-0001 Stage 2: `phase=161` command sample and `phase=154/155/162` draw
 // usage/overflow are now routed through `DIAG_PROFILE` at their emit sites (the
@@ -32,12 +33,19 @@ use crate::firmware::app_host::{
 // formatters import unconditionally — a disabled profile branch is const-folded
 // away at the call site instead.
 use crate::firmware::app_render::log_command_sample;
-use crate::firmware::audio::{PicoAudioBackend, RUNTIME_CUE_IMAGE_CAPACITY};
+use crate::firmware::audio::{
+    try_load_rich_audio_image, LoadedAudioImage, PicoAudioBackend, RichImageError,
+};
+use crate::firmware::audio_scratch::{
+    record_cold_cue_load, record_cue_cache_hit, record_load_acquisition, record_pcm16_stream_start,
+    record_sld4_stream_start, regression_stages as audio_regression_stages,
+    reset_diagnostics as reset_audio_scratch_diagnostics, stats as audio_scratch_stats,
+};
 use crate::firmware::config::{
-    DiagClass, FirmwareClock, CODE_WINDOW_TOTAL_BYTES, DEVICE_CODE_CEILING, DEVICE_FRAME_FUEL,
-    DEVICE_VM_CALL_DEPTH, DEVICE_VM_STACK_SLOTS, DIAG_PROFILE, KEYBOARD_REGISTER_SETTLE_US,
-    MANIFEST_LFN_BYTES, MAX_APP_DRAW_COMMANDS, MAX_DEVICE_HEAP_BYTES, MAX_EVENTS_PER_FRAME,
-    RASTER_STRIP_BYTES, RGB666_STRIP_BYTES,
+    DiagClass, FirmwareClock, APP_PSRAM_LIMIT, CODE_WINDOW_TOTAL_BYTES, DEVICE_CODE_CEILING,
+    DEVICE_FRAME_FUEL, DEVICE_VM_CALL_DEPTH, DEVICE_VM_STACK_SLOTS, DIAG_PROFILE,
+    KEYBOARD_REGISTER_SETTLE_US, MANIFEST_LFN_BYTES, MAX_APP_DRAW_COMMANDS, MAX_DEVICE_HEAP_BYTES,
+    MAX_EVENTS_PER_FRAME, RASTER_STRIP_BYTES, RGB666_STRIP_BYTES,
 };
 use crate::firmware::diag::{
     log_app_budget_observation, log_app_cmdshift_correlation, log_app_cmdshift_probe,
@@ -63,6 +71,194 @@ use crate::psram::dma_code_window_read_trace_snapshot;
     feature = "psram_dma_read_code_window_diag"
 ))]
 use crate::psram::DmaCodeWindowPsram;
+
+/// One bounded cooperative service that must continue while an app owns the
+/// main loop. Network runtimes implement this without exposing their stack or
+/// sockets to the VM host.
+pub trait AppBackgroundService {
+    fn poll_once(&mut self, context: &mut Context<'_>);
+
+    fn service_tls_audio_exclusion(&mut self, _: &mut PicoAudioBackend) {}
+
+    fn cancel_tls_audio_exclusion(&mut self) {}
+
+    fn tls_audio_exclusion_pending(&mut self) -> bool {
+        false
+    }
+
+    fn fetch_available(&self) -> bool {
+        false
+    }
+
+    fn fetch_start(
+        &mut self,
+        _: koto_core::FetchRequestId,
+        _: &str,
+        _: koto_core::FetchPinSet,
+    ) -> Result<(), koto_core::FetchError> {
+        Err(koto_core::FetchError::Unavailable)
+    }
+
+    fn fetch_poll(&mut self, _: koto_core::FetchRequestId) -> koto_core::BackendPoll {
+        koto_core::BackendPoll::Failed(koto_core::FetchError::Unavailable)
+    }
+
+    fn fetch_read(
+        &mut self,
+        _: koto_core::FetchRequestId,
+        _: &mut [u8],
+    ) -> Result<usize, koto_core::FetchError> {
+        Err(koto_core::FetchError::Unavailable)
+    }
+
+    fn fetch_cancel(&mut self, _: koto_core::FetchRequestId) {}
+}
+
+#[derive(Default)]
+pub struct NoopAppBackgroundService;
+
+impl AppBackgroundService for NoopAppBackgroundService {
+    fn poll_once(&mut self, _: &mut Context<'_>) {}
+}
+
+impl<T: AppBackgroundService> AppBackgroundService for Option<T> {
+    fn poll_once(&mut self, context: &mut Context<'_>) {
+        if let Some(service) = self.as_mut() {
+            service.poll_once(context);
+        }
+    }
+
+    fn service_tls_audio_exclusion(&mut self, audio: &mut PicoAudioBackend) {
+        if let Some(service) = self.as_mut() {
+            service.service_tls_audio_exclusion(audio);
+        }
+    }
+
+    fn cancel_tls_audio_exclusion(&mut self) {
+        if let Some(service) = self.as_mut() {
+            service.cancel_tls_audio_exclusion();
+        }
+    }
+
+    fn tls_audio_exclusion_pending(&mut self) -> bool {
+        self.as_mut()
+            .is_some_and(AppBackgroundService::tls_audio_exclusion_pending)
+    }
+
+    fn fetch_available(&self) -> bool {
+        self.as_ref()
+            .is_some_and(AppBackgroundService::fetch_available)
+    }
+
+    fn fetch_start(
+        &mut self,
+        request: koto_core::FetchRequestId,
+        url: &str,
+        pins: koto_core::FetchPinSet,
+    ) -> Result<(), koto_core::FetchError> {
+        self.as_mut()
+            .ok_or(koto_core::FetchError::Unavailable)?
+            .fetch_start(request, url, pins)
+    }
+
+    fn fetch_poll(&mut self, request: koto_core::FetchRequestId) -> koto_core::BackendPoll {
+        self.as_mut().map_or(
+            koto_core::BackendPoll::Failed(koto_core::FetchError::Unavailable),
+            |service| service.fetch_poll(request),
+        )
+    }
+
+    fn fetch_read(
+        &mut self,
+        request: koto_core::FetchRequestId,
+        dst: &mut [u8],
+    ) -> Result<usize, koto_core::FetchError> {
+        self.as_mut()
+            .ok_or(koto_core::FetchError::Unavailable)?
+            .fetch_read(request, dst)
+    }
+
+    fn fetch_cancel(&mut self, request: koto_core::FetchRequestId) {
+        if let Some(service) = self.as_mut() {
+            service.fetch_cancel(request);
+        }
+    }
+}
+
+#[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+impl<A: crate::firmware::wifi_residency::WifiRuntimeArena> AppBackgroundService
+    for crate::firmware::wifi_residency::WifiRuntime<A>
+{
+    fn poll_once(&mut self, context: &mut Context<'_>) {
+        self.service_with_context(context);
+    }
+
+    fn fetch_available(&self) -> bool {
+        // KOTO-0245: RP2040 uses its TLS/audio ownership interval; RP2350A
+        // uses a dedicated concurrent TLS workspace. Profiles without the
+        // product HTTPS feature keep the stable `Unavailable` result.
+        cfg!(feature = "app_fetch_https") && self.is_active()
+    }
+
+    fn service_tls_audio_exclusion(&mut self, audio: &mut PicoAudioBackend) {
+        #[cfg(feature = "mcu-rp2040")]
+        crate::firmware::wifi_residency::WifiRuntime::service_tls_audio_exclusion(self, audio);
+        #[cfg(not(feature = "mcu-rp2040"))]
+        let _ = audio;
+    }
+
+    fn cancel_tls_audio_exclusion(&mut self) {
+        let coordinator = self.fetch_mailbox().tls_audio();
+        if let Some(token) = coordinator.active_token() {
+            let _ = coordinator.request_cancel(token);
+        }
+    }
+
+    fn tls_audio_exclusion_pending(&mut self) -> bool {
+        crate::firmware::wifi_residency::WifiRuntime::tls_audio_exclusion_pending(self)
+    }
+
+    fn fetch_start(
+        &mut self,
+        request: koto_core::FetchRequestId,
+        url: &str,
+        pins: koto_core::FetchPinSet,
+    ) -> Result<(), koto_core::FetchError> {
+        self.fetch_mailbox()
+            .with_mut(|mailbox| mailbox.submit(request, url, pins))
+    }
+
+    fn fetch_poll(&mut self, request: koto_core::FetchRequestId) -> koto_core::BackendPoll {
+        // `poll_mut` records the app's Headers observation so the transport
+        // producer can hold the first body chunk until success metadata has
+        // been seen once (KotoSim parity).
+        self.fetch_mailbox()
+            .with_mut(|mailbox| mailbox.poll_mut(request))
+    }
+
+    fn fetch_read(
+        &mut self,
+        request: koto_core::FetchRequestId,
+        dst: &mut [u8],
+    ) -> Result<usize, koto_core::FetchError> {
+        self.fetch_mailbox()
+            .with_mut(|mailbox| mailbox.read_body(request, dst))
+    }
+
+    fn fetch_cancel(&mut self, request: koto_core::FetchRequestId) {
+        self.fetch_mailbox().with_mut(|mailbox| {
+            if matches!(
+                mailbox.state(),
+                koto_core::FetchTransportState::Complete | koto_core::FetchTransportState::Failed
+            ) {
+                let _ = mailbox.release_terminal(request);
+            } else {
+                let _ = mailbox.request_cancel(request);
+            }
+        });
+        self.cancel_tls_audio_exclusion();
+    }
+}
 #[cfg(all(
     feature = "psram_dma_read_code_window",
     feature = "psram_dma_read_code_window_diag"
@@ -113,26 +309,6 @@ use crate::psram_ext::{
 };
 
 const AUDIO_CUE_CACHE_ENTRIES: usize = 16;
-
-struct AudioLoadScratch {
-    image: [u8; RUNTIME_CUE_IMAGE_CAPACITY],
-}
-
-impl AudioLoadScratch {
-    const fn new() -> Self {
-        Self {
-            image: [0; RUNTIME_CUE_IMAGE_CAPACITY],
-        }
-    }
-}
-
-/// CPU0 is the sole accessor. Keeping this large scratch outside the embassy
-/// future avoids adding ~22 KiB to the main task and does not mask interrupts
-/// during SD I/O or KMML compilation.
-struct Cpu0AudioScratch(UnsafeCell<AudioLoadScratch>);
-unsafe impl Sync for Cpu0AudioScratch {}
-static AUDIO_LOAD_SCRATCH: Cpu0AudioScratch =
-    Cpu0AudioScratch(UnsafeCell::new(AudioLoadScratch::new()));
 
 #[derive(Clone, Copy)]
 struct AudioCueCacheEntry {
@@ -478,12 +654,16 @@ impl QpiCodeWindowCounters {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run_device_app<D>(
+pub async fn run_device_app<D, B>(
     volume_mgr: &VolumeManager<D, FirmwareClock>,
     package: PackageInfo,
+    config_snapshot: koto_core::ConfigSnapshot,
+    ui_session: &mut koto_core::UiSession,
     psram: &mut Option<PsramBlocks<FirmwarePsramHal<'_>>>,
     code_window: &mut [u8; CODE_WINDOW_TOTAL_BYTES],
     heap: &mut [u8; MAX_DEVICE_HEAP_BYTES],
+    manifest_fetch: &mut ManifestFetchResident,
+    background: &mut B,
     lfn_storage: &mut [u8; MANIFEST_LFN_BYTES],
     keyboard: &mut I2c<'_, peripherals::I2C1, embassy_rp::i2c::Blocking>,
     lcd: &mut PicoCalcLcd<'_>,
@@ -501,10 +681,12 @@ pub async fn run_device_app<D>(
     // what the panel already shows instead of forcing a whole-surface repaint.
     static_shadow: &mut StaticLayerShadow,
     audio: &mut PicoAudioBackend,
+    skk: &mut DeviceHostSkk,
     uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
 ) where
     D: BlockDevice,
     D::Error: core::fmt::Debug,
+    B: AppBackgroundService,
 {
     if package.runtime() != Some("kotoruntime-bytecode") {
         audio.stop();
@@ -530,6 +712,7 @@ pub async fn run_device_app<D>(
         psram.as_mut(),
         code_window,
         heap,
+        manifest_fetch,
         lfn_storage,
         uart,
     ) else {
@@ -549,6 +732,7 @@ pub async fn run_device_app<D>(
     if staged.used_psram {
         let Some(psram) = psram.as_mut() else {
             uart_log(uart, "phase=255 launch-memory-budget-error\r\n");
+            manifest_fetch.deactivate_fetch(background);
             return;
         };
         #[cfg(all(
@@ -580,6 +764,8 @@ pub async fn run_device_app<D>(
         run_app_session(
             volume_mgr,
             &package,
+            config_snapshot,
+            ui_session,
             &mut code,
             &header,
             staged.file_len,
@@ -597,6 +783,9 @@ pub async fn run_device_app<D>(
             static_layer,
             static_shadow,
             audio,
+            skk,
+            manifest_fetch.fetch_mut(),
+            background,
             uart,
         )
         .await;
@@ -605,6 +794,8 @@ pub async fn run_device_app<D>(
         run_app_session(
             volume_mgr,
             &package,
+            config_snapshot,
+            ui_session,
             &mut code,
             &header,
             staged.file_len,
@@ -622,9 +813,38 @@ pub async fn run_device_app<D>(
             static_layer,
             static_shadow,
             audio,
+            skk,
+            manifest_fetch.fetch_mut(),
+            background,
             uart,
         )
         .await;
+    }
+    manifest_fetch.deactivate_fetch(background);
+    drain_tls_audio_shutdown(audio, background).await;
+}
+
+async fn drain_tls_audio_shutdown<B: AppBackgroundService>(
+    audio: &mut PicoAudioBackend,
+    background: &mut B,
+) {
+    const RESTORE_TIMEOUT_MS: u64 = 2_000;
+    background.cancel_tls_audio_exclusion();
+    let started = Instant::now();
+    while background.tls_audio_exclusion_pending()
+        && started.elapsed().as_millis() < RESTORE_TIMEOUT_MS
+    {
+        for _ in 0..8 {
+            core::future::poll_fn(|context| {
+                background.poll_once(context);
+                core::task::Poll::Ready(())
+            })
+            .await;
+            embassy_futures::yield_now().await;
+        }
+        audio.service();
+        background.service_tls_audio_exclusion(audio);
+        Timer::after_millis(1).await;
     }
 }
 
@@ -633,9 +853,11 @@ pub async fn run_device_app<D>(
 /// `code` source is the only platform-specific piece: PicoCalc passes a PSRAM
 /// window, but this body is identical to KotoSim's session loop.
 #[allow(clippy::too_many_arguments)]
-async fn run_app_session<C, D>(
+async fn run_app_session<C, D, B>(
     volume_mgr: &VolumeManager<D, FirmwareClock>,
     package: &PackageInfo,
+    config_snapshot: koto_core::ConfigSnapshot,
+    ui_session: &mut koto_core::UiSession,
     code: &mut C,
     header: &[u8],
     file_len: usize,
@@ -657,11 +879,15 @@ async fn run_app_session<C, D>(
     static_layer: &mut AppStaticLayer,
     static_shadow: &mut StaticLayerShadow,
     audio: &mut PicoAudioBackend,
+    skk: &mut DeviceHostSkk,
+    fetch: &mut DeviceFetchSession,
+    background: &mut B,
     uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
 ) where
     C: CodeSource + CodeWindowVerifyExt,
     D: BlockDevice,
     D::Error: core::fmt::Debug,
+    B: AppBackgroundService,
 {
     let mut session =
         match BytecodeSession::<DEVICE_VM_STACK_SLOTS, DEVICE_VM_CALL_DEPTH>::new_streaming(
@@ -725,13 +951,19 @@ async fn run_app_session<C, D>(
     let mut host = DeviceHost::new(
         volume_mgr,
         package.app_id(),
+        config_snapshot,
+        ui_session,
         &heap[..heap_len],
         &mut current_slot[0],
         static_layer,
         audio,
         package_file,
+        skk,
+        fetch,
+        background,
     );
     let mut audio_cache = [AudioCueCacheEntry::EMPTY; AUDIO_CUE_CACHE_ENTRIES];
+    reset_audio_scratch_diagnostics();
     let mut audio_next_address =
         align_psram_address(staged_code_base_addr.saturating_add(staged_code_size as u32));
     host.load_skk();
@@ -841,6 +1073,17 @@ async fn run_app_session<C, D>(
 
     loop {
         let frame_started = Instant::now();
+        // Match the shell's bounded network work budget. Each poll retains the
+        // app frame's waker for Embassy timers/driver IRQs, but never exposes a
+        // network handle to the VM or lets background work run unbounded.
+        for _ in 0..8 {
+            core::future::poll_fn(|context| {
+                host.poll_background_once(context);
+                core::task::Poll::Ready(())
+            })
+            .await;
+            embassy_futures::yield_now().await;
+        }
         let mut latest = None;
         let mut f3_pressed = false;
         for _ in 0..MAX_EVENTS_PER_FRAME.min(FIFO_CAPACITY) {
@@ -913,6 +1156,44 @@ async fn run_app_session<C, D>(
                 #[cfg(feature = "psram_qpi_code_window_counters")]
                 cw_counters.log(uart, package.app_id(), "app_exit");
                 let mut line = LineBuffer::new();
+                if package.app_id() == "dev.koto.samples.audio-codecs" {
+                    let scratch = audio_scratch_stats();
+                    let audio_regression = audio_regression_stages();
+                    let audio_stats = host.audio_stats();
+                    let passed = code == 0
+                        && audio_regression.pcm16_stream_starts > 0
+                        && audio_regression.sld4_stream_starts > 0
+                        && audio_regression.cold_cue_loads >= 2
+                        && audio_regression.cue_cache_hits >= 100
+                        && scratch.rejected_acquisitions == 0
+                        && scratch.corruption_failures == 0
+                        && audio_stats.drops == 0
+                        && audio_stats.underruns == 0
+                        && audio_stats.unsupported_count == 0
+                        && audio_stats.command_drops == 0
+                        && audio_stats.worker_heartbeat > 0;
+                    let _ = write!(
+                        line,
+                        "phase=226 audio-scratch-regression pcm16={} sld4={} cold={} hits={} load={} stream={} rejected={} corrupt={} drops={} underruns={} unsupported={} command_drops={} heartbeat={} core1_free={} result={}\r\n",
+                        audio_regression.pcm16_stream_starts,
+                        audio_regression.sld4_stream_starts,
+                        audio_regression.cold_cue_loads,
+                        audio_regression.cue_cache_hits,
+                        scratch.load_acquisitions,
+                        scratch.stream_acquisitions,
+                        scratch.rejected_acquisitions,
+                        scratch.corruption_failures,
+                        audio_stats.drops,
+                        audio_stats.underruns,
+                        audio_stats.unsupported_count,
+                        audio_stats.command_drops,
+                        audio_stats.worker_heartbeat,
+                        audio_stats.core1_stack_free_min,
+                        if passed { "pass" } else { "fail" },
+                    );
+                    uart_write_line(uart, &line);
+                    line.clear();
+                }
                 let _ = write!(line, "phase=153 app-exited code={}\r\n", code);
                 uart_write_line(uart, &line);
                 host.close_package_stream();
@@ -1448,6 +1729,41 @@ async fn run_app_session<C, D>(
                     code_window_log_tag(),
                 );
             }
+            // KOTO-0245 Fetch-transport terminal diagnostics: one bounded line
+            // per finished request (fixed error code, HTTP status, byte count,
+            // duration, and the TLS session-future admission pair — never
+            // URLs, header values, or body bytes). `result=0` is success;
+            // nonzero matches the `FetchError` discriminant. `tls_future=a/b`
+            // must satisfy a <= b or the session fell back to `Unavailable`.
+            #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+            if let Some(diag) = crate::firmware::wifi_residency::take_fetch_transport_diag() {
+                line.clear();
+                let _ = write!(
+                    line,
+                    "phase=245 fetch-diag seq={} req={:#010x} result={} status={} bytes={} elapsed_ms={} ip={}.{}.{}.{} conn_err={} tls_phase={} tls_io={}/{} reads={}/{} tls_future={}/{} crypto={}/{}\r\n",
+                    diag.sequence,
+                    diag.request_raw,
+                    diag.error_code,
+                    diag.status,
+                    diag.bytes,
+                    diag.elapsed_ms,
+                    diag.resolved_ip[0],
+                    diag.resolved_ip[1],
+                    diag.resolved_ip[2],
+                    diag.resolved_ip[3],
+                    diag.connect_error,
+                    diag.tls_phase,
+                    diag.tls_rx_bytes,
+                    diag.tls_tx_bytes,
+                    diag.tls_read_count,
+                    diag.tls_last_read_req,
+                    diag.session_future_bytes,
+                    diag.session_arena_bytes,
+                    diag.crypto_stack_peak,
+                    diag.crypto_stack_capacity,
+                );
+                uart_write_line(uart, &line);
+            }
             // Opt-in fast CodeWindow refill summary (KOTO-0153): whether the last
             // refill used the validated FastFallingClkdiv2 read, plus running
             // fast/fallback counts and the last fallback reason.
@@ -1548,7 +1864,7 @@ async fn run_app_session<C, D>(
                 line.clear();
                 let _ = write!(
                     line,
-                    "phase=173 audio-summary frame={} audio_events={} samples_submitted={} samples_played={} drops={} underruns={} unsupported_count={} buffer_level={} buffer_capacity={} command_drops={} bgm_starts={} bgm_stops={} bgm_voices={} sfx_voices={} mixer_saturations={} worker_late={} worker_max_jitter_us={} worker_heartbeat={} core1_stack_free_min={}\r\n",
+                    "phase=173 audio-summary frame={} audio_events={} samples_submitted={} samples_played={} drops={} underruns={} unsupported_count={} buffer_level={} buffer_capacity={} command_drops={} bgm_starts={} bgm_stops={} bgm_voices={} sfx_voices={} mixer_saturations={} worker_late={} worker_max_jitter_us={} worker_heartbeat={} core1_stack_free_min={} residency_state={:?} residency_generation={} worker_offline_generation={} worker_online_generation={} worker_rich_active={} transition_failures={} arena_guard_failures={}\r\n",
                     frame,
                     audio_stats.audio_events,
                     audio_stats.samples_submitted,
@@ -1568,6 +1884,24 @@ async fn run_app_session<C, D>(
                     audio_stats.worker_max_jitter_us,
                     audio_stats.worker_heartbeat,
                     audio_stats.core1_stack_free_min,
+                    audio_stats.residency_state,
+                    audio_stats.residency_generation,
+                    audio_stats.worker_offline_generation,
+                    audio_stats.worker_online_generation,
+                    u8::from(audio_stats.worker_rich_active),
+                    audio_stats.transition_failures,
+                    audio_stats.arena_guard_failures,
+                );
+                uart_write_line(uart, &line);
+                let scratch = audio_scratch_stats();
+                line.clear();
+                let _ = write!(
+                    line,
+                    "phase=173 audio-scratch load_acquisitions={} stream_acquisitions={} rejected_acquisitions={} corruption_failures={}\r\n",
+                    scratch.load_acquisitions,
+                    scratch.stream_acquisitions,
+                    scratch.rejected_acquisitions,
+                    scratch.corruption_failures,
                 );
                 uart_write_line(uart, &line);
             }
@@ -1646,8 +1980,8 @@ fn audio_asset_key(path: &str, bgm: bool) -> u64 {
     hash
 }
 
-fn service_pending_audio_asset<C, D>(
-    host: &mut DeviceHost<'_, D>,
+fn service_pending_audio_asset<C, D, B>(
+    host: &mut DeviceHost<'_, D, B>,
     code: &mut C,
     cache: &mut [AudioCueCacheEntry; AUDIO_CUE_CACHE_ENTRIES],
     next_address: &mut u32,
@@ -1656,6 +1990,7 @@ fn service_pending_audio_asset<C, D>(
     C: CodeWindowVerifyExt,
     D: BlockDevice,
     D::Error: core::fmt::Debug,
+    B: AppBackgroundService,
 {
     let Some(request) = host.take_audio_asset_request() else {
         return;
@@ -1663,6 +1998,11 @@ fn service_pending_audio_asset<C, D>(
     if request.path().ends_with(".kacl") {
         match host.start_streaming_audio_asset(request.path(), request.bgm) {
             Ok(true) => {
+                if request.path().contains("pcm16") {
+                    record_pcm16_stream_start();
+                } else if request.path().contains("sld4") {
+                    record_sld4_stream_start();
+                }
                 log_audio_asset_stage(uart, "streaming", request.path());
                 return;
             }
@@ -1674,68 +2014,96 @@ fn service_pending_audio_asset<C, D>(
         }
     }
     let key = audio_asset_key(request.path(), request.bgm);
-    // Safety: this routine runs only on CPU0, once between VM frames. CPU1
-    // receives a copy through AudioShared and never touches this scratch.
-    let scratch = unsafe { &mut *AUDIO_LOAD_SCRATCH.0.get() };
-
-    if let Some(entry) = cache.iter().find(|entry| entry.used && entry.key == key) {
-        let len = usize::from(entry.len);
-        log_audio_asset_stage(uart, "cache-read", request.path());
-        if code.asset_read(entry.address, &mut scratch.image[..len])
-            && host.play_loaded_audio_image(&scratch.image[..len], entry.bgm)
-        {
-            log_audio_asset_stage(uart, "queued", request.path());
-            return;
+    let mut failure_reported = false;
+    let load_result = try_load_rich_audio_image(|image| {
+        if let Some(entry) = cache.iter().find(|entry| entry.used && entry.key == key) {
+            record_cue_cache_hit();
+            let len = usize::from(entry.len);
+            log_audio_asset_stage(uart, "cache-read", request.path());
+            if code.asset_read(entry.address, &mut image[..len]) {
+                return Some(loaded_audio_image(&image[..len], entry.bgm));
+            }
+            host.audio_asset_diag("psram-read", request.path());
+            failure_reported = true;
+            return None;
         }
-        host.audio_asset_diag("psram-read", request.path());
-        return;
-    }
 
-    let image_len = match host.read_audio_asset(request.path(), &mut scratch.image) {
-        Ok(len) if len <= scratch.image.len() => len,
-        _ => {
-            host.audio_asset_diag("sd-read", request.path());
-            return;
+        let image_len = match host.read_audio_asset(request.path(), image) {
+            Ok(len) if len <= image.len() => len,
+            _ => {
+                host.audio_asset_diag("sd-read", request.path());
+                failure_reported = true;
+                return None;
+            }
+        };
+        record_cold_cue_load();
+        let magic = image.get(..4);
+        if image_len < 12 || !matches!(magic, Some(b"KAQ1") | Some(b"KACL")) {
+            host.audio_asset_diag("koto-audio-image", request.path());
+            failure_reported = true;
+            return None;
         }
-    };
-    let image = &mut scratch.image;
-    let magic = image.get(..4);
-    if image_len < 12 || !matches!(magic, Some(b"KAQ1") | Some(b"KACL")) {
-        host.audio_asset_diag("koto-audio-image", request.path());
-        return;
-    }
-    let Some(capacity) = code.asset_capacity() else {
-        host.audio_asset_diag("no-psram", request.path());
-        return;
-    };
-    let end = next_address.saturating_add(image_len as u32);
-    log_audio_asset_stage(uart, "psram-write", request.path());
-    if end > capacity || !code.asset_write(*next_address, &image[..image_len]) {
-        host.audio_asset_diag("psram-write", request.path());
-        return;
-    }
-    let Some(slot) = cache.iter_mut().find(|entry| !entry.used) else {
-        host.audio_asset_diag("cache-full", request.path());
-        return;
-    };
-    *slot = AudioCueCacheEntry {
-        key,
-        address: *next_address,
-        len: image_len as u16,
-        bgm: request.bgm,
-        used: true,
-    };
-    *next_address = align_psram_address(end);
+        let Some(capacity) = code.asset_capacity() else {
+            host.audio_asset_diag("no-psram", request.path());
+            failure_reported = true;
+            return None;
+        };
+        let end = next_address.saturating_add(image_len as u32);
+        log_audio_asset_stage(uart, "psram-write", request.path());
+        if end > capacity || !code.asset_write(*next_address, &image[..image_len]) {
+            host.audio_asset_diag("psram-write", request.path());
+            failure_reported = true;
+            return None;
+        }
+        let Some(slot) = cache.iter_mut().find(|entry| !entry.used) else {
+            host.audio_asset_diag("cache-full", request.path());
+            failure_reported = true;
+            return None;
+        };
+        *slot = AudioCueCacheEntry {
+            key,
+            address: *next_address,
+            len: image_len as u16,
+            bgm: request.bgm,
+            used: true,
+        };
+        *next_address = align_psram_address(end);
 
-    // Read back through the same copy-only PSRAM API used on cache hits. This
-    // makes PSRAM, not the compile scratch, the authoritative playback image.
-    log_audio_asset_stage(uart, "psram-read", request.path());
-    if !code.asset_read(slot.address, &mut image[..image_len])
-        || !host.play_loaded_audio_image(&image[..image_len], request.bgm)
-    {
-        host.audio_asset_diag("audio-queue", request.path());
+        // Read back through the same copy-only PSRAM API used on cache hits.
+        // This makes PSRAM, not the load view, authoritative for playback.
+        log_audio_asset_stage(uart, "psram-read", request.path());
+        if !code.asset_read(slot.address, &mut image[..image_len]) {
+            host.audio_asset_diag("audio-queue", request.path());
+            failure_reported = true;
+            None
+        } else {
+            Some(loaded_audio_image(&image[..image_len], request.bgm))
+        }
+    });
+    match load_result {
+        Err(RichImageError::TemporaryUnavailable) => {
+            host.audio_asset_diag("temporarily-unavailable", request.path())
+        }
+        Err(RichImageError::Busy) => host.audio_asset_diag("rich-image-busy", request.path()),
+        Ok(queued) => {
+            record_load_acquisition();
+            if queued {
+                log_audio_asset_stage(uart, "queued", request.path());
+            } else if !failure_reported {
+                host.audio_asset_diag("audio-queue", request.path());
+            }
+        }
+    }
+}
+
+fn loaded_audio_image(image: &[u8], bgm: bool) -> LoadedAudioImage {
+    if image.starts_with(b"KACL") {
+        LoadedAudioImage::Clip { len: image.len() }
     } else {
-        log_audio_asset_stage(uart, "queued", request.path());
+        LoadedAudioImage::Cue {
+            len: image.len(),
+            bgm,
+        }
     }
 }
 
@@ -1795,7 +2163,7 @@ impl CodeWindowVerifyExt for SliceCode<'_> {}
 
 impl<'a, 'b> CodeWindowVerifyExt for PsramCodeWindow<'a, FirmwarePsramHal<'b>> {
     fn asset_capacity(&self) -> Option<u32> {
-        Some(self.psram_capacity())
+        Some(self.psram_capacity().min(APP_PSRAM_LIMIT))
     }
 
     fn asset_read(&mut self, address: u32, dst: &mut [u8]) -> bool {
@@ -2485,6 +2853,13 @@ fn log_bad_bytecode_size_trace<C: CodeSource>(
 /// Every failure path logs a UART diagnostic and returns `None` so the caller
 /// returns to a usable Shell without a device reset.
 #[allow(clippy::too_many_arguments)]
+// KOTO-0252: `inline(never)` bounds the whole staging transient — KPA table
+// walk buffers, the ~1.3 KiB parsed `ManifestFetchPermission`, and the
+// 5.5 KiB + 3.6 KiB manifest-parse frames below it — to this launch-phase
+// frame. Inlined into `run_device_app`'s poll frame these slots stayed
+// resident under the entire app session and set the `phase=176 at=app`
+// low-water mark (56.9 KiB peak, KOTO-0170's long-standing dip).
+#[inline(never)]
 fn stage_app_code<D>(
     volume_mgr: &VolumeManager<D, FirmwareClock>,
     #[cfg_attr(
@@ -2497,6 +2872,7 @@ fn stage_app_code<D>(
     psram: Option<&mut PsramBlocks<FirmwarePsramHal<'_>>>,
     code_window: &mut [u8; CODE_WINDOW_TOTAL_BYTES],
     heap: &mut [u8; MAX_DEVICE_HEAP_BYTES],
+    manifest_fetch: &mut ManifestFetchResident,
     lfn_storage: &mut [u8; MANIFEST_LFN_BYTES],
     uart: &mut UartTx<'_, embassy_rp::uart::Blocking>,
 ) -> Option<StagedApp>
@@ -2579,6 +2955,25 @@ where
     let entry_count = u32::from_le_bytes(kpa_header[16..20].try_into().unwrap_or([0; 4]));
     let table_offset = u32::from_le_bytes(kpa_header[20..24].try_into().unwrap_or([0; 4]));
     let strings_offset = u32::from_le_bytes(kpa_header[24..28].try_into().unwrap_or([0; 4]));
+    let metadata_offset = u32::from_le_bytes(kpa_header[32..36].try_into().unwrap_or([0; 4]));
+    let metadata_size =
+        u32::from_le_bytes(kpa_header[36..40].try_into().unwrap_or([0; 4])) as usize;
+    let manifest = manifest_fetch.scratch();
+    if metadata_size > manifest.len()
+        || file.seek_from_start(metadata_offset).is_err()
+        || read_exact(&mut manifest[..metadata_size]).is_err()
+    {
+        uart_log(uart, "phase=254 launch-package-metadata-invalid\r\n");
+        return None;
+    }
+    let mut fetch_permission = koto_core::ManifestFetchPermission::empty();
+    if !crate::firmware::parse_package_fetch_permission_into(
+        &manifest[..metadata_size],
+        &mut fetch_permission,
+    ) {
+        uart_log(uart, "phase=254 launch-package-fetch-invalid\r\n");
+        return None;
+    }
     let mut record = [0u8; 64];
     let mut path_buf = [0u8; 96];
     let mut asset_range = None;
@@ -3085,6 +3480,11 @@ where
                 code_size, code_base_addr
             );
             uart_write_line(uart, &line);
+            manifest_fetch.activate_fetch(
+                app_id,
+                &fetch_permission.allowlist,
+                &fetch_permission.pins,
+            );
             Some(StagedApp {
                 file_len,
                 code_size,
@@ -3148,6 +3548,11 @@ where
                 code_size, code_base_addr
             );
             uart_write_line(uart, &line);
+            manifest_fetch.activate_fetch(
+                app_id,
+                &fetch_permission.allowlist,
+                &fetch_permission.pins,
+            );
             Some(StagedApp {
                 file_len,
                 code_size,

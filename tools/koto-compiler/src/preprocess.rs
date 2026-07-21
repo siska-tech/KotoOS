@@ -1,8 +1,10 @@
 //! KOTO-0183 textual include expansion.
 //!
-//! Before lexing, `include "relative/path.koto";` directive lines are replaced
-//! by the named file's contents (paths resolve against the *including* file's
-//! directory). The result compiles exactly like a single-file program, so a
+//! Before lexing, `include "relative/path.koto";` and
+//! `include <sdk/library.koto>;` directive lines are replaced by the named
+//! file's contents. Quoted paths resolve against the *including* file's
+//! directory; SDK paths resolve from the workspace root. The result compiles
+//! exactly like a single-file program, so a
 //! split is provably free: the token stream — and therefore the emitted
 //! bytecode — is identical to the unsplit source. A [`SourceMap`] records the
 //! originating file and line for every expanded line, and the crate boundary
@@ -165,7 +167,7 @@ impl Expansion<'_> {
                     self.lines.push((file_index, line_no));
                 }
                 IncludeLine::Malformed { col, message } => return Err(error(col, message)),
-                IncludeLine::Include { col, path } => {
+                IncludeLine::Include { col, path, kind } => {
                     if depth >= MAX_INCLUDE_DEPTH {
                         return Err(error(
                             col,
@@ -187,21 +189,41 @@ impl Expansion<'_> {
                             format!("include path must be relative, got \"{path}\""),
                         ));
                     }
-                    let parent = Path::new(&self.files[file_index])
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""));
-                    let resolved = normalize(&parent.join(&path));
+                    if kind == IncludeKind::Sdk && !valid_sdk_path(&path) {
+                        return Err(error(
+                            col,
+                            format!(
+                                "standard include path must start with `sdk/` and contain no `.` or `..` segments, got <{path}>"
+                            ),
+                        ));
+                    }
+                    let resolved = match kind {
+                        IncludeKind::Relative => {
+                            let parent = Path::new(&self.files[file_index])
+                                .parent()
+                                .unwrap_or_else(|| Path::new(""));
+                            normalize(&parent.join(&path))
+                        }
+                        IncludeKind::Sdk => normalize(Path::new(&path)),
+                    };
+                    let display_path = match kind {
+                        IncludeKind::Relative => format!("\"{path}\""),
+                        IncludeKind::Sdk => format!("<{path}>"),
+                    };
                     if !self.included.insert(resolved.clone()) {
                         return Err(error(
                             col,
                             format!(
-                                "\"{path}\" is already included; each file may be \
+                                "{display_path} is already included; each file may be \
                                  included once per program"
                             ),
                         ));
                     }
                     let source = self.loader.load(&resolved).map_err(|message| {
-                        error(col, format!("cannot read include \"{path}\": {message}"))
+                        error(
+                            col,
+                            format!("cannot read include {display_path}: {message}"),
+                        )
                     })?;
                     let display = resolved.to_string_lossy().replace('\\', "/");
                     self.files.push(display);
@@ -214,15 +236,29 @@ impl Expansion<'_> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IncludeKind {
+    Relative,
+    Sdk,
+}
+
 enum IncludeLine {
     NotADirective,
-    Include { col: usize, path: String },
-    Malformed { col: usize, message: String },
+    Include {
+        col: usize,
+        path: String,
+        kind: IncludeKind,
+    },
+    Malformed {
+        col: usize,
+        message: String,
+    },
 }
 
 /// Classify one raw source line. A directive is a whole line of the form
-/// `include "path";` (plus optional trailing `//` comment). The `include`
-/// keyword must be followed by whitespace and then a `"`, so identifiers like
+/// `include "path";` or `include <sdk/path>;` (plus optional trailing `//`
+/// comment). The `include` keyword must be followed by whitespace and then a
+/// `"` or `<`, so identifiers like
 /// `include_x` or calls like `include(x)` are ordinary code; but once a line
 /// commits to the directive prefix, malformed syntax is an error rather than
 /// silently compiling as an expression.
@@ -236,17 +272,33 @@ fn parse_include_line(raw_line: &str) -> IncludeLine {
         return IncludeLine::NotADirective;
     }
     let rest = rest.trim_start();
-    let Some(quoted) = rest.strip_prefix('"') else {
+    let (path, kind, after) = if let Some(quoted) = rest.strip_prefix('"') {
+        let Some(end) = quoted.find('"') else {
+            return IncludeLine::Malformed {
+                col,
+                message: "unterminated include path string".to_string(),
+            };
+        };
+        (
+            quoted[..end].to_string(),
+            IncludeKind::Relative,
+            quoted[end + 1..].trim_start(),
+        )
+    } else if let Some(standard) = rest.strip_prefix('<') {
+        let Some(end) = standard.find('>') else {
+            return IncludeLine::Malformed {
+                col,
+                message: "unterminated standard include path".to_string(),
+            };
+        };
+        (
+            standard[..end].to_string(),
+            IncludeKind::Sdk,
+            standard[end + 1..].trim_start(),
+        )
+    } else {
         return IncludeLine::NotADirective;
     };
-    let Some(end) = quoted.find('"') else {
-        return IncludeLine::Malformed {
-            col,
-            message: "unterminated include path string".to_string(),
-        };
-    };
-    let path = quoted[..end].to_string();
-    let after = quoted[end + 1..].trim_start();
     let Some(after) = after.strip_prefix(';') else {
         return IncludeLine::Malformed {
             col,
@@ -261,7 +313,14 @@ fn parse_include_line(raw_line: &str) -> IncludeLine {
             message: "unexpected text after include directive".to_string(),
         };
     }
-    IncludeLine::Include { col, path }
+    IncludeLine::Include { col, path, kind }
+}
+
+fn valid_sdk_path(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    matches!(components.next(), Some(Component::Normal(first)) if first == "sdk")
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
 /// Lexically normalize a path (fold `.` away, resolve `..` against named
@@ -352,6 +411,20 @@ mod tests {
     }
 
     #[test]
+    fn standard_sdk_include_resolves_from_the_workspace_root() {
+        let root = "include <sdk/koto_ui.koto>; // standard library\nfn main() { exit(0); }\n";
+        let (expanded, map) = expand_with(
+            "apps/demo/src/main.koto",
+            root,
+            &[("sdk/koto_ui.koto", "const UI = 1;\n")],
+        )
+        .expect("expands");
+        assert_eq!(expanded, "const UI = 1;\nfn main() { exit(0); }\n");
+        assert_eq!(map.resolve(1), ("sdk/koto_ui.koto", 1));
+        assert_eq!(map.resolve(2), ("apps/demo/src/main.koto", 2));
+    }
+
+    #[test]
     fn trailing_comment_is_allowed() {
         let root = "include \"util.koto\"; // helpers\n";
         let (expanded, _) =
@@ -414,6 +487,15 @@ mod tests {
             ("include \"\";\n", "include path is empty"),
             ("include \"/abs/a.koto\";\n", "must be relative"),
             ("include \"a\\\\b.koto\";\n", "must use `/`"),
+            (
+                "include <sdk/a.koto\n",
+                "unterminated standard include path",
+            ),
+            ("include <sdk/a.koto>\n", "expected `;`"),
+            ("include <>;\n", "include path is empty"),
+            ("include <sdk>;\n", "must start with `sdk/`"),
+            ("include <util.koto>;\n", "must start with `sdk/`"),
+            ("include <sdk/../secret.koto>;\n", "contain no `.` or `..`"),
         ] {
             let error = expand_with("test.koto", source, &[("a.koto", "")]).expect_err(source);
             assert!(error.message.contains(expected), "{source:?}: {error}");

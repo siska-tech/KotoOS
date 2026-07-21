@@ -13,7 +13,7 @@ pub const KBC_HEADER_SIZE: usize = 64;
 pub const KBC_VERSION_MAJOR: u16 = 1;
 pub const KBC_VERSION_MINOR: u16 = 0;
 pub const HOST_ABI_MAJOR: u16 = 1;
-pub const HOST_ABI_MINOR: u16 = 17;
+pub const HOST_ABI_MINOR: u16 = 23;
 /// Size of the VM local register file. Locals are shared across all of an app's
 /// functions (the compiler gives each function a non-overlapping `slot_base`),
 /// so this is the ceiling on *total* named locals a program may declare, less the
@@ -173,6 +173,101 @@ pub mod host_call {
     /// Read a range of a package asset. Args `(path_ptr, path_len, offset,
     /// dst_ptr, dst_max)`; returns bytes copied / `-1`.
     pub const ASSET_LOAD_RANGE: u8 = 0x45;
+    /// Start one allowlisted GET. Args `(url_ptr, url_len)`; returns request ID.
+    pub const FETCH_START: u8 = 0x46;
+    /// Poll request state. Arg `(request_id)`; returns `(state, metadata)`.
+    pub const FETCH_POLL: u8 = 0x47;
+    /// Copy response bytes. Args `(request_id, dst_ptr, dst_max)`; returns count.
+    pub const FETCH_READ: u8 = 0x48;
+    /// Cancel and invalidate one request. Arg `(request_id)`.
+    pub const FETCH_CANCEL: u8 = 0x49;
+
+    // Bounded incremental JSON decoding (Host ABI minor 20, KOTO-0246). The
+    // host owns one fixed-size decoder session per app; all payload bytes stay
+    // in caller-owned VM memory or the decoder's bounded token scratch.
+    /// Reset the host JSON decoder for a fresh document. No args.
+    pub const JSON_RESET: u8 = 0x4A;
+    /// Feed a chunk and pull one event. Args `(src_ptr, len)`; returns the
+    /// stable event code. Read `(consumed, depth)` via `JSON_STATUS`.
+    pub const JSON_NEXT: u8 = 0x4B;
+    /// Signal end of input. No args; returns the stable event code.
+    pub const JSON_FINISH: u8 = 0x4C;
+    /// Copy the most recent Key/Str/Number token. Args `(dst_ptr, dst_max)`;
+    /// returns byte count.
+    pub const JSON_TOKEN: u8 = 0x4D;
+    /// Read the sticky failure. No args; returns `(error_code, byte_offset)`,
+    /// `(0, 0)` while not failed.
+    pub const JSON_ERROR: u8 = 0x4E;
+    /// Read `(consumed, depth)` for the most recent `JSON_NEXT`. No args.
+    pub const JSON_STATUS: u8 = 0x4F;
+
+    // KotoUI retained application session (Host ABI minor 18).
+    /// Write the 64-byte KUC1 capability snapshot. Args `(dst_ptr, dst_max)`.
+    pub const UI_CAPABILITIES: u8 = 0x50;
+    /// Atomically mount one KUI1 packet. Args `(src_ptr, len)`.
+    pub const UI_MOUNT: u8 = 0x51;
+    /// Atomically apply one KUP1 packet. Args `(src_ptr, len)`.
+    pub const UI_UPDATE: u8 = 0x52;
+    /// Schedule all pending KotoUI damage. No args.
+    pub const UI_PRESENT: u8 = 0x53;
+    /// Write and dequeue one KUE1 semantic event. Args `(dst_ptr, dst_max)`.
+    pub const UI_POLL_EVENT: u8 = 0x54;
+    /// Clear the complete retained KotoUI session. No args.
+    pub const UI_RESET: u8 = 0x55;
+
+    /// Advisory time query (Host ABI minor 21, KOTO-0247). Arg `(kind)` from
+    /// `koto_core::time::app_time_query`; returns one value per kind: UTC
+    /// seconds (`-1` before synchronization), the configured UTC offset in
+    /// minutes, or 30-bit wrapping monotonic milliseconds. SNTP time stays
+    /// unauthenticated display/cache-age data; it never gates app execution.
+    pub const TIME_QUERY: u8 = 0x56;
+
+    // OS-owned application credential vault (Host ABI minor 22, KOTO-0248). The
+    // application never sees a secret byte: it resolves an opaque handle for a
+    // destination it is granted, then asks the OS to *use* it. The OS injects
+    // the credential inside its own authenticated transport after re-checking
+    // the app id, service, exact endpoint, and TLS.
+    /// Resolve the opaque credential handle for the running app and a
+    /// destination. Args `(service, url_ptr, url_len)`; returns the handle, or
+    /// `0` when no grant applies (default-denied). No secret is exposed.
+    pub const VAULT_HANDLE: u8 = 0x57;
+    /// Start one allowlisted GET with an OS-injected credential. Args
+    /// `(url_ptr, url_len, handle)`; returns a request ID. A zero, stale,
+    /// foreign, or off-endpoint handle fails closed with a fixed error before
+    /// any secret is touched.
+    pub const FETCH_START_AUTHENTICATED: u8 = 0x58;
+
+    // OS-owned bounded MQTT subscribe service (Host ABI minor 23, KOTO-0249).
+    // A foreground app receives bounded live telemetry through an OS-owned,
+    // capability-gated MQTT 3.1.1 QoS-0 subscribe profile. The app never sees a
+    // socket, TLS state, or credential byte: it names a manifest-declared broker
+    // and topic by index, then polls and drains complete messages into
+    // caller-owned bounded VM buffers. Handles are app-context-bound and
+    // generation-tagged; a stale, foreign, or unknown handle fails closed.
+    /// Open the session to manifest broker `broker_index`. Arg `(broker_index)`;
+    /// returns a generation-tagged session id, or a fixed error (one session per
+    /// app and one globally).
+    pub const MQTT_CONNECT: u8 = 0x59;
+    /// Subscribe to manifest exact topic filter `topic_index` on a connected
+    /// session. Args `(session, topic_index)`; returns `0`, else a fixed error.
+    pub const MQTT_SUBSCRIBE: u8 = 0x5A;
+    /// Advance and read the session lifecycle state. Arg `(session)`; returns one
+    /// of `Connecting`/`Connected`/`Message`/`Disconnected`/`Failed`.
+    pub const MQTT_POLL: u8 = 0x5B;
+    /// Read `(topic_len, payload_len)` of the oldest queued message without
+    /// consuming it, so the app can size buffers. Arg `(session)`; `(0, 0)` when
+    /// the queue is empty. Idempotent.
+    pub const MQTT_PEEK: u8 = 0x5C;
+    /// Copy and consume the oldest queued message into caller buffers. Args
+    /// `(session, topic_ptr, topic_max, payload_ptr, payload_max)`; returns `0`
+    /// (no message), `1` (delivered), or `2` (delivered retained). A message too
+    /// large for either buffer is consumed and fails closed, never truncated.
+    pub const MQTT_READ: u8 = 0x5D;
+    /// Disconnect and zeroize the session. Arg `(session)`; returns `0`.
+    pub const MQTT_DISCONNECT: u8 = 0x5E;
+    /// Read the saturating count of messages dropped by the OS queue overflow
+    /// policy (drop-oldest) for a session. Arg `(session)`. Idempotent.
+    pub const MQTT_DROPPED: u8 = 0x5F;
 
     // Text-composition / text-buffer service (host ABI minor 1). These keep the
     // VM neutral: the host owns the IME and editor models; bytecode drives them.
@@ -263,6 +358,32 @@ pub mod host_call {
             FILE_CLOSE => "file_close",
             ASSET_LOAD => "asset_load",
             ASSET_LOAD_RANGE => "asset_load_range",
+            FETCH_START => "fetch_start",
+            FETCH_POLL => "fetch_poll",
+            FETCH_READ => "fetch_read",
+            FETCH_CANCEL => "fetch_cancel",
+            JSON_RESET => "json_reset",
+            JSON_NEXT => "json_next",
+            JSON_FINISH => "json_finish",
+            JSON_TOKEN => "json_token",
+            JSON_ERROR => "json_error",
+            JSON_STATUS => "json_status",
+            UI_CAPABILITIES => "ui_capabilities",
+            UI_MOUNT => "ui_mount",
+            UI_UPDATE => "ui_update",
+            UI_PRESENT => "ui_present",
+            UI_POLL_EVENT => "ui_poll_event",
+            UI_RESET => "ui_reset",
+            TIME_QUERY => "time_query",
+            VAULT_HANDLE => "vault_handle",
+            FETCH_START_AUTHENTICATED => "fetch_start_authenticated",
+            MQTT_CONNECT => "mqtt_connect",
+            MQTT_SUBSCRIBE => "mqtt_subscribe",
+            MQTT_POLL => "mqtt_poll",
+            MQTT_PEEK => "mqtt_peek",
+            MQTT_READ => "mqtt_read",
+            MQTT_DISCONNECT => "mqtt_disconnect",
+            MQTT_DROPPED => "mqtt_dropped",
             IME_FEED_KEY => "ime_feed_key",
             IME_CONVERT => "ime_convert",
             IME_QUERY_LINE => "ime_query_line",
@@ -1212,6 +1333,9 @@ pub enum HostCallOutcome {
 }
 
 pub trait VmHost {
+    /// Called exactly once before bytecode resumes for an executable VM frame.
+    fn ui_frame_begin(&mut self, _input: VmInputSnapshot) {}
+
     fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, rgb565: i32) -> HostCallOutcome;
     fn draw_text(&mut self, x: i32, y: i32, text: &str) -> HostCallOutcome;
     /// Draw text in a caller-chosen RGB565 colour. The default ignores the colour
@@ -1437,6 +1561,168 @@ pub trait VmHost {
     ) -> HostCallOutcome {
         HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
     }
+
+    fn fetch_start(&mut self, _url: &str) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn fetch_poll(&mut self, _request_id: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn fetch_read(&mut self, _request_id: i32, _dst: &mut [u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn fetch_cancel(&mut self, _request_id: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    // Bounded incremental JSON decoding (Host ABI minor 20, KOTO-0246). Hosts
+    // back these with one `koto_core::JsonHostSession`; the defaults report
+    // unsupported so bare test hosts stay unaffected.
+
+    /// Reset the host JSON decoder session for a fresh document.
+    fn json_reset(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Feed `src` and pull one event; returns `Ok1(event_code)`. The bytes
+    /// consumed are read afterwards through [`Self::json_status`], because this
+    /// call is not idempotent and the VM's paired result aliases re-execute
+    /// their host call.
+    fn json_next(&mut self, _src: &[u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Signal end of input; returns `Ok1(event_code)`.
+    fn json_finish(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Copy the most recent Key/Str/Number token into `dst`; returns
+    /// `Ok1(len)`, or `BAD_ARGUMENT` when `dst` cannot hold the whole token
+    /// (tokens are never truncated).
+    fn json_token(&mut self, _dst: &mut [u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Read the sticky failure; returns `Ok2(error_code, byte_offset)`, with
+    /// `(0, 0)` while the decoder has not failed.
+    fn json_error(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Read `(consumed, depth)` for the most recent [`Self::json_next`].
+    fn json_status(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Advisory time query (Host ABI minor 21, KOTO-0247). `kind` selects UTC
+    /// seconds (`Ok1(-1)` while unsynchronized), the configured UTC offset in
+    /// minutes, or 30-bit wrapping monotonic milliseconds; an unknown `kind`
+    /// is `BAD_ARGUMENT`. The default reports unsupported so bare test hosts
+    /// stay unaffected.
+    fn time_query(&mut self, _kind: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Resolve the opaque credential handle for the running app and `url`
+    /// (KOTO-0248). `service` selects the service kind (`0` Fetch, `1` MQTT).
+    /// Returns `Ok1(handle)` with `0` meaning no grant applies; a secret is
+    /// never exposed. The default reports unsupported so bare test hosts stay
+    /// unaffected.
+    fn vault_handle(&mut self, _service: i32, _url: &str) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Start one allowlisted GET with the OS-owned credential named by `handle`
+    /// injected inside the authenticated transport (KOTO-0248). The host
+    /// re-checks the app id, service, exact endpoint, and TLS before injecting;
+    /// a zero/stale/foreign/off-endpoint handle fails closed. Returns
+    /// `Ok1(request_id)`. The default reports unsupported.
+    fn fetch_start_authenticated(&mut self, _url: &str, _handle: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    // OS-owned bounded MQTT subscribe service (Host ABI minor 23, KOTO-0249).
+    // Hosts back these with one `koto_core::AppMqttService` over an OS-private
+    // transport; the defaults report unsupported so bare test hosts and offline
+    // builds return a stable `Unavailable`.
+
+    /// Open a session to the manifest broker at `broker_index`. Returns
+    /// `Ok1(session_id)`; a generation-tagged, app-context-bound handle.
+    fn mqtt_connect(&mut self, _broker_index: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Subscribe a connected session to the manifest topic at `topic_index`.
+    /// Returns `Ok1(0)` on success.
+    fn mqtt_subscribe(&mut self, _session: i32, _topic_index: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Advance and read the session lifecycle state; returns `Ok1(state)`.
+    fn mqtt_poll(&mut self, _session: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Read `Ok2(topic_len, payload_len)` for the oldest queued message without
+    /// consuming it; `(0, 0)` when the queue is empty. Idempotent.
+    fn mqtt_peek(&mut self, _session: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Copy and consume the oldest queued message into `topic`/`payload`.
+    /// Returns `Ok1(0)` (no message), `Ok1(1)` (delivered), `Ok1(2)` (delivered
+    /// retained); a message too large for either buffer fails closed.
+    fn mqtt_read(
+        &mut self,
+        _session: i32,
+        _topic: &mut [u8],
+        _payload: &mut [u8],
+    ) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Disconnect and zeroize the session; returns `Ok1(0)`.
+    fn mqtt_disconnect(&mut self, _session: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Read the saturating drop-oldest overflow count for the session. Idempotent.
+    fn mqtt_dropped(&mut self, _session: i32) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Write the current KotoUI capability snapshot into `dst`.
+    fn ui_capabilities(&mut self, _dst: &mut [u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Validate, copy, and atomically replace the retained KotoUI session.
+    fn ui_mount(&mut self, _src: &[u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn ui_update(&mut self, _src: &[u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn ui_present(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn ui_poll_event(&mut self, _dst: &mut [u8]) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    fn ui_reset(&mut self) -> HostCallOutcome {
+        HostCallOutcome::Err(HostErrorCode::UNSUPPORTED)
+    }
+
+    /// Lifecycle cleanup used on exit and trap; it has no app-visible result.
+    fn ui_session_end(&mut self) {}
 
     /// Frame-stable typed-character input. Returns `(codepoint, intent_bits)`.
     /// The default reflects the current frame snapshot unchanged.
@@ -1839,6 +2125,7 @@ impl<const STACK: usize, const CALLS: usize> BytecodeVm<STACK, CALLS> {
         if fuel == 0 {
             return Ok(VmRunResult::FuelExhausted);
         }
+        host.ui_frame_begin(input);
         self.stats.frames = self.stats.frames.saturating_add(1);
 
         // H2-a bookkeeping hoist (KOTO-0169 Stage 3): the loop counts executed
@@ -1860,10 +2147,14 @@ impl<const STACK: usize, const CALLS: usize> BytecodeVm<STACK, CALLS> {
                 Ok(StepOutcome::Yielded) => break Ok(VmRunResult::Yielded),
                 Ok(StepOutcome::Exited(code)) => {
                     host.close_all_files();
+                    host.ui_session_end();
                     self.exited = Some(code);
                     break Ok(VmRunResult::Exited(code));
                 }
-                Err(error) => break Err(error),
+                Err(error) => {
+                    host.ui_session_end();
+                    break Err(error);
+                }
             }
         };
         self.last_frame_fuel = executed;
@@ -2487,6 +2778,221 @@ impl<const STACK: usize, const CALLS: usize> BytecodeVm<STACK, CALLS> {
                 self.push_host_outcome(outcome, 1)?;
                 Ok(StepOutcome::Continue)
             }
+            host_call::FETCH_START => {
+                let len = self.pop_usize()?;
+                let ptr = self.pop_usize()?;
+                const MAX_FETCH_URL_LEN: usize = 384;
+                if len > MAX_FETCH_URL_LEN {
+                    self.push_host_outcome(HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT), 1)?;
+                    return Ok(StepOutcome::Continue);
+                }
+                let Some(bytes) = heap_slice(heap, ptr, len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                let url = match core::str::from_utf8(bytes) {
+                    Ok(url) => url,
+                    Err(_) => {
+                        self.push_host_outcome(
+                            HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT),
+                            1,
+                        )?;
+                        return Ok(StepOutcome::Continue);
+                    }
+                };
+                self.push_host_outcome(host.fetch_start(url), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::FETCH_POLL => {
+                let request_id = self.pop()?;
+                self.push_host_outcome(host.fetch_poll(request_id), 2)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::FETCH_READ => {
+                let max = self.pop_usize()?;
+                let ptr = self.pop_usize()?;
+                let request_id = self.pop()?;
+                let Some(dst) = heap_slice_mut(heap, ptr, max) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                self.push_host_outcome(host.fetch_read(request_id, dst), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::FETCH_CANCEL => {
+                let request_id = self.pop()?;
+                self.push_host_outcome(host.fetch_cancel(request_id), 0)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::JSON_RESET => {
+                self.push_host_outcome(host.json_reset(), 0)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::JSON_NEXT => {
+                let len = self.pop_usize()?;
+                let ptr = self.pop_usize()?;
+                let Some(src) = heap_slice(heap, ptr, len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                self.push_host_outcome(host.json_next(src), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::JSON_FINISH => {
+                self.push_host_outcome(host.json_finish(), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::JSON_TOKEN => {
+                let max = self.pop_usize()?;
+                let dst_ptr = self.pop_usize()?;
+                let Some(dst) = heap_slice_mut(heap, dst_ptr, max) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                self.push_host_outcome(host.json_token(dst), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::JSON_ERROR => {
+                self.push_host_outcome(host.json_error(), 2)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::JSON_STATUS => {
+                self.push_host_outcome(host.json_status(), 2)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::TIME_QUERY => {
+                let kind = self.pop()?;
+                self.push_host_outcome(host.time_query(kind), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::VAULT_HANDLE => {
+                let len = self.pop_usize()?;
+                let ptr = self.pop_usize()?;
+                let service = self.pop()?;
+                const MAX_FETCH_URL_LEN: usize = 384;
+                if len > MAX_FETCH_URL_LEN {
+                    self.push_host_outcome(HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT), 1)?;
+                    return Ok(StepOutcome::Continue);
+                }
+                let Some(bytes) = heap_slice(heap, ptr, len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                let Ok(url) = core::str::from_utf8(bytes) else {
+                    self.push_host_outcome(HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT), 1)?;
+                    return Ok(StepOutcome::Continue);
+                };
+                self.push_host_outcome(host.vault_handle(service, url), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::FETCH_START_AUTHENTICATED => {
+                let handle = self.pop()?;
+                let len = self.pop_usize()?;
+                let ptr = self.pop_usize()?;
+                const MAX_FETCH_URL_LEN: usize = 384;
+                if len > MAX_FETCH_URL_LEN {
+                    self.push_host_outcome(HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT), 1)?;
+                    return Ok(StepOutcome::Continue);
+                }
+                let Some(bytes) = heap_slice(heap, ptr, len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                let Ok(url) = core::str::from_utf8(bytes) else {
+                    self.push_host_outcome(HostCallOutcome::Err(HostErrorCode::BAD_ARGUMENT), 1)?;
+                    return Ok(StepOutcome::Continue);
+                };
+                self.push_host_outcome(host.fetch_start_authenticated(url, handle), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::MQTT_CONNECT => {
+                let broker_index = self.pop()?;
+                self.push_host_outcome(host.mqtt_connect(broker_index), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::MQTT_SUBSCRIBE => {
+                let topic_index = self.pop()?;
+                let session = self.pop()?;
+                self.push_host_outcome(host.mqtt_subscribe(session, topic_index), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::MQTT_POLL => {
+                let session = self.pop()?;
+                self.push_host_outcome(host.mqtt_poll(session), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::MQTT_PEEK => {
+                let session = self.pop()?;
+                self.push_host_outcome(host.mqtt_peek(session), 2)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::MQTT_READ => {
+                let payload_max = self.pop_usize()?;
+                let payload_ptr = self.pop_usize()?;
+                let topic_max = self.pop_usize()?;
+                let topic_ptr = self.pop_usize()?;
+                let session = self.pop()?;
+                // Two disjoint mutable heap slices for one call: bounds-check and
+                // split them explicitly so neither aliases the other.
+                let Some((topic, payload)) =
+                    heap_two_slices_mut(heap, topic_ptr, topic_max, payload_ptr, payload_max)
+                else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                self.push_host_outcome(host.mqtt_read(session, topic, payload), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::MQTT_DISCONNECT => {
+                let session = self.pop()?;
+                self.push_host_outcome(host.mqtt_disconnect(session), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::MQTT_DROPPED => {
+                let session = self.pop()?;
+                self.push_host_outcome(host.mqtt_dropped(session), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::UI_CAPABILITIES => {
+                let max = self.pop_usize()?;
+                let dst_ptr = self.pop_usize()?;
+                let Some(dst) = heap_slice_mut(heap, dst_ptr, max) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                let outcome = host.ui_capabilities(dst);
+                self.push_host_outcome(outcome, 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::UI_MOUNT => {
+                let len = self.pop_usize()?;
+                let src_ptr = self.pop_usize()?;
+                let Some(src) = heap_slice(heap, src_ptr, len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                let outcome = host.ui_mount(src);
+                self.push_host_outcome(outcome, 0)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::UI_UPDATE => {
+                let len = self.pop_usize()?;
+                let src_ptr = self.pop_usize()?;
+                let Some(src) = heap_slice(heap, src_ptr, len) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                let outcome = host.ui_update(src);
+                self.push_host_outcome(outcome, 0)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::UI_PRESENT => {
+                self.push_host_outcome(host.ui_present(), 0)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::UI_POLL_EVENT => {
+                let max = self.pop_usize()?;
+                let dst_ptr = self.pop_usize()?;
+                let Some(dst) = heap_slice_mut(heap, dst_ptr, max) else {
+                    return Err(VmError::MemoryOutOfBounds);
+                };
+                self.push_host_outcome(host.ui_poll_event(dst), 1)?;
+                Ok(StepOutcome::Continue)
+            }
+            host_call::UI_RESET => {
+                self.push_host_outcome(host.ui_reset(), 0)?;
+                Ok(StepOutcome::Continue)
+            }
             host_call::TEXT_INPUT => {
                 self.push_host_outcome(host.text_input(input), 2)?;
                 Ok(StepOutcome::Continue)
@@ -2722,6 +3228,35 @@ fn heap_slice(heap: &[u8], ptr: usize, len: usize) -> Option<&[u8]> {
 fn heap_slice_mut(heap: &mut [u8], ptr: usize, len: usize) -> Option<&mut [u8]> {
     let end = ptr.checked_add(len)?;
     heap.get_mut(ptr..end)
+}
+
+/// Two disjoint mutable heap slices for a single host call that writes two
+/// caller buffers (an MQTT message's topic and payload). Returns `None` when
+/// either range is out of bounds or the two ranges overlap, so the two `&mut`
+/// never alias.
+fn heap_two_slices_mut(
+    heap: &mut [u8],
+    a_ptr: usize,
+    a_len: usize,
+    b_ptr: usize,
+    b_len: usize,
+) -> Option<(&mut [u8], &mut [u8])> {
+    let a_end = a_ptr.checked_add(a_len)?;
+    let b_end = b_ptr.checked_add(b_len)?;
+    if a_end > heap.len() || b_end > heap.len() {
+        return None;
+    }
+    // Reject any overlap so the two mutable borrows are provably disjoint.
+    if a_ptr < b_end && b_ptr < a_end {
+        return None;
+    }
+    if a_ptr <= b_ptr {
+        let (left, right) = heap.split_at_mut(b_ptr);
+        Some((&mut left[a_ptr..a_end], &mut right[..b_len]))
+    } else {
+        let (left, right) = heap.split_at_mut(a_ptr);
+        Some((&mut right[..a_len], &mut left[b_ptr..b_end]))
+    }
 }
 
 /// Byte length of a `frames`x`channels` i16 PCM buffer (`frames * channels * 2`),
@@ -2974,6 +3509,32 @@ fn known_host_call(id: u8) -> bool {
             | host_call::FILE_CLOSE
             | host_call::ASSET_LOAD
             | host_call::ASSET_LOAD_RANGE
+            | host_call::FETCH_START
+            | host_call::FETCH_POLL
+            | host_call::FETCH_READ
+            | host_call::FETCH_CANCEL
+            | host_call::JSON_RESET
+            | host_call::JSON_NEXT
+            | host_call::JSON_FINISH
+            | host_call::JSON_TOKEN
+            | host_call::JSON_ERROR
+            | host_call::JSON_STATUS
+            | host_call::UI_CAPABILITIES
+            | host_call::UI_MOUNT
+            | host_call::UI_UPDATE
+            | host_call::UI_PRESENT
+            | host_call::UI_POLL_EVENT
+            | host_call::UI_RESET
+            | host_call::TIME_QUERY
+            | host_call::VAULT_HANDLE
+            | host_call::FETCH_START_AUTHENTICATED
+            | host_call::MQTT_CONNECT
+            | host_call::MQTT_SUBSCRIBE
+            | host_call::MQTT_POLL
+            | host_call::MQTT_PEEK
+            | host_call::MQTT_READ
+            | host_call::MQTT_DISCONNECT
+            | host_call::MQTT_DROPPED
             | host_call::IME_FEED_KEY
             | host_call::IME_CONVERT
             | host_call::IME_QUERY_LINE
@@ -3038,6 +3599,32 @@ fn host_call_stack_effect(id: u8) -> (u16, u16) {
         host_call::FILE_CLOSE => (1, 1),
         host_call::ASSET_LOAD => (4, 2),
         host_call::ASSET_LOAD_RANGE => (5, 2),
+        host_call::FETCH_START => (2, 2),
+        host_call::FETCH_POLL => (1, 3),
+        host_call::FETCH_READ => (3, 2),
+        host_call::FETCH_CANCEL => (1, 1),
+        host_call::JSON_RESET => (0, 1),
+        host_call::JSON_NEXT => (2, 2),
+        host_call::JSON_FINISH => (0, 2),
+        host_call::JSON_TOKEN => (2, 2),
+        host_call::JSON_ERROR => (0, 3),
+        host_call::JSON_STATUS => (0, 3),
+        host_call::UI_CAPABILITIES => (2, 2),
+        host_call::UI_MOUNT => (2, 1),
+        host_call::UI_UPDATE => (2, 1),
+        host_call::UI_PRESENT => (0, 1),
+        host_call::UI_POLL_EVENT => (2, 2),
+        host_call::UI_RESET => (0, 1),
+        host_call::TIME_QUERY => (1, 2),
+        host_call::VAULT_HANDLE => (3, 2),
+        host_call::FETCH_START_AUTHENTICATED => (3, 2),
+        host_call::MQTT_CONNECT => (1, 2),
+        host_call::MQTT_SUBSCRIBE => (2, 2),
+        host_call::MQTT_POLL => (1, 2),
+        host_call::MQTT_PEEK => (1, 3),
+        host_call::MQTT_READ => (5, 2),
+        host_call::MQTT_DISCONNECT => (1, 2),
+        host_call::MQTT_DROPPED => (1, 2),
         host_call::IME_FEED_KEY => (2, 1),
         host_call::IME_CONVERT => (0, 1),
         host_call::IME_QUERY_LINE => (2, 2),
@@ -3374,6 +3961,12 @@ mod tests {
         bgm_stops: usize,
         /// Asset paths passed to `asset_load`, in call order.
         assets_requested: Vec<String>,
+        ui_mounts: Vec<Vec<u8>>,
+        ui_updates: Vec<Vec<u8>>,
+        ui_presents: usize,
+        ui_polls: Vec<usize>,
+        ui_resets: usize,
+        ui_session_ends: usize,
         /// Recorded `game2d_set_tile` calls: `(layer, x, y, tile_ref)`.
         tiles: Vec<(i32, i32, i32, i32)>,
         tilemap_configs: Vec<(i32, i32, i32, i32, i32)>,
@@ -3384,6 +3977,13 @@ mod tests {
         /// assert the timing seam brackets every `HOST_CALL` exactly once.
         dispatch_begins: u32,
         dispatch_ends: u32,
+        /// KOTO-0248: recorded `vault_handle` calls as `(service, url_len)`.
+        vault_handle_calls: Vec<(i32, usize)>,
+        /// KOTO-0248: recorded `fetch_start_authenticated` calls as
+        /// `(url_len, handle)`.
+        fetch_auth_calls: Vec<(usize, i32)>,
+        /// KOTO-0249: recorded MQTT host calls as `(op_name, session, index)`.
+        mqtt_calls: Vec<(&'static str, i32, i32)>,
     }
 
     impl VmHost for TestHost {
@@ -3402,6 +4002,66 @@ mod tests {
 
         fn draw_text(&mut self, _x: i32, _y: i32, _text: &str) -> HostCallOutcome {
             HostCallOutcome::Ok0
+        }
+
+        fn vault_handle(&mut self, service: i32, url: &str) -> HostCallOutcome {
+            self.vault_handle_calls.push((service, url.len()));
+            HostCallOutcome::Ok1(0)
+        }
+
+        fn fetch_start_authenticated(&mut self, url: &str, handle: i32) -> HostCallOutcome {
+            self.fetch_auth_calls.push((url.len(), handle));
+            HostCallOutcome::Ok1(42)
+        }
+
+        fn mqtt_connect(&mut self, broker_index: i32) -> HostCallOutcome {
+            self.mqtt_calls.push(("connect", 0, broker_index));
+            HostCallOutcome::Ok1(0x1_0001)
+        }
+
+        fn mqtt_subscribe(&mut self, session: i32, topic_index: i32) -> HostCallOutcome {
+            self.mqtt_calls.push(("subscribe", session, topic_index));
+            HostCallOutcome::Ok1(0)
+        }
+
+        fn mqtt_poll(&mut self, session: i32) -> HostCallOutcome {
+            self.mqtt_calls.push(("poll", session, 0));
+            HostCallOutcome::Ok1(2)
+        }
+
+        fn mqtt_peek(&mut self, session: i32) -> HostCallOutcome {
+            self.mqtt_calls.push(("peek", session, 0));
+            HostCallOutcome::Ok2(3, 5)
+        }
+
+        fn mqtt_read(
+            &mut self,
+            session: i32,
+            topic: &mut [u8],
+            payload: &mut [u8],
+        ) -> HostCallOutcome {
+            self.mqtt_calls.push((
+                "read",
+                session,
+                (topic.len() as i32) << 8 | payload.len() as i32,
+            ));
+            for b in topic.iter_mut() {
+                *b = 0xAA;
+            }
+            for b in payload.iter_mut() {
+                *b = 0xBB;
+            }
+            HostCallOutcome::Ok1(1)
+        }
+
+        fn mqtt_disconnect(&mut self, session: i32) -> HostCallOutcome {
+            self.mqtt_calls.push(("disconnect", session, 0));
+            HostCallOutcome::Ok1(0)
+        }
+
+        fn mqtt_dropped(&mut self, session: i32) -> HostCallOutcome {
+            self.mqtt_calls.push(("dropped", session, 0));
+            HostCallOutcome::Ok1(0)
         }
 
         fn draw_pixels_rgb565(
@@ -3504,6 +4164,38 @@ mod tests {
             let len = payload.len().min(dst.len());
             dst[..len].copy_from_slice(&payload[..len]);
             HostCallOutcome::Ok1(len as i32)
+        }
+
+        fn ui_mount(&mut self, src: &[u8]) -> HostCallOutcome {
+            self.ui_mounts.push(src.to_vec());
+            HostCallOutcome::Ok0
+        }
+
+        fn ui_update(&mut self, src: &[u8]) -> HostCallOutcome {
+            self.ui_updates.push(src.to_vec());
+            HostCallOutcome::Ok0
+        }
+
+        fn ui_present(&mut self) -> HostCallOutcome {
+            self.ui_presents += 1;
+            HostCallOutcome::Ok0
+        }
+
+        fn ui_poll_event(&mut self, dst: &mut [u8]) -> HostCallOutcome {
+            self.ui_polls.push(dst.len());
+            if !dst.is_empty() {
+                dst[0] = 0x5a;
+            }
+            HostCallOutcome::Ok1(usize::from(!dst.is_empty()) as i32)
+        }
+
+        fn ui_reset(&mut self) -> HostCallOutcome {
+            self.ui_resets += 1;
+            HostCallOutcome::Ok0
+        }
+
+        fn ui_session_end(&mut self) {
+            self.ui_session_ends += 1;
         }
 
         fn ime_feed_key(&mut self, kind: i32, codepoint: i32) -> HostCallOutcome {
@@ -3840,6 +4532,7 @@ mod tests {
         assert_eq!(session.frame(), 1);
         assert!(session.has_exited());
         assert_eq!(session.last_error(), None);
+        assert_eq!(host.ui_session_ends, 1);
 
         let trap_bytes = fixture(&[
             insn(opcode::PUSH_I16, 0, 1),
@@ -3855,6 +4548,7 @@ mod tests {
         );
         assert_eq!(session.frame(), 1);
         assert_eq!(session.last_error(), Some(VmError::DivisionByZero));
+        assert_eq!(host.ui_session_ends, 2);
     }
 
     #[test]
@@ -3928,6 +4622,50 @@ mod tests {
         // `game2d_present` is handed the app heap so a draw-model host can re-read
         // tile art; `execute_test_frame` runs against the program's heap window.
         assert!(host.present_heap_len > 0);
+    }
+
+    #[test]
+    fn vm_dispatches_ui_mount_and_update_heap_slices_with_fixed_stack_effects() {
+        let bytes = fixture(&[
+            insn(opcode::PUSH_I16, 0, 12),
+            insn(opcode::PUSH_I16, 0, 4),
+            insn(opcode::HOST_CALL, host_call::UI_MOUNT, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 16),
+            insn(opcode::PUSH_I16, 0, 3),
+            insn(opcode::HOST_CALL, host_call::UI_UPDATE, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::HOST_CALL, host_call::UI_PRESENT, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 20),
+            insn(opcode::PUSH_I16, 0, 8),
+            insn(opcode::HOST_CALL, host_call::UI_POLL_EVENT, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::HOST_CALL, host_call::UI_RESET, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 0),
+            insn(opcode::HOST_CALL, host_call::EXIT, 0),
+        ]);
+        let program = verified(&bytes);
+        let mut vm = BytecodeVm::<8, 4>::new(&program).unwrap();
+        let mut host = TestHost::default();
+
+        let result = vm
+            .execute_test_frame(&bytes, &program, &mut host, VmInputSnapshot::empty(), 32)
+            .unwrap();
+
+        assert_eq!(result, VmRunResult::Exited(0));
+        assert_eq!(host.ui_mounts, [vec![0, 0, 0, 0]]);
+        assert_eq!(host.ui_updates, [vec![0, 0, 0]]);
+        assert_eq!(host.ui_presents, 1);
+        assert_eq!(host.ui_polls, [8]);
+        assert_eq!(host.ui_resets, 1);
+        assert_eq!(host_call::name(host_call::UI_MOUNT), "ui_mount");
+        assert_eq!(host_call::name(host_call::UI_UPDATE), "ui_update");
+        assert_eq!(host_call::name(host_call::UI_PRESENT), "ui_present");
+        assert_eq!(host_call::name(host_call::UI_POLL_EVENT), "ui_poll_event");
+        assert_eq!(host_call::name(host_call::UI_RESET), "ui_reset");
     }
 
     #[test]
@@ -4238,6 +4976,143 @@ mod tests {
     }
 
     #[test]
+    fn vault_host_calls_marshal_args_and_dispatch() {
+        // KOTO-0248: vault_handle(service, url_ptr, url_len) and
+        // fetch_start_authenticated(url_ptr, url_len, handle) must pop their
+        // arguments in the documented order and reach the host. An empty
+        // (ptr=0, len=0) slice is a valid empty URL, so no rodata is needed.
+        let bytes = fixture(&[
+            insn(opcode::PUSH_I16, 0, 0), // service = Fetch
+            insn(opcode::PUSH_I16, 0, 0), // url_ptr
+            insn(opcode::PUSH_I16, 0, 0), // url_len
+            insn(opcode::HOST_CALL, host_call::VAULT_HANDLE, 0),
+            insn(opcode::PUSH_I16, 0, 0), // url_ptr
+            insn(opcode::PUSH_I16, 0, 0), // url_len
+            insn(opcode::PUSH_I16, 0, 7), // handle
+            insn(opcode::HOST_CALL, host_call::FETCH_START_AUTHENTICATED, 0),
+            insn(opcode::PUSH_I16, 0, 0),
+            insn(opcode::HOST_CALL, host_call::EXIT, 0),
+        ]);
+        let program = verified(&bytes);
+        let mut vm = BytecodeVm::<16, 4>::new(&program).unwrap();
+        let mut host = TestHost::default();
+        let result = vm
+            .execute_test_frame(&bytes, &program, &mut host, VmInputSnapshot::empty(), 100)
+            .unwrap();
+        assert_eq!(result, VmRunResult::Exited(0));
+        assert_eq!(host.vault_handle_calls, [(0, 0)]);
+        assert_eq!(host.fetch_auth_calls, [(0, 7)]);
+    }
+
+    #[test]
+    fn vault_host_calls_are_known_with_stable_names_and_arity() {
+        assert!(known_host_call(host_call::VAULT_HANDLE));
+        assert!(known_host_call(host_call::FETCH_START_AUTHENTICATED));
+        assert_eq!(host_call::name(host_call::VAULT_HANDLE), "vault_handle");
+        assert_eq!(
+            host_call::name(host_call::FETCH_START_AUTHENTICATED),
+            "fetch_start_authenticated"
+        );
+        assert_eq!(host_call_stack_effect(host_call::VAULT_HANDLE), (3, 2));
+        assert_eq!(
+            host_call_stack_effect(host_call::FETCH_START_AUTHENTICATED),
+            (3, 2)
+        );
+        assert_eq!(HOST_ABI_MINOR, 23);
+    }
+
+    #[test]
+    fn mqtt_host_calls_marshal_args_and_dispatch() {
+        // KOTO-0249: each MQTT host call must pop its arguments in the documented
+        // order and reach the host. Empty (ptr=0, len=0) topic/payload buffers are
+        // valid, so no rodata is needed; `mqtt_read` receives two disjoint slices.
+        let bytes = fixture(&[
+            insn(opcode::PUSH_I16, 0, 1), // broker_index = 1
+            insn(opcode::HOST_CALL, host_call::MQTT_CONNECT, 0),
+            insn(opcode::DROP, 0, 0),     // drop status
+            insn(opcode::DROP, 0, 0),     // drop session id
+            insn(opcode::PUSH_I16, 0, 9), // session
+            insn(opcode::PUSH_I16, 0, 3), // topic_index
+            insn(opcode::HOST_CALL, host_call::MQTT_SUBSCRIBE, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 9), // session
+            insn(opcode::HOST_CALL, host_call::MQTT_POLL, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 9), // session
+            insn(opcode::PUSH_I16, 0, 0), // topic_ptr
+            insn(opcode::PUSH_I16, 0, 0), // topic_max
+            insn(opcode::PUSH_I16, 0, 0), // payload_ptr
+            insn(opcode::PUSH_I16, 0, 0), // payload_max
+            insn(opcode::HOST_CALL, host_call::MQTT_READ, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 9), // session
+            insn(opcode::HOST_CALL, host_call::MQTT_DROPPED, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 9), // session
+            insn(opcode::HOST_CALL, host_call::MQTT_DISCONNECT, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::DROP, 0, 0),
+            insn(opcode::PUSH_I16, 0, 0),
+            insn(opcode::HOST_CALL, host_call::EXIT, 0),
+        ]);
+        let program = verified(&bytes);
+        let mut vm = BytecodeVm::<16, 4>::new(&program).unwrap();
+        let mut host = TestHost::default();
+        let result = vm
+            .execute_test_frame(&bytes, &program, &mut host, VmInputSnapshot::empty(), 100)
+            .unwrap();
+        assert_eq!(result, VmRunResult::Exited(0));
+        assert_eq!(
+            host.mqtt_calls,
+            [
+                ("connect", 0, 1),
+                ("subscribe", 9, 3),
+                ("poll", 9, 0),
+                ("read", 9, 0),
+                ("dropped", 9, 0),
+                ("disconnect", 9, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn mqtt_host_calls_are_known_with_stable_names_and_arity() {
+        for (id, name, arity) in [
+            (host_call::MQTT_CONNECT, "mqtt_connect", (1, 2)),
+            (host_call::MQTT_SUBSCRIBE, "mqtt_subscribe", (2, 2)),
+            (host_call::MQTT_POLL, "mqtt_poll", (1, 2)),
+            (host_call::MQTT_PEEK, "mqtt_peek", (1, 3)),
+            (host_call::MQTT_READ, "mqtt_read", (5, 2)),
+            (host_call::MQTT_DISCONNECT, "mqtt_disconnect", (1, 2)),
+            (host_call::MQTT_DROPPED, "mqtt_dropped", (1, 2)),
+        ] {
+            assert!(known_host_call(id), "{name} must be known");
+            assert_eq!(host_call::name(id), name);
+            assert_eq!(host_call_stack_effect(id), arity, "{name} arity");
+        }
+    }
+
+    #[test]
+    fn heap_two_slices_mut_rejects_overlap_and_out_of_bounds() {
+        let mut heap = [0u8; 32];
+        // Disjoint ranges split cleanly regardless of order.
+        assert!(heap_two_slices_mut(&mut heap, 0, 4, 8, 4).is_some());
+        assert!(heap_two_slices_mut(&mut heap, 8, 4, 0, 4).is_some());
+        // Adjacent (touching) ranges are disjoint.
+        assert!(heap_two_slices_mut(&mut heap, 0, 8, 8, 8).is_some());
+        // Overlap is rejected so the two `&mut` never alias.
+        assert!(heap_two_slices_mut(&mut heap, 0, 8, 4, 8).is_none());
+        assert!(heap_two_slices_mut(&mut heap, 4, 8, 0, 8).is_none());
+        // Out of bounds is rejected.
+        assert!(heap_two_slices_mut(&mut heap, 0, 4, 30, 8).is_none());
+        assert!(heap_two_slices_mut(&mut heap, usize::MAX, 4, 0, 4).is_none());
+    }
+
+    #[test]
     fn vm_reports_runtime_traps_without_panicking() {
         let div_zero = fixture(&[
             insn(opcode::PUSH_I16, 0, 1),
@@ -4464,6 +5339,13 @@ mod tests {
             verify_kbc(&bytes, RuntimeLimits::simulator_default()),
             Err(VerifyError::UnsupportedHostAbi)
         );
+    }
+
+    #[test]
+    fn accepts_existing_host_abi_minor_17_without_rebuild() {
+        let mut bytes = fixture(&[insn(opcode::HALT, 0, 0)]);
+        bytes[50..52].copy_from_slice(&17u16.to_le_bytes());
+        assert!(verify_kbc(&bytes, RuntimeLimits::simulator_default()).is_ok());
     }
 
     #[test]

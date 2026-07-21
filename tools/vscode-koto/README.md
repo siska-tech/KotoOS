@@ -41,8 +41,9 @@ Editor support for KotoOS app development:
   a smoke scenario without rewriting another app.
 - **Koto language intelligence** (KOTO-0194): the dependency-free client
   starts the Rust `koto-lsp` server and provides live diagnostics from unsaved
-  buffers, include-aware go-to-definition, signature/slot hover, constant
-  hover, and a `slots used/45` inlay (`⚠` at 90%). By default it runs
+  buffers, include-aware go-to-definition and completion, KotoSDK completion,
+  signature/slot hover, constant hover, and a `slots used/45` inlay (`⚠` at
+  90%). By default it runs
   `cargo run -q -p koto-lsp --` in the workspace; set
   `koto.languageServer.path` to use a prebuilt executable, or disable it with
   `koto.languageServer.enabled`. Changes are debounced for 150 ms, configurable

@@ -1,0 +1,50 @@
+{
+  "format": "kpa-manifest",
+  "version": 2,
+  "app_id": "dev.koto.weather",
+  "name": "Koto Weather",
+  "entry": "bytecode/weather.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/weather.kicon",
+  "description": "Bilingual Internet-weather reference app over the bounded Fetch/JSON SDK.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/weather.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/weather.kicon",
+      "type": "image",
+      "sequential": false
+    },
+    {
+      "path": "locales/en-US.txt",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "locales/ja-JP.txt",
+      "type": "data",
+      "sequential": true
+    },
+    {
+      "path": "locales/qps-ploc.txt",
+      "type": "data",
+      "sequential": true
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": {
+      "origins": [
+        "https://weather.example"
+      ]
+    }
+  }
+}

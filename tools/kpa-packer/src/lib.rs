@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use koto_audio::{runtime_cue_max_encoded_len, RuntimeCue, RuntimeCueError};
 use koto_core::package::validate_entry_path;
-use koto_core::{ManifestFields, PackageIconStyle, PackageIconTheme, PackageManifest};
+use koto_core::{
+    FetchAllowlist, FetchOrigin, FetchPinSet, FetchScheme, ManifestFields, PackageIconStyle,
+    PackageIconTheme, PackageManifest, SpkiSha256,
+};
 use serde::Deserialize;
 
 const HEADER_SIZE: u32 = 64;
@@ -173,6 +176,7 @@ pub fn pack_manifest(
         .map(SourceShellIcon::to_theme)
         .transpose()
         .map_err(|_| PackError::ManifestFields)?;
+    validate_fetch_permission(manifest.version, manifest.permissions.as_ref())?;
     PackageManifest::new(ManifestFields {
         format: &manifest.format,
         version: manifest.version,
@@ -469,7 +473,77 @@ struct SourceManifest {
     description: Option<String>,
     #[serde(default)]
     category: Option<String>,
+    #[serde(default)]
+    permissions: Option<serde_json::Value>,
     assets: Vec<SourceAsset>,
+}
+
+fn validate_fetch_permission(
+    version: u32,
+    permissions: Option<&serde_json::Value>,
+) -> Result<(), PackError> {
+    let Some(permissions) = permissions else {
+        return Ok(());
+    };
+    let permissions = permissions.as_object().ok_or(PackError::ManifestFields)?;
+    let Some(network) = permissions.get("network") else {
+        return Ok(());
+    };
+    if version == 1 {
+        return network
+            .as_bool()
+            .map(|_| ())
+            .ok_or(PackError::ManifestFields);
+    }
+    let object = network.as_object().ok_or(PackError::ManifestFields)?;
+    if object.len() != 1 || !object.contains_key("origins") {
+        return Err(PackError::ManifestFields);
+    }
+    let origins = object["origins"]
+        .as_array()
+        .ok_or(PackError::ManifestFields)?;
+    let mut allowlist = FetchAllowlist::empty();
+    for origin in origins {
+        let (origin, _pins) = if let Some(text) = origin.as_str() {
+            (
+                FetchOrigin::parse(text).map_err(|_| PackError::ManifestFields)?,
+                None,
+            )
+        } else {
+            let object = origin.as_object().ok_or(PackError::ManifestFields)?;
+            if object.len() != 2
+                || !object.contains_key("origin")
+                || !object.contains_key("spki_sha256")
+            {
+                return Err(PackError::ManifestFields);
+            }
+            let parsed =
+                FetchOrigin::parse(object["origin"].as_str().ok_or(PackError::ManifestFields)?)
+                    .map_err(|_| PackError::ManifestFields)?;
+            if parsed.scheme() != FetchScheme::Https {
+                return Err(PackError::ManifestFields);
+            }
+            let values = object["spki_sha256"]
+                .as_array()
+                .ok_or(PackError::ManifestFields)?;
+            let mut set = FetchPinSet::empty();
+            for value in values {
+                set.push(
+                    SpkiSha256::parse_hex(value.as_str().ok_or(PackError::ManifestFields)?)
+                        .map_err(|_| PackError::ManifestFields)?,
+                )
+                .map_err(|_| PackError::ManifestFields)?;
+            }
+            if set.is_empty() {
+                return Err(PackError::ManifestFields);
+            }
+            (parsed, Some(set))
+        };
+        allowlist
+            .push(origin)
+            .map_err(|_| PackError::ManifestFields)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -558,6 +632,28 @@ mod tests {
         assert_eq!(first.layout[2].path, "icons/sample.kicon");
         assert_eq!(first.layout[0].data_offset, 4096);
         assert_eq!(first.layout[1].data_offset % 512, 0);
+    }
+
+    #[test]
+    fn validates_bounded_spki_rotation_entries() {
+        const PIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let permission = serde_json::json!({
+            "network": {
+                "origins": [{"origin":"https://secure.example", "spki_sha256":[PIN]}]
+            }
+        });
+        assert!(validate_fetch_permission(2, Some(&permission)).is_ok());
+
+        for invalid in [
+            serde_json::json!({"network":{"origins":[{"origin":"http://secure.example","spki_sha256":[PIN]}]}}),
+            serde_json::json!({"network":{"origins":[{"origin":"https://secure.example","spki_sha256":[]}]}}),
+            serde_json::json!({"network":{"origins":[{"origin":"https://secure.example","spki_sha256":[PIN,PIN]}]}}),
+        ] {
+            assert!(matches!(
+                validate_fetch_permission(2, Some(&invalid)),
+                Err(PackError::ManifestFields)
+            ));
+        }
     }
 
     #[test]

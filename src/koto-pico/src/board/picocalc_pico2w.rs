@@ -1,6 +1,6 @@
 //! Raspberry Pi Pico 2 W / RP2350A installed in a PicoCalc.
 
-use super::BoardProfile;
+use super::{BoardCapabilities, BoardProfile};
 
 pub const PROFILE: BoardProfile = BoardProfile {
     board_id: "picocalc-pico2w-rp2350a",
@@ -12,7 +12,9 @@ pub const PROFILE: BoardProfile = BoardProfile {
     lcd_spi_hz: 37_500_000,
     psram_pio_divider: 5,
     code_window_tiles: 3,
-    has_wireless_radio: true,
+    capabilities: BoardCapabilities::AUDIO
+        .union(BoardCapabilities::WIFI)
+        .union(BoardCapabilities::AUDIO_WIFI_CONCURRENT),
 };
 
 pub const BOARD_ID: &str = PROFILE.board_id;
@@ -24,4 +26,11 @@ pub const DEFAULT_SYSTEM_HZ: u32 = PROFILE.default_system_hz;
 pub const LCD_SPI_HZ: u32 = PROFILE.lcd_spi_hz;
 pub const PSRAM_PIO_DIVIDER: u32 = PROFILE.psram_pio_divider;
 pub const CODE_WINDOW_TILES: usize = PROFILE.code_window_tiles;
-pub const HAS_WIRELESS_RADIO: bool = PROFILE.has_wireless_radio;
+pub const HAS_WIRELESS_RADIO: bool = PROFILE.capabilities.contains(BoardCapabilities::WIFI);
+pub const AUDIO_WIFI_CONCURRENT: bool = PROFILE
+    .capabilities
+    .contains(BoardCapabilities::AUDIO_WIFI_CONCURRENT);
+
+const _: () = assert!(PROFILE.capabilities.contains(BoardCapabilities::AUDIO));
+const _: () = assert!(PROFILE.capabilities.contains(BoardCapabilities::WIFI));
+const _: () = assert!(AUDIO_WIFI_CONCURRENT);

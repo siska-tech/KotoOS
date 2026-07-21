@@ -9,6 +9,124 @@ pub type PsramSio0Pin = peripherals::PIN_2;
 pub type PsramSio1Pin = peripherals::PIN_3;
 pub type PsramSio2Pin = peripherals::PIN_4;
 pub type PsramSio3Pin = peripherals::PIN_5;
+#[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+pub type RadioPowerPin = peripherals::PIN_23;
+#[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+pub type RadioDataPin = peripherals::PIN_24;
+#[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+pub type RadioCsPin = peripherals::PIN_25;
+#[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+pub type RadioClockPin = peripherals::PIN_29;
+
+#[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+pub struct PicoWRadioResources {
+    pub pio: Peri<'static, peripherals::PIO0>,
+    pub power: Peri<'static, RadioPowerPin>,
+    pub data: Peri<'static, RadioDataPin>,
+    pub cs: Peri<'static, RadioCsPin>,
+    pub clock: Peri<'static, RadioClockPin>,
+    pub dma_tx: Peri<'static, peripherals::DMA_CH2>,
+    pub dma_rx: Peri<'static, peripherals::DMA_CH3>,
+}
+
+#[cfg(all(
+    any(
+        feature = "wifi_residency_probe",
+        all(feature = "network_service", feature = "board-picocalc-picow")
+    ),
+    any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w")
+))]
+impl PicoWRadioResources {
+    /// # Safety
+    ///
+    /// The caller must have proven that no user of the previous alias remains
+    /// alive: the arena-owned CYW43 lifecycle future must have been dropped
+    /// and joined (`WifiRuntime::shutdown` returned the arena) so PIO0,
+    /// DMA_CH2, DMA_CH3, and the GP23/24/25/29 pins are all dead before the
+    /// returned alias is used.
+    unsafe fn duplicate(&self) -> Self {
+        unsafe {
+            Self {
+                pio: self.pio.clone_unchecked(),
+                power: self.power.clone_unchecked(),
+                data: self.data.clone_unchecked(),
+                cs: self.cs.clone_unchecked(),
+                clock: self.clock.clone_unchecked(),
+                dma_tx: self.dma_tx.clone_unchecked(),
+                dma_rx: self.dma_rx.clone_unchecked(),
+            }
+        }
+    }
+
+    /// Duplicates the radio peripheral handles for the next KOTO-0227 probe
+    /// round trip.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::duplicate`]: the previous lifecycle future must
+    /// have been dropped and joined and `RadioPowerOutput` must have forced
+    /// GP23 low before the returned alias is used.
+    #[cfg(feature = "wifi_residency_probe")]
+    pub unsafe fn clone_for_probe(&self) -> Self {
+        unsafe { self.duplicate() }
+    }
+
+    /// Duplicates the radio peripheral handles for the next KOTO-0251 Pico W
+    /// product radio-enable cycle. RP2040's switchable residency installs a
+    /// fresh arena-owned CYW43 lifecycle on every radio enable, so the product
+    /// mode owner needs the same alias the probe soak used.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::duplicate`]: the previous lifecycle future must
+    /// have been dropped and joined (`WifiRuntime::shutdown` returned the
+    /// arena, or no lifecycle was ever installed) and GP23 forced low before
+    /// the returned alias is used.
+    #[cfg(all(feature = "network_service", feature = "board-picocalc-picow"))]
+    pub unsafe fn clone_for_enable_cycle(&self) -> Self {
+        unsafe { self.duplicate() }
+    }
+}
+
+#[cfg(feature = "board-picocalc-pico2w")]
+pub struct MinimalRadioProbeResources {
+    pub uart: Peri<'static, peripherals::UART0>,
+    pub uart_tx: Peri<'static, peripherals::PIN_0>,
+    pub pio: Peri<'static, peripherals::PIO0>,
+    pub power: Peri<'static, RadioPowerPin>,
+    pub data: Peri<'static, RadioDataPin>,
+    pub cs: Peri<'static, RadioCsPin>,
+    pub clock: Peri<'static, RadioClockPin>,
+    #[cfg(not(feature = "wifi_minimal_dma23_probe"))]
+    pub dma_tx: Peri<'static, peripherals::DMA_CH0>,
+    #[cfg(not(feature = "wifi_minimal_dma23_probe"))]
+    pub dma_rx: Peri<'static, peripherals::DMA_CH1>,
+    #[cfg(feature = "wifi_minimal_dma23_probe")]
+    pub dma_tx: Peri<'static, peripherals::DMA_CH2>,
+    #[cfg(feature = "wifi_minimal_dma23_probe")]
+    pub dma_rx: Peri<'static, peripherals::DMA_CH3>,
+}
+
+#[cfg(feature = "board-picocalc-pico2w")]
+pub fn split_minimal_radio_probe(p: Peripherals) -> MinimalRadioProbeResources {
+    MinimalRadioProbeResources {
+        uart: p.UART0,
+        uart_tx: p.PIN_0,
+        pio: p.PIO0,
+        power: p.PIN_23,
+        data: p.PIN_24,
+        cs: p.PIN_25,
+        clock: p.PIN_29,
+        #[cfg(not(feature = "wifi_minimal_dma23_probe"))]
+        dma_tx: p.DMA_CH0,
+        #[cfg(not(feature = "wifi_minimal_dma23_probe"))]
+        dma_rx: p.DMA_CH1,
+        #[cfg(feature = "wifi_minimal_dma23_probe")]
+        dma_tx: p.DMA_CH2,
+        #[cfg(feature = "wifi_minimal_dma23_probe")]
+        dma_rx: p.DMA_CH3,
+    }
+}
 
 /// GPIO numbers and peripheral instances fixed by the PicoCalc carrier.
 ///
@@ -96,6 +214,20 @@ pub struct PicoCalcPeripherals {
     pub psram_sio2: Peri<'static, peripherals::PIN_4>,
     pub psram_sio3: Peri<'static, peripherals::PIN_5>,
     pub psram_rx_dma: Peri<'static, peripherals::DMA_CH1>,
+    #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+    pub radio_pio: Peri<'static, peripherals::PIO0>,
+    #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+    pub radio_power: Peri<'static, peripherals::PIN_23>,
+    #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+    pub radio_data: Peri<'static, peripherals::PIN_24>,
+    #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+    pub radio_cs: Peri<'static, peripherals::PIN_25>,
+    #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+    pub radio_clock: Peri<'static, peripherals::PIN_29>,
+    #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+    pub radio_dma: Peri<'static, peripherals::DMA_CH2>,
+    #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+    pub radio_dma_rx: Peri<'static, peripherals::DMA_CH3>,
 }
 
 /// Convert Embassy's chip-oriented peripheral set into PicoCalc roles.
@@ -132,5 +264,19 @@ pub fn split_peripherals(p: Peripherals) -> PicoCalcPeripherals {
         psram_sio2: p.PIN_4,
         psram_sio3: p.PIN_5,
         psram_rx_dma: p.DMA_CH1,
+        #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+        radio_pio: p.PIO0,
+        #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+        radio_power: p.PIN_23,
+        #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+        radio_data: p.PIN_24,
+        #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+        radio_cs: p.PIN_25,
+        #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+        radio_clock: p.PIN_29,
+        #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+        radio_dma: p.DMA_CH2,
+        #[cfg(any(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w"))]
+        radio_dma_rx: p.DMA_CH3,
     }
 }

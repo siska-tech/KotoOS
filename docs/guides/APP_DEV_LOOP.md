@@ -60,13 +60,14 @@ package fields (name, icon, palette, memory, permissions):
 }
 ```
 
-In-app paths (`source`, `icon`, and the optional `audio` / `images` / `maps`
+In-app paths (`source`, `icon`, and the optional `assets` / `audio` / `images` / `maps`
 sources) are **app-relative**, so the folder is copy-paste portable. `kind` is
 `koto` (compiled by `koto-compiler`) or `asm` (assembled by `kbc-asm`).
 `package` is the staging/archive stem (`APPS/<package>.kpa`). The build
 generates the `.kpa.json` manifest and stages `icon.kicon` into
 `package_inputs/` — those are intermediates, not authored by hand. Optional
-blocks: `codegen` (per-app compiler flags), `maps` (`.map` validation and packaging),
+blocks: `codegen` (per-app compiler flags), `assets` (text and other files copied
+byte-for-byte as read-only package data), `maps` (`.map` validation and packaging),
 `images` (`.kspr` → `.kim`), `audio` (staged/compiled Native KotoAudio),
 `shell_icon` (launcher palette).
 
@@ -107,6 +108,7 @@ cargo run -p koto-sim -- --app dev.koto.games.koto-blocks --app-script frame_cap
 An app script drives one frame per line. Tokens:
 
 - a single-quoted character: `'a'`, `'\n'`, `'\s'` (space);
+- `activate` or `confirm` for a focused KotoUI Button/Checkbox/List;
 - intent names: `shift convert commit cancel backspace delete left right up down
   home end newline save exit open`;
 - `frame` for an empty frame; `#` starts a comment.
@@ -129,8 +131,8 @@ input.
 cargo run -p koto-sim --features window -- --window
 ```
 
-Arrow keys move/position the cursor, letters type, F1 toggles IME on/off, Tab
-converts, Shift arms Sticky Shift, Right-Shift commits, Left Ctrl cancels, F2
+Arrow keys move/position the cursor, letters type, F1 toggles IME on/off, Space
+converts/cycles candidates, Shift arms Sticky Shift, Enter commits, Ctrl+G cancels, F2
 opens the memo save prompt (empty Enter overwrites, a typed name saves as), F4
 opens the memo file picker, and F5 immediately creates an unnamed empty memo.
 F2 asks `上書き保存しますか? (y/n)` for named files; `n` and unnamed files open
@@ -271,9 +273,14 @@ state (`stack`/`local`/`heap`), the per-frame `fuel` budget, and host-owned work
 sets (draw lists, file handles) whose pixel/PCM bytes never live in the VM heap.
 `heap_peak` is the highest heap byte the VM addressed; `heap_request` is the KBC
 heap it was given; `heap_budget` is the manifest's declared SRAM ceiling (`none`
-if unset). `harness/check_budgets.py` runs the Memo and KotoBlocks scenarios under
-this report, warns at >=90% of a fixed capacity, and fails when a peak exceeds its
-configured threshold; it runs as part of `harness/check_all.py`.
+if unset). KotoUI runs additionally report fixed host state as `ui_session_sram`,
+the retained rectangle/text command high-water as `ui_render_commands_peak`, and
+the observed slowest host frame as `frame_time_us_peak`. Wall-clock time is
+informational because it varies by machine; `fuel_peak` is its deterministic CI
+bound. `harness/check_budgets.py` runs the Gallery, Memo, KotoBlocks, and actor
+array scenarios under this report, warns at >=90% of a fixed capacity, and fails
+when a deterministic peak exceeds its configured threshold; it runs as part of
+`harness/check_all.py`.
 
 ### Local slot map
 

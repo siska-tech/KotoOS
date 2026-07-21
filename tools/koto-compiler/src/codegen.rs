@@ -18,7 +18,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use crate::parser::{BinOp, DataWidth, Expr, Program, Stmt, Type, UnOp};
+use crate::parser::{BinOp, DataWidth, Expr, Function, Program, Stmt, StructFieldKind, Type, UnOp};
 use crate::Diag;
 
 /// The compiler reserves three codegen scratch local slots: a return-value slot
@@ -93,6 +93,12 @@ fn intrinsic(name: &str) -> Option<Intrinsic> {
     let (asm, args, result) = match name {
         "exit" => ("exit", 1, ResultKind::Exit),
         "yield_frame" => ("yield_frame", 0, ResultKind::Status),
+        "ui_capabilities" => ("ui_capabilities", 2, ResultKind::Value),
+        "ui_mount" => ("ui_mount", 2, ResultKind::Status),
+        "ui_update" => ("ui_update", 2, ResultKind::Status),
+        "ui_present" => ("ui_present", 0, ResultKind::Status),
+        "ui_poll_event" => ("ui_poll_event", 2, ResultKind::Value),
+        "ui_reset" => ("ui_reset", 0, ResultKind::Status),
         "draw_rect" => ("draw_rect", 5, ResultKind::Status),
         "draw_text" => ("draw_text", 4, ResultKind::Status),
         "draw_text_color" => ("draw_text_color", 5, ResultKind::Status),
@@ -126,6 +132,50 @@ fn intrinsic(name: &str) -> Option<Intrinsic> {
         "file_write" => ("file_write", 3, ResultKind::Value),
         "file_close" => ("file_close", 1, ResultKind::Status),
         "asset_load" => ("asset_load", 4, ResultKind::Value),
+        "fetch_start" => ("fetch_start", 2, ResultKind::Value),
+        "fetch_poll_state" => ("fetch_poll", 1, ResultKind::Value2First),
+        "fetch_poll_metadata" => ("fetch_poll", 1, ResultKind::Value2Second),
+        "fetch_read" => ("fetch_read", 3, ResultKind::Value),
+        "fetch_cancel" => ("fetch_cancel", 1, ResultKind::Status),
+        // Bounded incremental JSON decoding (KOTO-0246). `json_next` is not
+        // idempotent, so unlike `fetch_poll` its two companion values are read
+        // through the separate idempotent `json_status` call rather than
+        // Value2First/Second aliases of the same host call.
+        "json_reset" => ("json_reset", 0, ResultKind::Status),
+        "json_next" => ("json_next", 2, ResultKind::Value),
+        "json_finish" => ("json_finish", 0, ResultKind::Value),
+        "json_token" => ("json_token", 2, ResultKind::Value),
+        "json_error_code" => ("json_error", 0, ResultKind::Value2First),
+        "json_error_offset" => ("json_error", 0, ResultKind::Value2Second),
+        "json_consumed" => ("json_status", 0, ResultKind::Value2First),
+        "json_depth" => ("json_status", 0, ResultKind::Value2Second),
+        // Advisory time query (KOTO-0247): one selector-driven host call so
+        // future kinds extend the domain without new IDs. UTC `-1` means
+        // "not synchronized" by contract, so ResultKind::Value's failure
+        // sentinel and the legitimate unknown answer coincide on purpose.
+        "time_query" => ("time_query", 1, ResultKind::Value),
+        // Application credential vault (KOTO-0248). `vault_handle(service,
+        // url_ptr, url_len)` resolves the running app's opaque handle (`0` when
+        // no grant applies); the app never sees a secret.
+        // `fetch_start_authenticated(url_ptr, url_len, handle)` starts a GET
+        // with the OS-injected credential. Both return a single value, so a
+        // failure sentinel and a legitimate `0`/id share `ResultKind::Value`.
+        "vault_handle" => ("vault_handle", 3, ResultKind::Value),
+        "fetch_start_authenticated" => ("fetch_start_authenticated", 3, ResultKind::Value),
+        // OS-owned bounded MQTT subscribe service (KOTO-0249). The app names a
+        // manifest broker/topic by index and drains complete messages into its
+        // own bounded buffers; it never sees a socket, TLS, or credential byte.
+        // `mqtt_read` consumes the oldest message, so (like `json_next`) its
+        // companion lengths are read through the separate idempotent
+        // `mqtt_peek_*` calls rather than Value2 aliases of the same host call.
+        "mqtt_connect" => ("mqtt_connect", 1, ResultKind::Value),
+        "mqtt_subscribe" => ("mqtt_subscribe", 2, ResultKind::Value),
+        "mqtt_poll" => ("mqtt_poll", 1, ResultKind::Value),
+        "mqtt_peek_topic_len" => ("mqtt_peek", 1, ResultKind::Value2First),
+        "mqtt_peek_payload_len" => ("mqtt_peek", 1, ResultKind::Value2Second),
+        "mqtt_read" => ("mqtt_read", 5, ResultKind::Value),
+        "mqtt_disconnect" => ("mqtt_disconnect", 1, ResultKind::Value),
+        "mqtt_dropped" => ("mqtt_dropped", 1, ResultKind::Value),
         "ime_feed_key" => ("ime_feed_key", 2, ResultKind::Status),
         "ime_convert" => ("ime_convert", 0, ResultKind::Status),
         "ime_query_line" => ("ime_query_line", 2, ResultKind::Value),
@@ -157,12 +207,184 @@ fn intrinsic(name: &str) -> Option<Intrinsic> {
 /// Predefined SDK constants exposed to every program. Sourced from the host ABI
 /// modules so they cannot drift from the runtime; see `docs/spec/KOTO_SDK.md`.
 fn sdk_consts() -> Vec<(&'static str, i64)> {
+    use koto_core::json::event_code as json_event;
+    use koto_core::mqtt::app_mqtt;
     use koto_core::runtime::{edit_delete, edit_dir, ime_key, text_intent};
+    use koto_core::time::app_time_query as time_query;
+    use koto_core::vault::app_vault;
+    use koto_core::JsonError;
+    use koto_core::{
+        HostErrorCode, UI_ABI_HOST_MINOR, UI_CAPABILITIES_BYTES, UI_DAMAGE_CAPACITY,
+        UI_DATA_CAPACITY, UI_EVENT_HEADER_SIZE, UI_EVENT_QUEUE_CAPACITY, UI_MAX_LIST_ROWS,
+        UI_MAX_MOUNT_BYTES, UI_MAX_NODES, UI_MAX_OPEN_MODALS, UI_MAX_TEXT_FIELDS,
+        UI_MAX_TEXT_FIELD_BYTES, UI_MAX_UPDATE_BYTES,
+    };
     vec![
+        // KotoUI application ABI v1.0 (KOTO-0217/0219).
+        ("UI_ABI_MAJOR", 1),
+        ("UI_ABI_MINOR", 0),
+        ("UI_HOST_ABI_MINOR", UI_ABI_HOST_MINOR as i64),
+        ("UI_NODE_LABEL", 1),
+        ("UI_NODE_BUTTON", 2),
+        ("UI_NODE_CHECKBOX", 3),
+        ("UI_NODE_LIST", 4),
+        ("UI_NODE_TEXT_FIELD", 5),
+        ("UI_NODE_PANEL", 6),
+        ("UI_NODE_DIALOG", 7),
+        // Structural sentinel; this is a distinguished value, not a domain.
+        ("UI_PARENT_ROOT", -1),
+        ("UI_FOCUS_FIRST", -1),
+        ("UI_SELECTION_NONE", -1),
+        ("UI_CURSOR_END", -1),
+        ("UI_ACTION_NONE", -1),
+        ("UI_FLAG_VISIBLE", 1),
+        ("UI_FLAG_ENABLED", 2),
+        ("UI_FLAG_LTR", 1 << 2),
+        ("UI_FLAG_ELLIPSIS", 1 << 4),
+        ("UI_ALIGN_START", 0),
+        ("UI_ALIGN_CENTER", 1),
+        ("UI_ALIGN_END", 2),
+        ("UI_RESPONSE_ACTIVATED", 1),
+        ("UI_RESPONSE_VALUE_CHANGED", 2),
+        ("UI_RESPONSE_TEXT_CHANGED", 3),
+        ("UI_RESPONSE_SELECTION_CHANGED", 4),
+        ("UI_RESPONSE_SELECTION_ACTIVATED", 5),
+        ("UI_RESPONSE_SUBMITTED", 6),
+        ("UI_RESPONSE_CANCELLED", 7),
+        ("UI_RESPONSE_FOCUS_CHANGED", 8),
+        ("UI_RESPONSE_CAPACITY_REJECTED", 9),
+        ("UI_RESPONSE_LOCALE_CHANGED", 10),
+        (
+            "UI_ERROR_BAD_ARGUMENT",
+            HostErrorCode::BAD_ARGUMENT.0 as i64,
+        ),
+        ("UI_ERROR_NOT_FOUND", HostErrorCode::NOT_FOUND.0 as i64),
+        ("UI_ERROR_UNSUPPORTED", HostErrorCode::UNSUPPORTED.0 as i64),
+        ("UI_ERROR_NO_MEMORY", HostErrorCode::NO_MEMORY.0 as i64),
+        ("UI_CAPABILITIES_BYTES", UI_CAPABILITIES_BYTES as i64),
+        ("UI_EVENT_HEADER_BYTES", UI_EVENT_HEADER_SIZE as i64),
+        ("UI_MAX_NODES", UI_MAX_NODES as i64),
+        ("UI_MAX_MOUNT_BYTES", UI_MAX_MOUNT_BYTES as i64),
+        ("UI_MAX_UPDATE_BYTES", UI_MAX_UPDATE_BYTES as i64),
+        ("UI_MAX_DATA_BYTES", UI_DATA_CAPACITY as i64),
+        ("UI_EVENT_QUEUE_CAPACITY", UI_EVENT_QUEUE_CAPACITY as i64),
+        ("UI_MAX_TEXT_FIELDS", UI_MAX_TEXT_FIELDS as i64),
+        ("UI_MAX_TEXT_FIELD_BYTES", UI_MAX_TEXT_FIELD_BYTES as i64),
+        ("UI_MAX_LIST_ROWS", UI_MAX_LIST_ROWS as i64),
+        ("UI_DAMAGE_CAPACITY", UI_DAMAGE_CAPACITY as i64),
+        ("UI_MAX_OPEN_MODALS", UI_MAX_OPEN_MODALS as i64),
+        ("UI_CAP_IME", 1),
         // file_open modes (see koto-sim SimRuntimeHost::file_open)
         ("MODE_READ", 0),
         ("MODE_WRITE", 1),
         ("MODE_READWRITE", 2),
+        // fetch_poll state values (Host ABI minor 19).
+        ("FETCH_PENDING", 0),
+        ("FETCH_HEADERS", 1),
+        ("FETCH_BODY", 2),
+        ("FETCH_COMPLETE", 3),
+        ("FETCH_FAILED", 4),
+        ("FETCH_MAX_READ", koto_core::MAX_FETCH_READ_BYTES as i64),
+        ("FETCH_MAX_TOTAL", koto_core::MAX_FETCH_TOTAL_BYTES as i64),
+        // json_next/json_finish event codes (Host ABI minor 20, KOTO-0246),
+        // sourced from the frozen koto-core ABI module.
+        ("JSON_NEED_MORE", json_event::NEED_MORE as i64),
+        ("JSON_BEGIN_OBJECT", json_event::BEGIN_OBJECT as i64),
+        ("JSON_END_OBJECT", json_event::END_OBJECT as i64),
+        ("JSON_BEGIN_ARRAY", json_event::BEGIN_ARRAY as i64),
+        ("JSON_END_ARRAY", json_event::END_ARRAY as i64),
+        ("JSON_KEY", json_event::KEY as i64),
+        ("JSON_STR", json_event::STR as i64),
+        ("JSON_NUMBER", json_event::NUMBER as i64),
+        ("JSON_FALSE", json_event::FALSE as i64),
+        ("JSON_TRUE", json_event::TRUE as i64),
+        ("JSON_NULL", json_event::NULL as i64),
+        ("JSON_END_DOC", json_event::END_DOCUMENT as i64),
+        ("JSON_ERROR", json_event::ERROR as i64),
+        // json_error_code values and decoder limits.
+        (
+            "JSON_ERR_UNEXPECTED_BYTE",
+            JsonError::UnexpectedByte.code() as i64,
+        ),
+        (
+            "JSON_ERR_INVALID_NUMBER",
+            JsonError::InvalidNumber.code() as i64,
+        ),
+        (
+            "JSON_ERR_INVALID_STRING",
+            JsonError::InvalidString.code() as i64,
+        ),
+        (
+            "JSON_ERR_INVALID_ESCAPE",
+            JsonError::InvalidEscape.code() as i64,
+        ),
+        (
+            "JSON_ERR_INVALID_UNICODE",
+            JsonError::InvalidUnicode.code() as i64,
+        ),
+        (
+            "JSON_ERR_INVALID_UTF8",
+            JsonError::InvalidUtf8.code() as i64,
+        ),
+        (
+            "JSON_ERR_DEPTH_EXCEEDED",
+            JsonError::DepthExceeded.code() as i64,
+        ),
+        (
+            "JSON_ERR_TOKEN_TOO_LONG",
+            JsonError::TokenTooLong.code() as i64,
+        ),
+        (
+            "JSON_ERR_NUMBER_TOO_LONG",
+            JsonError::NumberTooLong.code() as i64,
+        ),
+        (
+            "JSON_ERR_TRAILING_DATA",
+            JsonError::TrailingData.code() as i64,
+        ),
+        (
+            "JSON_ERR_UNEXPECTED_END",
+            JsonError::UnexpectedEnd.code() as i64,
+        ),
+        ("JSON_MAX_DEPTH", koto_core::MAX_JSON_DEPTH as i64),
+        ("JSON_MAX_TOKEN", koto_core::MAX_JSON_TOKEN_BYTES as i64),
+        ("JSON_MAX_NUMBER", koto_core::MAX_JSON_NUMBER_BYTES as i64),
+        // time_query selector kinds and the monotonic wrap mask (Host ABI
+        // minor 21, KOTO-0247), sourced from the frozen koto-core module.
+        ("TIME_UTC_SECONDS", time_query::UTC_SECONDS as i64),
+        ("TIME_OFFSET_MINUTES", time_query::OFFSET_MINUTES as i64),
+        ("TIME_MONOTONIC_MS", time_query::MONOTONIC_MS as i64),
+        ("TIME_MONOTONIC_MASK", time_query::MONOTONIC_MASK as i64),
+        // vault_handle service selectors (Host ABI minor 22, KOTO-0248),
+        // sourced from koto-core so they cannot drift from the store encoding.
+        ("VAULT_SERVICE_FETCH", app_vault::SERVICE_FETCH as i64),
+        ("VAULT_SERVICE_MQTT", app_vault::SERVICE_MQTT as i64),
+        // Bounded MQTT subscribe service (Host ABI minor 23, KOTO-0249). Poll
+        // states, read-delivery results, and the frozen capacity profile, all
+        // sourced from koto-core so they cannot drift from the runtime contract.
+        ("MQTT_CONNECTING", app_mqtt::STATE_CONNECTING as i64),
+        ("MQTT_CONNECTED", app_mqtt::STATE_CONNECTED as i64),
+        ("MQTT_MESSAGE", app_mqtt::STATE_MESSAGE as i64),
+        ("MQTT_DISCONNECTED", app_mqtt::STATE_DISCONNECTED as i64),
+        ("MQTT_FAILED", app_mqtt::STATE_FAILED as i64),
+        ("MQTT_READ_NONE", app_mqtt::READ_NONE as i64),
+        ("MQTT_READ_MESSAGE", app_mqtt::READ_MESSAGE as i64),
+        ("MQTT_READ_RETAINED", app_mqtt::READ_RETAINED as i64),
+        ("MQTT_MAX_BROKERS", koto_core::MAX_MQTT_BROKERS as i64),
+        (
+            "MQTT_MAX_TOPIC_FILTERS",
+            koto_core::MAX_MQTT_TOPIC_FILTERS as i64,
+        ),
+        (
+            "MQTT_MAX_TOPIC_BYTES",
+            koto_core::MAX_MQTT_TOPIC_BYTES as i64,
+        ),
+        (
+            "MQTT_MAX_PAYLOAD_BYTES",
+            koto_core::MAX_MQTT_PAYLOAD_BYTES as i64,
+        ),
+        ("MQTT_MAX_QUEUE", koto_core::MAX_MQTT_MESSAGE_QUEUE as i64),
+        ("MQTT_KEEPALIVE_SECS", koto_core::MQTT_KEEPALIVE_SECS as i64),
         // ime_feed_key kinds
         ("IME_CHARACTER", ime_key::CHARACTER as i64),
         ("IME_SHIFT", ime_key::SHIFT as i64),
@@ -205,18 +427,170 @@ fn sdk_consts() -> Vec<(&'static str, i64)> {
     ]
 }
 
+/// Integer-backed SDK domains. Values are resolved through `sdk_consts`, whose
+/// entries are sourced from the runtime ABI modules above, so the qualified and
+/// legacy flat spellings cannot drift.
+pub(crate) fn sdk_enums() -> Vec<(&'static str, Vec<(&'static str, i64)>)> {
+    let flat: HashMap<_, _> = sdk_consts().into_iter().collect();
+    let domain = |name: &'static str, members: &[(&'static str, &'static str)]| {
+        (
+            name,
+            members
+                .iter()
+                .map(|(member, alias)| (*member, flat[alias]))
+                .collect(),
+        )
+    };
+    vec![
+        domain(
+            "UiNodeKind",
+            &[
+                ("Label", "UI_NODE_LABEL"),
+                ("Button", "UI_NODE_BUTTON"),
+                ("Checkbox", "UI_NODE_CHECKBOX"),
+                ("List", "UI_NODE_LIST"),
+                ("TextField", "UI_NODE_TEXT_FIELD"),
+                ("Panel", "UI_NODE_PANEL"),
+                ("Dialog", "UI_NODE_DIALOG"),
+            ],
+        ),
+        domain(
+            "UiAlignment",
+            &[
+                ("Start", "UI_ALIGN_START"),
+                ("Center", "UI_ALIGN_CENTER"),
+                ("End", "UI_ALIGN_END"),
+            ],
+        ),
+        domain(
+            "UiResponse",
+            &[
+                ("Activated", "UI_RESPONSE_ACTIVATED"),
+                ("ValueChanged", "UI_RESPONSE_VALUE_CHANGED"),
+                ("TextChanged", "UI_RESPONSE_TEXT_CHANGED"),
+                ("SelectionChanged", "UI_RESPONSE_SELECTION_CHANGED"),
+                ("SelectionActivated", "UI_RESPONSE_SELECTION_ACTIVATED"),
+                ("Submitted", "UI_RESPONSE_SUBMITTED"),
+                ("Cancelled", "UI_RESPONSE_CANCELLED"),
+                ("FocusChanged", "UI_RESPONSE_FOCUS_CHANGED"),
+                ("CapacityRejected", "UI_RESPONSE_CAPACITY_REJECTED"),
+                ("LocaleChanged", "UI_RESPONSE_LOCALE_CHANGED"),
+            ],
+        ),
+        domain(
+            "UiError",
+            &[
+                ("BadArgument", "UI_ERROR_BAD_ARGUMENT"),
+                ("NotFound", "UI_ERROR_NOT_FOUND"),
+                ("Unsupported", "UI_ERROR_UNSUPPORTED"),
+                ("NoMemory", "UI_ERROR_NO_MEMORY"),
+            ],
+        ),
+        domain(
+            "FileMode",
+            &[
+                ("Read", "MODE_READ"),
+                ("Write", "MODE_WRITE"),
+                ("ReadWrite", "MODE_READWRITE"),
+            ],
+        ),
+        domain(
+            "ImeKey",
+            &[
+                ("Character", "IME_CHARACTER"),
+                ("Shift", "IME_SHIFT"),
+                ("Convert", "IME_CONVERT"),
+                ("Commit", "IME_COMMIT"),
+                ("Cancel", "IME_CANCEL"),
+                ("Backspace", "IME_BACKSPACE"),
+                ("Other", "IME_OTHER"),
+                ("Toggle", "IME_TOGGLE"),
+            ],
+        ),
+        domain(
+            "EditDirection",
+            &[
+                ("Left", "DIR_LEFT"),
+                ("Right", "DIR_RIGHT"),
+                ("Up", "DIR_UP"),
+                ("Down", "DIR_DOWN"),
+                ("Home", "DIR_HOME"),
+                ("End", "DIR_END"),
+            ],
+        ),
+        domain(
+            "DeleteKind",
+            &[
+                ("Backspace", "DELETE_BACKSPACE"),
+                ("Forward", "DELETE_FORWARD"),
+            ],
+        ),
+    ]
+}
+
 struct FnInfo {
     params: Vec<(String, Type)>,
     ret: Option<Type>,
     body: Vec<Stmt>,
 }
 
+/// One struct field's storage shape: a 32-bit scalar (KOTO-0228) or a
+/// fixed-capacity byte region (KOTO-0235). Buffer fields are address-valued in
+/// expressions and contribute their capacity to the record layout, but never
+/// materialize bytes in the KBC rodata image.
+#[derive(Clone)]
+enum FieldInfo {
+    Scalar(Type),
+    Buffer(u32),
+}
+
+#[derive(Clone)]
+struct StructInfo {
+    fields: HashMap<String, (FieldInfo, u32)>,
+    ordered_fields: Vec<(String, FieldInfo)>,
+    size: u32,
+}
+
 struct Scope {
     func: String,
     locals: HashMap<String, usize>,
+    local_types: HashMap<String, Type>,
     buffers: HashMap<String, (u32, u32)>,
     next_slot: usize,
     end_label: String,
+}
+
+fn validate_signature_types(
+    function: &Function,
+    structs: &HashMap<String, StructInfo>,
+) -> Result<(), Diag> {
+    for param in &function.params {
+        if let Type::Struct(name) = &param.ty {
+            if !structs.contains_key(name) {
+                return Err(Diag::new(
+                    param.line,
+                    param.col,
+                    format!("unknown struct type `{name}`"),
+                ));
+            }
+        }
+    }
+    if let Some(Type::Struct(name)) = &function.ret {
+        return Err(Diag::new(
+            function.line,
+            function.col,
+            format!("struct return type `{name}` is not supported"),
+        ));
+    }
+    Ok(())
+}
+
+fn type_name(ty: &Type) -> &str {
+    match ty {
+        Type::Int => "int",
+        Type::Bool => "bool",
+        Type::Struct(name) => name,
+    }
 }
 
 /// Compile a parsed program to assembly text, with the KOTO-0156 code-window layout
@@ -237,7 +611,11 @@ struct Codegen<'a> {
     file: &'a str,
     program: &'a Program,
     consts: HashMap<String, i64>,
+    const_types: HashMap<String, Type>,
+    enums: HashMap<String, HashMap<String, i64>>,
     funcs: HashMap<String, FnInfo>,
+    structs: HashMap<String, StructInfo>,
+    statics: HashMap<String, (u32, String)>,
     buffer_offsets: HashMap<(String, String), (u32, u32)>,
     /// Top-level `data` const buffers, by name → (heap byte offset, byte length).
     /// These live at the bottom of the heap and are initialized from `rodata`
@@ -318,6 +696,52 @@ impl<'a> Codegen<'a> {
         for def in &program.consts {
             consts.insert(def.name.clone(), def.value);
         }
+        let const_types = program
+            .consts
+            .iter()
+            .map(|def| (def.name.clone(), def.ty.clone()))
+            .collect();
+
+        let mut enums: HashMap<String, HashMap<String, i64>> = sdk_enums()
+            .into_iter()
+            .map(|(name, members)| {
+                (
+                    name.to_string(),
+                    members
+                        .into_iter()
+                        .map(|(member, value)| (member.to_string(), value))
+                        .collect(),
+                )
+            })
+            .collect();
+        for def in &program.enums {
+            if enums.contains_key(&def.name) {
+                return Err(Diag::new(
+                    def.name_line,
+                    def.name_col,
+                    format!("enum `{}` is already defined", def.name),
+                ));
+            }
+            let mut members = HashMap::new();
+            for member in &def.members {
+                if members.insert(member.name.clone(), member.value).is_some() {
+                    return Err(Diag::new(
+                        member.name_line,
+                        member.name_col,
+                        format!(
+                            "enum member `{}::{}` is already defined",
+                            def.name, member.name
+                        ),
+                    ));
+                }
+            }
+            enums.insert(def.name.clone(), members);
+        }
+        for (enum_name, members) in &enums {
+            for (member_name, value) in members {
+                consts.insert(format!("{enum_name}::{member_name}"), *value);
+            }
+        }
 
         // Function signatures. Functions are inlined and their user-local slots are
         // allocated at the *call site* (KOTO-0104): each inline expansion takes slots
@@ -340,10 +764,121 @@ impl<'a> Codegen<'a> {
                     params: function
                         .params
                         .iter()
-                        .map(|p| (p.name.clone(), p.ty))
+                        .map(|p| (p.name.clone(), p.ty.clone()))
                         .collect(),
-                    ret: function.ret,
+                    ret: function.ret.clone(),
                     body: function.body.clone(),
+                },
+            );
+        }
+
+        let mut structs = HashMap::new();
+        for def in &program.structs {
+            if structs.contains_key(&def.name) || enums.contains_key(&def.name) {
+                return Err(Diag::new(
+                    def.name_line,
+                    def.name_col,
+                    format!("struct `{}` is already defined", def.name),
+                ));
+            }
+            let mut fields = HashMap::new();
+            let mut ordered_fields = Vec::new();
+            // Declaration-ordered layout: scalars take 4 bytes, buffer fields
+            // take their declared capacity (KOTO-0235). Offsets and the total
+            // are checked so a corrupt layout is a diagnostic, not a wrap.
+            let mut cursor = 0u32;
+            for field in &def.fields {
+                let (info, bytes) = match &field.kind {
+                    StructFieldKind::Scalar(ty) => {
+                        if !matches!(ty, Type::Int | Type::Bool) {
+                            return Err(Diag::new(
+                                field.name_line,
+                                field.name_col,
+                                "V1 struct fields must be `int`, `bool`, or `buf[N]`".to_string(),
+                            ));
+                        }
+                        (FieldInfo::Scalar(ty.clone()), 4u32)
+                    }
+                    StructFieldKind::Buffer(capacity) => {
+                        let capacity = u32::try_from(*capacity).map_err(|_| {
+                            Diag::new(
+                                field.name_line,
+                                field.name_col,
+                                "struct layout overflow".to_string(),
+                            )
+                        })?;
+                        (FieldInfo::Buffer(capacity), capacity)
+                    }
+                };
+                if fields
+                    .insert(field.name.clone(), (info.clone(), cursor))
+                    .is_some()
+                {
+                    return Err(Diag::new(
+                        field.name_line,
+                        field.name_col,
+                        format!("field `{}.{}` is already defined", def.name, field.name),
+                    ));
+                }
+                ordered_fields.push((field.name.clone(), info));
+                cursor = cursor.checked_add(bytes).ok_or_else(|| {
+                    Diag::new(
+                        field.name_line,
+                        field.name_col,
+                        "struct layout overflow".to_string(),
+                    )
+                })?;
+            }
+            let size = cursor;
+            structs.insert(
+                def.name.clone(),
+                StructInfo {
+                    fields,
+                    ordered_fields,
+                    size,
+                },
+            );
+        }
+
+        for function in &program.functions {
+            validate_signature_types(function, &structs)?;
+        }
+        for method in &program.methods {
+            if !structs.contains_key(&method.target) {
+                return Err(Diag::new(
+                    method.function.line,
+                    method.function.col,
+                    format!("unknown impl target `{}`", method.target),
+                ));
+            }
+            validate_signature_types(&method.function, &structs)?;
+            if !matches!(method.function.params.first().map(|p| &p.ty), Some(Type::Struct(name)) if name == &method.target)
+            {
+                return Err(Diag::new(
+                    method.function.line,
+                    method.function.col,
+                    "a method must declare `self` as its first parameter".to_string(),
+                ));
+            }
+            let key = format!("{}::{}", method.target, method.function.name);
+            if funcs.contains_key(&key) {
+                return Err(Diag::new(
+                    method.function.name_line,
+                    method.function.name_col,
+                    format!("method `{key}` is already defined"),
+                ));
+            }
+            funcs.insert(
+                key,
+                FnInfo {
+                    params: method
+                        .function
+                        .params
+                        .iter()
+                        .map(|p| (p.name.clone(), p.ty.clone()))
+                        .collect(),
+                    ret: method.function.ret.clone(),
+                    body: method.function.body.clone(),
                 },
             );
         }
@@ -363,7 +898,11 @@ impl<'a> Codegen<'a> {
             file,
             program,
             consts,
+            const_types,
+            enums,
             funcs,
+            structs,
+            statics: HashMap::new(),
             buffer_offsets: HashMap::new(),
             data_offsets: HashMap::new(),
             rodata: Vec::new(),
@@ -388,17 +927,18 @@ impl<'a> Codegen<'a> {
 
     fn assign_heap(&mut self) -> Result<(), Diag> {
         let mut cursor = 0u32;
-        // Mutable `buf`s come first so an app that addresses a buffer by an absolute
-        // heap offset across functions (e.g. KotoBlocks' tile cache at offset 0, read
-        // by `blit_piece` and the host as `t*512`) keeps that offset. Const `data`
-        // sits above them; the heap image (`rodata`) is the heap *prefix* up to the
-        // end of the const region (KOTO-0139) — the mutable prefix is a zero fill.
-        for function in &self.program.functions {
-            collect_buffers(&function.body, &mut |name, size| {
-                self.buffer_offsets
-                    .insert((function.name.clone(), name.to_string()), (cursor, size));
-                cursor += size;
-            });
+        // Preserve the legacy buffer-first layout byte-for-byte for Apps without
+        // records (some address a buffer at absolute offset zero across helpers).
+        // Apps that opt into `static` place initialized data first so large mutable
+        // buffers do not become a zero-filled prefix in the KBC rodata image.
+        if self.program.statics.is_empty() {
+            for function in &self.program.functions {
+                collect_buffers(&function.body, &mut |name, size| {
+                    self.buffer_offsets
+                        .insert((function.name.clone(), name.to_string()), (cursor, size));
+                    cursor += size;
+                });
+            }
         }
         // Const `data` buffers, in source order. Record each one's bytes at its heap
         // offset, then materialize the rodata image as `heap[0..data_end]` with the
@@ -443,8 +983,121 @@ impl<'a> Codegen<'a> {
             data_blocks.push((offset, block));
             cursor += bytes;
         }
+        let mut static_names = HashSet::new();
+        for def in &self.program.statics {
+            if !static_names.insert(def.name.clone()) {
+                return Err(Diag::new(
+                    def.name_line,
+                    def.name_col,
+                    format!("static `{}` is already defined", def.name),
+                ));
+            }
+            if self.consts.contains_key(&def.name)
+                || self.data_offsets.contains_key(&def.name)
+                || self.funcs.contains_key(&def.name)
+            {
+                return Err(Diag::new(
+                    def.name_line,
+                    def.name_col,
+                    format!("name `{}` is already defined", def.name),
+                ));
+            }
+            let layout = self.structs.get(&def.ty).cloned().ok_or_else(|| {
+                Diag::new(
+                    def.name_line,
+                    def.name_col,
+                    format!("unknown struct type `{}`", def.ty),
+                )
+            })?;
+            let mut values = HashMap::new();
+            for init in &def.fields {
+                if values.insert(init.name.clone(), &init.value).is_some() {
+                    return Err(Diag::new(
+                        init.line,
+                        init.col,
+                        format!("field `{}` is initialized more than once", init.name),
+                    ));
+                }
+                match layout.fields.get(&init.name) {
+                    None => {
+                        return Err(Diag::new(
+                            init.line,
+                            init.col,
+                            format!("unknown field `{}.{}`", def.ty, init.name),
+                        ));
+                    }
+                    // KOTO-0235: buffer regions are zero-initialized by the
+                    // loader; an initializer payload has no representation in
+                    // the rodata image and is rejected like other stored-alias
+                    // forms.
+                    Some((FieldInfo::Buffer(_), _)) => {
+                        return Err(Diag::new(
+                            init.line,
+                            init.col,
+                            format!(
+                                "buffer field `{}.{}` cannot take an initializer; buffer regions are zero-initialized",
+                                def.ty, init.name
+                            ),
+                        ));
+                    }
+                    Some((FieldInfo::Scalar(_), _)) => {}
+                }
+            }
+            let offset = cursor;
+            cursor = cursor.checked_add(layout.size).ok_or_else(|| {
+                Diag::new(def.line, def.col, "App heap layout overflow".to_string())
+            })?;
+            // Scalar fields materialize as rodata bytes at their layout
+            // offsets; buffer fields contribute no image bytes (KOTO-0235) —
+            // the loader zero-fills the heap above the image, and any gap a
+            // buffer leaves *inside* the image span is zero-filled when the
+            // rodata vector is assembled below.
+            for (field, info) in &layout.ordered_fields {
+                let ty = match info {
+                    FieldInfo::Buffer(_) => continue,
+                    FieldInfo::Scalar(ty) => ty,
+                };
+                let expr = values.get(field).ok_or_else(|| {
+                    Diag::new(
+                        def.line,
+                        def.col,
+                        format!("missing initializer for field `{}.{field}`", def.ty),
+                    )
+                })?;
+                let (value, value_ty) = self.fold_static_expr(expr)?;
+                if &value_ty != ty {
+                    return Err(Diag::new(
+                        expr.position().0,
+                        expr.position().1,
+                        format!(
+                            "initializer for `{}.{field}` has type {}, expected {}",
+                            def.ty,
+                            type_name(&value_ty),
+                            type_name(ty)
+                        ),
+                    ));
+                }
+                let field_offset = layout.fields.get(field).map(|(_, o)| *o).unwrap();
+                data_blocks.push((offset + field_offset, value.to_le_bytes().to_vec()));
+            }
+            self.statics
+                .insert(def.name.clone(), (offset, def.ty.clone()));
+        }
+        if !self.program.statics.is_empty() {
+            for function in &self.program.functions {
+                collect_buffers(&function.body, &mut |name, size| {
+                    self.buffer_offsets
+                        .insert((function.name.clone(), name.to_string()), (cursor, size));
+                    cursor += size;
+                });
+            }
+        }
         if !data_blocks.is_empty() {
-            let data_end = cursor as usize;
+            let data_end = data_blocks
+                .iter()
+                .map(|(offset, block)| *offset as usize + block.len())
+                .max()
+                .unwrap_or(0);
             self.rodata = vec![0u8; data_end];
             for (offset, block) in &data_blocks {
                 let start = *offset as usize;
@@ -469,15 +1122,105 @@ impl<'a> Codegen<'a> {
             });
         }
         self.total_heap = cursor;
+        if self.total_heap > koto_core::RuntimeLimits::simulator_default().max_heap_bytes {
+            return Err(Diag::new(
+                1,
+                1,
+                format!(
+                    "App heap request {} exceeds limit {}",
+                    self.total_heap,
+                    koto_core::RuntimeLimits::simulator_default().max_heap_bytes
+                ),
+            ));
+        }
         Ok(())
+    }
+
+    fn fold_static_expr(&self, expr: &Expr) -> Result<(i32, Type), Diag> {
+        let (line, col) = expr.position();
+        match expr {
+            Expr::Int { value, .. } => i32::try_from(*value)
+                .map(|value| (value, Type::Int))
+                .map_err(|_| {
+                    Diag::new(
+                        line,
+                        col,
+                        "static integer is out of 32-bit range".to_string(),
+                    )
+                }),
+            Expr::Bool { value, .. } => Ok((i32::from(*value), Type::Bool)),
+            Expr::Ident { name, .. } => self
+                .consts
+                .get(name)
+                .copied()
+                .ok_or_else(|| {
+                    Diag::new(
+                        line,
+                        col,
+                        "static initializer must be a compile-time value".to_string(),
+                    )
+                })
+                .and_then(|value| {
+                    i32::try_from(value)
+                        .map(|value| {
+                            (
+                                value,
+                                self.const_types.get(name).cloned().unwrap_or(Type::Int),
+                            )
+                        })
+                        .map_err(|_| {
+                            Diag::new(
+                                line,
+                                col,
+                                "static constant is out of 32-bit range".to_string(),
+                            )
+                        })
+                }),
+            Expr::EnumMember {
+                enum_name,
+                member_name,
+                ..
+            } => self
+                .enums
+                .get(enum_name)
+                .and_then(|members| members.get(member_name))
+                .copied()
+                .map(|value| (value as i32, Type::Int))
+                .ok_or_else(|| {
+                    Diag::new(
+                        line,
+                        col,
+                        format!("unknown enum member `{enum_name}::{member_name}`"),
+                    )
+                }),
+            Expr::Unary {
+                op: UnOp::Neg,
+                expr,
+                ..
+            } => {
+                let (value, ty) = self.fold_static_expr(expr)?;
+                if ty != Type::Int {
+                    return Err(Diag::new(line, col, "unary `-` needs `int`".to_string()));
+                }
+                value
+                    .checked_neg()
+                    .map(|value| (value, Type::Int))
+                    .ok_or_else(|| Diag::new(line, col, "static integer overflow".to_string()))
+            }
+            _ => Err(Diag::new(
+                line,
+                col,
+                "static initializer must be a literal, const, or enum member".to_string(),
+            )),
+        }
     }
 
     fn reject_recursion(&self) -> Result<(), Diag> {
         // DFS over the user-function call graph; any cycle is unsupported.
         let mut visiting = HashSet::new();
         let mut done = HashSet::new();
-        for function in &self.program.functions {
-            self.visit_calls(&function.name, &mut visiting, &mut done)?;
+        for name in self.funcs.keys() {
+            self.visit_calls(name, &mut visiting, &mut done)?;
         }
         Ok(())
     }
@@ -547,6 +1290,7 @@ impl<'a> Codegen<'a> {
         self.scopes.push(Scope {
             func: "main".to_string(),
             locals: HashMap::new(),
+            local_types: HashMap::new(),
             buffers: HashMap::new(),
             // main is the root expansion: its locals start at user slot 0.
             next_slot: 0,
@@ -637,12 +1381,14 @@ impl<'a> Codegen<'a> {
         // heap-allocated globally and are intentionally not scoped here.
         let scope = self.scopes.last().unwrap();
         let saved_locals = scope.locals.clone();
+        let saved_local_types = scope.local_types.clone();
         let saved_next_slot = scope.next_slot;
         for stmt in stmts {
             self.emit_stmt(stmt)?;
         }
         let scope = self.scopes.last_mut().unwrap();
         scope.locals = saved_locals;
+        scope.local_types = saved_local_types;
         scope.next_slot = saved_next_slot;
         Ok(())
     }
@@ -651,17 +1397,34 @@ impl<'a> Codegen<'a> {
         match stmt {
             Stmt::Let {
                 name,
+                annotation,
                 value,
                 line,
                 col,
                 ..
             } => {
                 self.emit_loc(*line, *col);
+                let value_ty = self.expr_type(value)?;
+                if matches!(value_ty, Type::Struct(_)) {
+                    return Err(Diag::new(
+                        *line,
+                        *col,
+                        "stored struct aliases are not supported".to_string(),
+                    ));
+                }
+                if let Some(expected) = annotation {
+                    self.require_same_type(expected, &value_ty, *line, *col)?;
+                }
                 let produced = self.emit_expr(value)?;
                 if !produced {
                     return Err(Diag::new(*line, *col, "let value has no value".to_string()));
                 }
                 let slot = self.alloc_local(name, *line, *col)?;
+                self.scopes
+                    .last_mut()
+                    .unwrap()
+                    .local_types
+                    .insert(name.clone(), value_ty);
                 self.emit(format!("store_local {slot}"));
                 self.adjust(-1);
             }
@@ -696,6 +1459,9 @@ impl<'a> Codegen<'a> {
                 let slot = self.lookup_local(name).ok_or_else(|| {
                     Diag::new(*line, *col, format!("`{name}` is not an assignable local"))
                 })?;
+                let expected = self.lookup_local_type(name).cloned().unwrap();
+                let actual = self.expr_type(value)?;
+                self.require_same_type(&expected, &actual, *line, *col)?;
                 let produced = self.emit_expr(value)?;
                 if !produced {
                     return Err(Diag::new(
@@ -728,6 +1494,36 @@ impl<'a> Codegen<'a> {
                 // value
                 self.require_value(value)?;
                 self.emit("store8".to_string());
+                self.adjust(-2);
+            }
+            Stmt::FieldAssign {
+                receiver,
+                field,
+                value,
+                line,
+                col,
+            } => {
+                self.emit_loc(*line, *col);
+                let (info, offset) = self.field_info(receiver, field, *line, *col)?;
+                let FieldInfo::Scalar(field_ty) = info else {
+                    return Err(Diag::new(
+                        *line,
+                        *col,
+                        format!(
+                            "buffer field `{field}` names a fixed region and cannot be assigned; write through `heap_set_u8(...)` instead"
+                        ),
+                    ));
+                };
+                let value_ty = self.expr_type(value)?;
+                self.require_same_type(&field_ty, &value_ty, *line, *col)?;
+                self.require_value(receiver)?;
+                if offset != 0 {
+                    self.emit_int_const(offset as i32);
+                    self.emit("add_i32".to_string());
+                    self.adjust(-1);
+                }
+                self.require_value(value)?;
+                self.emit("store32".to_string());
                 self.adjust(-2);
             }
             Stmt::Expr(expr) => {
@@ -827,9 +1623,11 @@ impl<'a> Codegen<'a> {
         let scope = self.scopes.last().unwrap();
         let func = scope.func.clone();
         let end_label = scope.end_label.clone();
-        let ret_ty = self.funcs.get(&func).unwrap().ret;
+        let ret_ty = self.funcs.get(&func).unwrap().ret.clone();
         match (value, ret_ty) {
-            (Some(expr), Some(_)) => {
+            (Some(expr), Some(expected)) => {
+                let actual = self.expr_type(expr)?;
+                self.require_same_type(&expected, &actual, line, col)?;
                 self.require_value(expr)?;
                 // Route through the return slot so the post-return code keeps a
                 // consistent linear depth for the verifier.
@@ -892,6 +1690,8 @@ impl<'a> Codegen<'a> {
                     self.adjust(1);
                 } else if let Some((offset, _)) = self.lookup_data(name) {
                     self.emit_int_const(offset as i32);
+                } else if let Some((offset, _)) = self.statics.get(name).cloned() {
+                    self.emit_int_const(offset as i32);
                 } else if let Some(value) = self.consts.get(name).copied() {
                     let value = i32::try_from(value).map_err(|_| {
                         Diag::new(*line, *col, format!("const `{name}` out of 32-bit range"))
@@ -900,6 +1700,26 @@ impl<'a> Codegen<'a> {
                 } else {
                     return Err(Diag::new(*line, *col, format!("undefined name `{name}`")));
                 }
+                Ok(true)
+            }
+            Expr::EnumMember {
+                enum_name,
+                member_name,
+                line,
+                col,
+            } => {
+                let members = self
+                    .enums
+                    .get(enum_name)
+                    .ok_or_else(|| Diag::new(*line, *col, format!("unknown enum `{enum_name}`")))?;
+                let value = members.get(member_name).copied().ok_or_else(|| {
+                    Diag::new(
+                        *line,
+                        *col,
+                        format!("unknown enum member `{enum_name}::{member_name}`"),
+                    )
+                })?;
+                self.emit_int_const(value as i32);
                 Ok(true)
             }
             Expr::BufIndex {
@@ -948,6 +1768,217 @@ impl<'a> Codegen<'a> {
                 line,
                 col,
             } => self.emit_call(name, args, *line, *col),
+            Expr::Field {
+                receiver,
+                name,
+                line,
+                col,
+            } => {
+                let (info, offset) = self.field_info(receiver, name, *line, *col)?;
+                if matches!(info, FieldInfo::Buffer(_)) {
+                    // KOTO-0235: a buffer field reads as its region address —
+                    // `base + offset` with no trailing `load32`. A static
+                    // receiver folds to one constant; a struct parameter is
+                    // one runtime add, matching hand-written base-plus-offset.
+                    if let Some(base) = self.static_base(receiver) {
+                        self.emit_int_const((base + offset) as i32);
+                    } else {
+                        self.require_value(receiver)?;
+                        if offset != 0 {
+                            self.emit_int_const(offset as i32);
+                            self.emit("add_i32".to_string());
+                            self.adjust(-1);
+                        }
+                    }
+                    return Ok(true);
+                }
+                self.require_value(receiver)?;
+                if offset != 0 {
+                    self.emit_int_const(offset as i32);
+                    self.emit("add_i32".to_string());
+                    self.adjust(-1);
+                }
+                self.emit("load32".to_string());
+                Ok(true)
+            }
+            Expr::MethodCall {
+                receiver,
+                name,
+                args,
+                line,
+                col,
+            } => {
+                let receiver_ty = self.expr_type(receiver)?;
+                let Type::Struct(struct_name) = receiver_ty else {
+                    return Err(Diag::new(
+                        *line,
+                        *col,
+                        "method receiver must be a struct reference".to_string(),
+                    ));
+                };
+                let key = format!("{struct_name}::{name}");
+                let mut all_args = Vec::with_capacity(args.len() + 1);
+                all_args.push((**receiver).clone());
+                all_args.extend(args.iter().cloned());
+                if !self.funcs.contains_key(&key) {
+                    return Err(Diag::new(*line, *col, format!("unknown method `{key}`")));
+                }
+                self.emit_inline(&key, &all_args, *line, *col)
+            }
+        }
+    }
+
+    fn expr_type(&self, expr: &Expr) -> Result<Type, Diag> {
+        let (line, col) = expr.position();
+        match expr {
+            Expr::Bool { .. } => Ok(Type::Bool),
+            Expr::Int { .. }
+            | Expr::Str { .. }
+            | Expr::EnumMember { .. }
+            | Expr::BufIndex { .. } => Ok(Type::Int),
+            Expr::Ident { name, .. } => {
+                if let Some(ty) = self.lookup_local_type(name) {
+                    return Ok(ty.clone());
+                }
+                if let Some((_, ty)) = self.statics.get(name) {
+                    return Ok(Type::Struct(ty.clone()));
+                }
+                if self.lookup_buffer(name).is_some() || self.lookup_data(name).is_some() {
+                    return Ok(Type::Int);
+                }
+                if self.consts.contains_key(name) {
+                    return Ok(self.const_types.get(name).cloned().unwrap_or(Type::Int));
+                }
+                Err(Diag::new(line, col, format!("undefined name `{name}`")))
+            }
+            Expr::Unary { op, expr, .. } => {
+                let ty = self.expr_type(expr)?;
+                match op {
+                    UnOp::Neg if ty == Type::Int => Ok(Type::Int),
+                    UnOp::Not if matches!(ty, Type::Int | Type::Bool) => Ok(Type::Bool),
+                    _ => Err(Diag::new(
+                        line,
+                        col,
+                        "invalid unary operand type".to_string(),
+                    )),
+                }
+            }
+            Expr::Binary { op, lhs, rhs, .. } => {
+                let left = self.expr_type(lhs)?;
+                let right = self.expr_type(rhs)?;
+                if matches!(left, Type::Struct(_)) || matches!(right, Type::Struct(_)) {
+                    return Err(Diag::new(
+                        line,
+                        col,
+                        "struct values cannot be used with operators".to_string(),
+                    ));
+                }
+                Ok(
+                    if matches!(
+                        op,
+                        BinOp::Eq
+                            | BinOp::Ne
+                            | BinOp::Lt
+                            | BinOp::Le
+                            | BinOp::Gt
+                            | BinOp::Ge
+                            | BinOp::LAnd
+                            | BinOp::LOr
+                    ) {
+                        Type::Bool
+                    } else {
+                        Type::Int
+                    },
+                )
+            }
+            Expr::Call { name, .. } => {
+                if let Some(info) = self.funcs.get(name) {
+                    return info
+                        .ret
+                        .clone()
+                        .ok_or_else(|| Diag::new(line, col, format!("`{name}` returns no value")));
+                }
+                Ok(Type::Int)
+            }
+            Expr::Field { receiver, name, .. } => {
+                self.field_info(receiver, name, line, col)
+                    .map(|(info, _)| match info {
+                        FieldInfo::Scalar(ty) => ty,
+                        // A buffer field decays to its region address, like a
+                        // named `buf` (KOTO-0235).
+                        FieldInfo::Buffer(_) => Type::Int,
+                    })
+            }
+            Expr::MethodCall { receiver, name, .. } => {
+                let Type::Struct(struct_name) = self.expr_type(receiver)? else {
+                    return Err(Diag::new(
+                        line,
+                        col,
+                        "method receiver must be a struct reference".to_string(),
+                    ));
+                };
+                let key = format!("{struct_name}::{name}");
+                self.funcs
+                    .get(&key)
+                    .and_then(|info| info.ret.clone())
+                    .ok_or_else(|| Diag::new(line, col, format!("method `{key}` returns no value")))
+            }
+        }
+    }
+
+    fn field_info(
+        &self,
+        receiver: &Expr,
+        field: &str,
+        line: usize,
+        col: usize,
+    ) -> Result<(FieldInfo, u32), Diag> {
+        let Type::Struct(name) = self.expr_type(receiver)? else {
+            return Err(Diag::new(
+                line,
+                col,
+                "field receiver must be a struct reference".to_string(),
+            ));
+        };
+        self.structs
+            .get(&name)
+            .and_then(|layout| layout.fields.get(field))
+            .cloned()
+            .ok_or_else(|| Diag::new(line, col, format!("unknown field `{name}.{field}`")))
+    }
+
+    /// The constant heap base of a field receiver that names a `static`
+    /// record directly (and is not shadowed by a local). Buffer-field reads on
+    /// such receivers fold `base + offset` to one constant (KOTO-0235).
+    fn static_base(&self, receiver: &Expr) -> Option<u32> {
+        let Expr::Ident { name, .. } = receiver else {
+            return None;
+        };
+        if self.lookup_local(name).is_some() {
+            return None;
+        }
+        self.statics.get(name).map(|(offset, _)| *offset)
+    }
+
+    fn require_same_type(
+        &self,
+        expected: &Type,
+        actual: &Type,
+        line: usize,
+        col: usize,
+    ) -> Result<(), Diag> {
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(Diag::new(
+                line,
+                col,
+                format!(
+                    "type mismatch: expected {}, got {}",
+                    type_name(expected),
+                    type_name(actual)
+                ),
+            ))
         }
     }
 
@@ -1070,6 +2101,9 @@ impl<'a> Codegen<'a> {
         line: usize,
         col: usize,
     ) -> Result<bool, Diag> {
+        if name == "len" {
+            return self.emit_len(args, line, col);
+        }
         if let Some(result) = self.emit_heap_call(name, args, line, col)? {
             return Ok(result);
         }
@@ -1105,6 +2139,88 @@ impl<'a> Codegen<'a> {
             col,
             format!("call to undefined function `{name}`"),
         ))
+    }
+
+    /// KOTO-0233: `len(buf)` folds to the buffer's declared compile-time byte
+    /// capacity. A buffer lowers to a raw app-heap offset with no runtime
+    /// descriptor, so the operand must name a `buf` visible at this point under
+    /// the ordinary identifier resolution order (locals shadow buffers);
+    /// anything else is rejected at compile time.
+    fn emit_len(&mut self, args: &[Expr], line: usize, col: usize) -> Result<bool, Diag> {
+        if args.len() != 1 {
+            return Err(Diag::new(
+                line,
+                col,
+                format!("`len` takes 1 argument(s), got {}", args.len()),
+            ));
+        }
+        // KOTO-0235: `len(value.field)` folds to a buffer field's declared
+        // capacity — no heap read, local slot, or runtime instructions — on
+        // statics and struct parameters alike.
+        if let Expr::Field {
+            receiver,
+            name,
+            line,
+            col,
+        } = &args[0]
+        {
+            let (info, _) = self.field_info(receiver, name, *line, *col)?;
+            return match info {
+                FieldInfo::Buffer(capacity) => {
+                    self.emit_int_const(capacity as i32);
+                    Ok(true)
+                }
+                FieldInfo::Scalar(_) => Err(Diag::new(
+                    *line,
+                    *col,
+                    format!(
+                        "`{name}` is a 32-bit scalar field, not a buffer field; `len` is only defined for buffer capacities"
+                    ),
+                )),
+            };
+        }
+        let Expr::Ident { name, line, col } = &args[0] else {
+            let (line, col) = args[0].position();
+            return Err(Diag::new(
+                line,
+                col,
+                "`len` operand must name a `buf` declared earlier in this function".to_string(),
+            ));
+        };
+        if self.lookup_local(name).is_some() {
+            return Err(Diag::new(
+                *line,
+                *col,
+                format!(
+                    "`{name}` is a local value here, not a `buf`; its capacity is not statically known"
+                ),
+            ));
+        }
+        if let Some((_, size)) = self.lookup_buffer(name) {
+            self.emit_int_const(size as i32);
+            return Ok(true);
+        }
+        let func = self.scopes.last().unwrap().func.clone();
+        if self.buffer_offsets.contains_key(&(func, name.clone())) {
+            return Err(Diag::new(
+                *line,
+                *col,
+                format!("buf `{name}` is not in scope yet; `len` must follow its declaration"),
+            ));
+        }
+        if self.lookup_data(name).is_some()
+            || self.statics.contains_key(name)
+            || self.consts.contains_key(name)
+        {
+            return Err(Diag::new(
+                *line,
+                *col,
+                format!(
+                    "`{name}` is not a `buf`; `len` is only defined for local buffer capacities"
+                ),
+            ));
+        }
+        Err(Diag::new(*line, *col, format!("undefined name `{name}`")))
     }
 
     fn emit_heap_call(
@@ -1320,8 +2436,15 @@ impl<'a> Codegen<'a> {
         line: usize,
         col: usize,
     ) -> Result<bool, Diag> {
+        if self.scopes.iter().any(|scope| scope.func == name) {
+            return Err(Diag::new(
+                line,
+                col,
+                format!("recursion is not supported (in `{name}`)"),
+            ));
+        }
         let info_params = self.funcs.get(name).unwrap().params.clone();
-        let info_ret = self.funcs.get(name).unwrap().ret;
+        let info_ret = self.funcs.get(name).unwrap().ret.clone();
         let info_body = self.funcs.get(name).unwrap().body.clone();
         if args.len() != info_params.len() {
             return Err(Diag::new(
@@ -1350,19 +2473,24 @@ impl<'a> Codegen<'a> {
         // caller scope before the next argument is evaluated, so a nested inline call
         // inside a later argument allocates above the params it must not clobber.
         let mut locals = HashMap::new();
-        for (slot_index, ((pname, _), arg)) in info_params.iter().zip(args).enumerate() {
+        let mut local_types = HashMap::new();
+        for (slot_index, ((pname, pty), arg)) in info_params.iter().zip(args).enumerate() {
+            let actual = self.expr_type(arg)?;
+            self.require_same_type(pty, &actual, line, col)?;
             self.require_value(arg)?;
             let slot = call_base + slot_index;
             self.emit(format!("store_local {slot}"));
             self.adjust(-1);
             locals.insert(pname.clone(), slot);
+            local_types.insert(pname.clone(), pty.clone());
             self.scopes.last_mut().unwrap().next_slot = slot + 1;
         }
         self.max_slot = self.max_slot.max(call_base + info_params.len());
-        let end_label = self.new_label(&format!("ret_{name}"));
+        let end_label = self.new_label(&format!("ret_{}", name.replace("::", "_")));
         self.scopes.push(Scope {
             func: name.to_string(),
             locals,
+            local_types,
             buffers: HashMap::new(),
             next_slot: call_base + info_params.len(),
             end_label: end_label.clone(),
@@ -1692,6 +2820,13 @@ impl<'a> Codegen<'a> {
             .and_then(|scope| scope.locals.get(name).copied())
     }
 
+    fn lookup_local_type(&self, name: &str) -> Option<&Type> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.local_types.get(name))
+    }
+
     fn lookup_buffer(&self, name: &str) -> Option<(u32, u32)> {
         self.scopes
             .last()
@@ -1786,7 +2921,7 @@ pub fn slot_map(file: &str, program: &Program) -> Result<SlotMap, Diag> {
     let mut codegen = Codegen::new(file, program)?;
     codegen.run()?;
     let user_slots_used = codegen.max_slot;
-    let functions = program
+    let mut functions = program
         .functions
         .iter()
         .map(|function| FnSlots {
@@ -1796,7 +2931,14 @@ pub fn slot_map(file: &str, program: &Program) -> Result<SlotMap, Diag> {
             line: function.line,
             src: String::new(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    functions.extend(program.methods.iter().map(|method| FnSlots {
+        name: format!("{}::{}", method.target, method.function.name),
+        params: method.function.params.len(),
+        locals: peak_lets(&method.function.body),
+        line: method.function.line,
+        src: String::new(),
+    }));
     Ok(SlotMap {
         functions,
         user_slots_used,
@@ -1863,6 +3005,12 @@ fn collect_actor_arrays(
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value) => {
                 collect_actor_arrays_expr(value, consts, sink)
             }
+            Stmt::FieldAssign {
+                receiver, value, ..
+            } => {
+                collect_actor_arrays_expr(receiver, consts, sink);
+                collect_actor_arrays_expr(value, consts, sink);
+            }
             Stmt::BufStore { index, value, .. } => {
                 collect_actor_arrays_expr(index, consts, sink);
                 collect_actor_arrays_expr(value, consts, sink);
@@ -1911,6 +3059,14 @@ fn collect_actor_arrays_expr(
             }
         }
         Expr::BufIndex { index, .. } => collect_actor_arrays_expr(index, consts, sink),
+        Expr::Field { receiver, .. } => collect_actor_arrays_expr(receiver, consts, sink),
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_actor_arrays_expr(receiver, consts, sink);
+            for arg in args {
+                collect_actor_arrays_expr(arg, consts, sink);
+            }
+        }
+        Expr::EnumMember { .. } => {}
         Expr::Unary { expr, .. } => collect_actor_arrays_expr(expr, consts, sink),
         Expr::Binary { lhs, rhs, .. } => {
             collect_actor_arrays_expr(lhs, consts, sink);
@@ -1924,6 +3080,11 @@ fn const_actor_count(expr: &Expr, consts: &HashMap<String, i64>) -> Option<u32> 
     let value = match expr {
         Expr::Int { value, .. } => *value,
         Expr::Ident { name, .. } => *consts.get(name)?,
+        Expr::EnumMember {
+            enum_name,
+            member_name,
+            ..
+        } => *consts.get(&format!("{enum_name}::{member_name}"))?,
         _ => return None,
     };
     u32::try_from(value).ok().filter(|count| *count > 0)
@@ -1963,6 +3124,12 @@ fn collect_strings(stmts: &[Stmt], sink: &mut impl FnMut(&[u8])) {
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value) => {
                 collect_strings_expr(value, sink)
             }
+            Stmt::FieldAssign {
+                receiver, value, ..
+            } => {
+                collect_strings_expr(receiver, sink);
+                collect_strings_expr(value, sink);
+            }
             Stmt::BufStore { index, value, .. } => {
                 collect_strings_expr(index, sink);
                 collect_strings_expr(value, sink);
@@ -1993,6 +3160,13 @@ fn collect_strings_expr(expr: &Expr, sink: &mut impl FnMut(&[u8])) {
     match expr {
         Expr::Str { bytes, .. } => sink(bytes),
         Expr::BufIndex { index, .. } => collect_strings_expr(index, sink),
+        Expr::Field { receiver, .. } => collect_strings_expr(receiver, sink),
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_strings_expr(receiver, sink);
+            for arg in args {
+                collect_strings_expr(arg, sink);
+            }
+        }
         Expr::Unary { expr, .. } => collect_strings_expr(expr, sink),
         Expr::Binary { lhs, rhs, .. } => {
             collect_strings_expr(lhs, sink);
@@ -2012,6 +3186,12 @@ fn collect_calls(stmts: &[Stmt], sink: &mut impl FnMut(&str)) {
         match stmt {
             Stmt::Let { value, .. } | Stmt::Assign { value, .. } | Stmt::Expr(value) => {
                 collect_calls_expr(value, sink)
+            }
+            Stmt::FieldAssign {
+                receiver, value, ..
+            } => {
+                collect_calls_expr(receiver, sink);
+                collect_calls_expr(value, sink);
             }
             Stmt::BufStore { index, value, .. } => {
                 collect_calls_expr(index, sink);
@@ -2048,6 +3228,13 @@ fn collect_calls_expr(expr: &Expr, sink: &mut impl FnMut(&str)) {
             }
         }
         Expr::BufIndex { index, .. } => collect_calls_expr(index, sink),
+        Expr::Field { receiver, .. } => collect_calls_expr(receiver, sink),
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_calls_expr(receiver, sink);
+            for arg in args {
+                collect_calls_expr(arg, sink);
+            }
+        }
         Expr::Unary { expr, .. } => collect_calls_expr(expr, sink),
         Expr::Binary { lhs, rhs, .. } => {
             collect_calls_expr(lhs, sink);

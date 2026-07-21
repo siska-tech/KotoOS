@@ -1,0 +1,54 @@
+// Bounded nonblocking Fetch sample. The same source uses the deterministic
+// KotoSim backend and the device AppFetchService boundary.
+
+fn main() {
+    buf response[512];
+    let request = fetch_start("https://siska-tech.jp/", 22);
+    let state = FETCH_PENDING;
+    let status = 0;
+    let total = 0;
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            if request >= 0 { fetch_cancel(request); }
+            exit(0);
+        }
+
+        if request < 0 {
+            draw_rect(0, 0, 320, 320, 0);
+            draw_text(16, 24, "fetch unavailable or denied", 27);
+            yield_frame();
+        }
+
+        if state != FETCH_COMPLETE && state != FETCH_FAILED {
+            state = fetch_poll_state(request);
+            if state == FETCH_HEADERS {
+                status = fetch_poll_metadata(request);
+            }
+            if state == FETCH_HEADERS || state == FETCH_BODY {
+                let read = fetch_read(request, response + total, FETCH_MAX_READ - total);
+                if read > 0 { total = total + read; }
+            }
+        }
+
+        draw_rect(0, 0, 320, 320, 0);
+        if state == FETCH_PENDING {
+            draw_text(16, 24, "fetch pending", 13);
+        }
+        if state == FETCH_HEADERS || state == FETCH_BODY {
+            draw_text(16, 24, "fetch receiving", 15);
+        }
+        if state == FETCH_COMPLETE {
+            draw_text(16, 24, "fetch complete", 14);
+            draw_text(16, 48, response, total);
+        }
+        if state == FETCH_FAILED {
+            draw_text(16, 24, "fetch failed/offline", 20);
+        }
+        if status == 200 {
+            draw_text(16, 72, "HTTP 200", 8);
+        }
+        yield_frame();
+    }
+}

@@ -18,9 +18,9 @@ use crate::runtime::text_intent;
 /// `0xb4..=0xb7` arrows, `0x81`-based function keys, `0xa2/0xa3` shifts,
 /// `0xa5` Ctrl, `0xb1` Esc.
 ///
-/// Esc maps to CANCEL: the sim carries CANCEL on LeftCtrl (its Esc closes the
-/// simulator window itself), and on the PicoCalc keyboard Esc is the natural
-/// CANCEL carrier next to Ctrl (KOTO-0177). Esc additionally acts as game
+/// Esc and Ctrl+G map to CANCEL. The simulator uses Ctrl+G because its Esc closes
+/// the window; PicoCalc keyboard firmware reports Ctrl+G as ASCII BEL (`0x07`).
+/// Esc additionally acts as game
 /// button B through the firmware's held-key game-pad bits; intents and pad
 /// bits coexist, exactly like Enter (NEWLINE intent + button A).
 ///
@@ -47,14 +47,14 @@ pub const fn intent_for_key(key: u8) -> u32 {
         0xb6 => text_intent::DOWN,
         0x0a => text_intent::NEWLINE,
         0x08 => text_intent::BACKSPACE,
-        0x09 => text_intent::CONVERT,
+        0x09 | b' ' => text_intent::CONVERT,
         0x81 => text_intent::IME_TOGGLE, // F1
         0xa2 => text_intent::SHIFT,
-        0xa3 => text_intent::COMMIT,
-        0xa5 | 0xb1 => text_intent::CANCEL, // Ctrl, Esc
-        0x82 => text_intent::SAVE,          // F2
-        0x84 => text_intent::OPEN,          // F4
-        0x85 => text_intent::NEW,           // F5
+        0x07 | 0xb1 => text_intent::CANCEL, // Ctrl+G, Esc
+        0xa3 => text_intent::SHIFT,
+        0x82 => text_intent::SAVE, // F2
+        0x84 => text_intent::OPEN, // F4
+        0x85 => text_intent::NEW,  // F5
         // F10 (Shift+F5 keycap legend): 0x90 measured on device; 0x8a is the
         // unobserved protocol-block assumption, kept as a harmless alias.
         0x90 | 0x8a => text_intent::EXIT,
@@ -63,6 +63,14 @@ pub const fn intent_for_key(key: u8) -> u32 {
         0xd5 => text_intent::END,    // End (Shift+Del keycap legend)
         _ => 0,
     }
+}
+
+/// Whether a PicoCalc key closes the native KotoConfig surface.
+///
+/// F1 toggles the surface it opened; F10 reuses the same device-verified EXIT
+/// carriers as apps. Other application intents do not leak into KotoConfig.
+pub const fn is_config_exit_key(key: u8) -> bool {
+    key == 0x81 || intent_for_key(key) & text_intent::EXIT != 0
 }
 
 /// Typed codepoint delivered to apps for a pressed keyboard-bridge key event,
@@ -99,8 +107,28 @@ mod tests {
     }
 
     #[test]
+    fn config_exits_on_f1_and_f10_only() {
+        for key in 0..=u8::MAX {
+            assert_eq!(
+                is_config_exit_key(key),
+                matches!(key, 0x81 | 0x8a | 0x90),
+                "key {key:#04x}"
+            );
+        }
+    }
+
+    #[test]
     fn escape_delivers_cancel_not_exit() {
         assert_eq!(intent_for_key(0xb1), text_intent::CANCEL);
+        assert_eq!(intent_for_key(0x07), text_intent::CANCEL);
+        assert_eq!(intent_for_key(0xa5), 0);
+    }
+
+    #[test]
+    fn skk_keys_use_space_enter_and_ctrl_g_semantics() {
+        assert_eq!(intent_for_key(b' '), text_intent::CONVERT);
+        assert_eq!(intent_for_key(0x0a), text_intent::NEWLINE);
+        assert_eq!(intent_for_key(0xa3), text_intent::SHIFT);
     }
 
     /// The bridge translates the shifted plane itself: Shift+Tab arrives as

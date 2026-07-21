@@ -250,7 +250,11 @@ impl<'a> Canvas<'a> {
                 baseline_y += i32::from(font.cell_height());
                 continue;
             }
-            match font.glyph(ch) {
+            match font
+                .glyph(ch)
+                .or_else(|| font.glyph('\u{fffd}'))
+                .or_else(|| font.glyph('?'))
+            {
                 Some(glyph) => {
                     self.draw_glyph(cursor, baseline_y, &glyph, fg);
                     cursor += glyph.width() as i32;
@@ -514,6 +518,45 @@ mod tests {
         assert_eq!(pixel_at(&buf, 4, 1, 0), 0xFFFF);
         assert_eq!(pixel_at(&buf, 4, 1, 2), 0xFFFF);
         assert_eq!(pixel_at(&buf, 4, 2, 0), 0x0000);
+    }
+
+    #[test]
+    fn missing_text_glyph_prefers_replacement_then_question_mark() {
+        let mut data = std::vec::Vec::new();
+        data.extend_from_slice(b"KFNT");
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&[1, 1, 1, 1]);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        // Sorted index: '?' is blank, U+FFFD is set. A missing 'Z' must render
+        // U+FFFD rather than silently advancing or selecting '?'.
+        data.extend_from_slice(&(b'?' as u32).to_le_bytes());
+        data.extend_from_slice(&[1, 1]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0xfffdu32.to_le_bytes());
+        data.extend_from_slice(&[1, 1]);
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&[0, 0b1000_0000]);
+        let font = BitmapFont::from_bytes(&data).unwrap();
+        let mut buf = canvas_buf(2, 1);
+        Canvas::new(&mut buf, 2, 1)
+            .unwrap()
+            .draw_text(0, 0, &font, "Z", Rgb565(0xffff));
+        assert_eq!(pixel_at(&buf, 2, 0, 0), 0xffff);
+
+        // With no replacement glyph, the same path falls back to '?'.
+        data[12..16].copy_from_slice(&1u32.to_le_bytes());
+        data.truncate(16 + 10 + 1);
+        data[16..20].copy_from_slice(&(b'?' as u32).to_le_bytes());
+        data[20..22].copy_from_slice(&[1, 1]);
+        data[22..26].copy_from_slice(&0u32.to_le_bytes());
+        data[26] = 0b1000_0000;
+        let font = BitmapFont::from_bytes(&data).unwrap();
+        let mut buf = canvas_buf(2, 1);
+        Canvas::new(&mut buf, 2, 1)
+            .unwrap()
+            .draw_text(0, 0, &font, "Z", Rgb565(0xffff));
+        assert_eq!(pixel_at(&buf, 2, 0, 0), 0xffff);
     }
 
     #[test]
