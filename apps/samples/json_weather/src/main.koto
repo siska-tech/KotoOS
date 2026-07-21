@@ -1,0 +1,196 @@
+// Bounded incremental JSON decoding over the Fetch boundary (KOTO-0246 on top
+// of KOTO-0245). The response is fed to the host decoder chunk by chunk as it
+// arrives; the app selects "location" (string) and "temperature_c" (number),
+// skips the unknown nested "station" object by nesting depth, and keeps
+// missing, duplicate, and wrong-type fields distinguishable. At most one
+// bounded chunk is parsed per frame, so decoding never blocks the frame loop.
+
+// Field-selection outcomes (found flags).
+const F_MISSING = 0;
+const F_FOUND = 1;
+const F_DUPLICATE = 2;
+const F_WRONG_TYPE = 3;
+
+// Which named field the most recent depth-1 key selected.
+const T_NONE = 0;
+const T_LOCATION = 1;
+const T_TEMP = 2;
+
+// Token scratch sized to the decoder bound (JSON_MAX_TOKEN) so json_token can
+// never reject; the guard below keeps the two in lockstep.
+const TOK_BYTES = 256;
+
+fn str_eq(a: int, b: int, n: int) -> int {
+    let i = 0;
+    while i < n {
+        if heap_get_u8(a + i) != heap_get_u8(b + i) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Integer prefix of a JSON number token (sign + leading digits).
+fn tok_to_int(p: int, n: int) -> int {
+    let v = 0;
+    let i = 0;
+    let neg = 0;
+    if n > 0 && heap_get_u8(p) == 45 { neg = 1; i = 1; }
+    while i < n {
+        let c = heap_get_u8(p + i);
+        if c < 48 || c > 57 { break; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    if neg == 1 { return 0 - v; }
+    return v;
+}
+
+// Decimal text of v at dst; returns the byte length.
+fn fmt_int(dst: int, v: int) -> int {
+    let n = v;
+    let neg = 0;
+    if n < 0 { neg = 1; n = 0 - n; }
+    let digits = 1;
+    let probe = n;
+    while probe >= 10 { probe = probe / 10; digits = digits + 1; }
+    let i = digits + neg - 1;
+    while i >= neg {
+        heap_set_u8(dst + i, 48 + n % 10);
+        n = n / 10;
+        i = i - 1;
+    }
+    if neg == 1 { heap_set_u8(dst, 45); }
+    return digits + neg;
+}
+
+fn draw_flag(y: int, flag: int) {
+    if flag == F_MISSING { draw_text(160, y, "missing", 7); }
+    if flag == F_DUPLICATE { draw_text(160, y, "duplicate", 9); }
+    if flag == F_WRONG_TYPE { draw_text(160, y, "wrong type", 10); }
+}
+
+fn main() {
+    buf chunk[128];
+    buf tok[TOK_BYTES];
+    buf city[40];
+    buf num[16];
+    if TOK_BYTES < JSON_MAX_TOKEN { exit(1); }
+    let request = fetch_start("https://weather.example/current", 31);
+    let state = FETCH_PENDING;
+    let chunk_len = 0;
+    let chunk_pos = 0;
+    let target = T_NONE;
+    let city_flag = F_MISSING;
+    let city_len = 0;
+    let temp_flag = F_MISSING;
+    let temp = 0;
+    let doc_done = 0;
+    let parse_err = 0;
+    let err_at = 0;
+    json_reset();
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            if request >= 0 { fetch_cancel(request); }
+            exit(0);
+        }
+
+        if request < 0 {
+            draw_rect(0, 0, 320, 320, 0);
+            draw_text(16, 24, "fetch unavailable or denied", 27);
+            yield_frame();
+            continue;
+        }
+
+        // Refill the parse chunk from the transfer once the previous chunk is
+        // fully consumed. One bounded read per frame.
+        if state != FETCH_COMPLETE && state != FETCH_FAILED {
+            state = fetch_poll_state(request);
+            if (state == FETCH_HEADERS || state == FETCH_BODY) && chunk_pos >= chunk_len {
+                let read = fetch_read(request, chunk, len(chunk));
+                if read > 0 {
+                    chunk_len = read;
+                    chunk_pos = 0;
+                }
+            }
+        }
+
+        // Feed the decoder until this chunk is drained (or the document ends).
+        while parse_err == 0 && doc_done == 0 {
+            let ev = JSON_NEED_MORE;
+            if chunk_pos < chunk_len {
+                ev = json_next(chunk + chunk_pos, chunk_len - chunk_pos);
+                chunk_pos = chunk_pos + json_consumed();
+            } else {
+                if state != FETCH_COMPLETE { break; }
+                ev = json_finish();
+            }
+            if ev == JSON_NEED_MORE { continue; }
+            if ev == JSON_ERROR {
+                parse_err = json_error_code();
+                err_at = json_error_offset();
+            }
+            if ev == JSON_END_DOC { doc_done = 1; }
+            if ev == JSON_KEY {
+                // Only depth-1 keys are field names of the root object; deeper
+                // keys belong to unknown subtrees being skipped.
+                if json_depth() == 1 {
+                    let klen = json_token(tok, len(tok));
+                    target = T_NONE;
+                    if klen == 8 && str_eq(tok, "location", 8) == 1 { target = T_LOCATION; }
+                    if klen == 13 && str_eq(tok, "temperature_c", 13) == 1 { target = T_TEMP; }
+                }
+            }
+            if ev >= JSON_BEGIN_OBJECT && ev <= JSON_NULL && ev != JSON_KEY && ev != JSON_END_OBJECT && ev != JSON_END_ARRAY {
+                // A value event. It answers the pending depth-1 key selection,
+                // if any; every other value is part of a skipped subtree.
+                if target == T_LOCATION {
+                    if ev != JSON_STR { city_flag = F_WRONG_TYPE; }
+                    else {
+                        if city_flag == F_FOUND { city_flag = F_DUPLICATE; }
+                        else {
+                            city_len = json_token(city, len(city));
+                            city_flag = F_FOUND;
+                        }
+                    }
+                }
+                if target == T_TEMP {
+                    if ev != JSON_NUMBER { temp_flag = F_WRONG_TYPE; }
+                    else {
+                        if temp_flag == F_FOUND { temp_flag = F_DUPLICATE; }
+                        else {
+                            let tlen = json_token(tok, len(tok));
+                            temp = tok_to_int(tok, tlen);
+                            temp_flag = F_FOUND;
+                        }
+                    }
+                }
+                target = T_NONE;
+            }
+        }
+
+        draw_rect(0, 0, 320, 320, 0);
+        if state == FETCH_PENDING { draw_text(16, 24, "fetch pending", 13); }
+        if state == FETCH_HEADERS || state == FETCH_BODY {
+            draw_text(16, 24, "receiving + parsing", 19);
+        }
+        if state == FETCH_FAILED { draw_text(16, 24, "fetch failed/offline", 20); }
+        if parse_err != 0 {
+            draw_text(16, 24, "json error", 10);
+            draw_text(120, 24, num, fmt_int(num, parse_err));
+            draw_text(160, 24, "at", 2);
+            draw_text(192, 24, num, fmt_int(num, err_at));
+        }
+        if doc_done == 1 { draw_text(16, 24, "parsed", 6); }
+
+        draw_text(16, 56, "location:", 9);
+        if city_flag == F_FOUND { draw_text(160, 56, city, city_len); }
+        draw_flag(56, city_flag);
+
+        draw_text(16, 80, "temp_c:", 7);
+        if temp_flag == F_FOUND { draw_text(160, 80, num, fmt_int(num, temp)); }
+        draw_flag(80, temp_flag);
+        yield_frame();
+    }
+}

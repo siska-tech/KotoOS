@@ -1,0 +1,674 @@
+// App-owned stateful packet builders. Each App declares its own top-level
+// `static` instances; the SDK deliberately owns no mutable singleton. A
+// builder is active only between begin and finish. Do not call yield_frame in
+// that interval, and do not re-enter an active builder. finish only seals the
+// packet: ui_mount/ui_update/ui_present remain explicit App operations.
+struct UiMountBuilder {
+    packet: int,
+    capacity: int,
+    record_capacity: int,
+    record_count: int,
+    data_offset: int,
+    data_cursor: int,
+    status: int,
+    active: bool,
+}
+
+struct UiUpdateBuilder {
+    packet: int,
+    capacity: int,
+    record_capacity: int,
+    record_count: int,
+    data_offset: int,
+    data_cursor: int,
+    status: int,
+    active: bool,
+}
+
+impl UiMountBuilder {
+    fn begin(self, packet: int, capacity: int, record_capacity: int,
+        root_id: int, initial_focus_id: int) -> int {
+        if self.active {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        if capacity < UI_MOUNT_HEADER_BYTES || capacity > UI_MAX_MOUNT_BYTES ||
+           record_capacity < 1 || record_capacity > UI_MAX_NODES {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            self.active = false;
+            return self.status;
+        }
+        let data_offset = UI_MOUNT_HEADER_BYTES + record_capacity * UI_NODE_RECORD_BYTES;
+        let status = ui_mount_begin(packet, capacity, record_capacity, data_offset,
+            root_id, initial_focus_id);
+        self.status = status;
+        self.active = status == UI_SDK_OK;
+        if status == UI_SDK_OK {
+            self.packet = packet;
+            self.capacity = capacity;
+            self.record_capacity = record_capacity;
+            self.record_count = 0;
+            self.data_offset = data_offset;
+            self.data_cursor = 0;
+        }
+        return status;
+    }
+
+    fn label(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        text: int, text_len: int, text_capacity: int, alignment: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || text_len < 0 ||
+           text_capacity < text_len || self.data_cursor + text_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + text_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        if alignment < UI_ALIGN_START || alignment > UI_ALIGN_END {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::Label, flags, 0, x, y, width, height,
+            self.data_cursor, text_len, text_capacity, 0, 0, 0,
+            alignment, 0, 0, 0);
+        let i = 0;
+        while i < text_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < text_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(text + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + text_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn button(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        text: int, text_len: int, text_capacity: int, closes_dialog: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || text_len < 0 ||
+           text_capacity < text_len || self.data_cursor + text_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + text_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        let state = 0;
+        if closes_dialog { state = 1; }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::Button, flags, state, x, y, width, height,
+            self.data_cursor, text_len, text_capacity, 0, 0, 0, 0, 0, 0, 0);
+        let i = 0;
+        while i < text_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < text_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(text + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + text_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn checkbox(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        text: int, text_len: int, text_capacity: int, checked: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || text_len < 0 ||
+           text_capacity < text_len || self.data_cursor + text_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + text_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        let state = 0;
+        if checked { state = 1; }
+        let side = height;
+        if side > 12 { side = 12; }
+        if side > width {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::Checkbox, flags, state, x, y, width, height,
+            self.data_cursor, text_len, text_capacity, 0, 0, 0,
+            0, 0, 0, 0);
+        let i = 0;
+        while i < text_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < text_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(text + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + text_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn checkbox_with_mark_offset(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        text: int, text_len: int, text_capacity: int, checked: bool,
+        mark_offset_x: int, mark_offset_y: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || text_len < 0 ||
+           text_capacity < text_len || self.data_cursor + text_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + text_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        let state = 0;
+        if checked { state = 1; }
+        let side = height;
+        if side > 12 { side = 12; }
+        let mark_y = (height - side) / 2 + mark_offset_y;
+        if side <= 0 || mark_offset_x < 0 || mark_offset_x + side > width ||
+           mark_y < 0 || mark_y + side > height {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::Checkbox, flags, state, x, y, width, height,
+            self.data_cursor, text_len, text_capacity, 0, 0, 0,
+            mark_offset_x, mark_offset_y, 0, 0);
+        let i = 0;
+        while i < text_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < text_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(text + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + text_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn list(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        rows: int, rows_len: int, rows_capacity: int,
+        row_count: int, selected: int, row_height: int, show_scrollbar: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || rows_len < 0 ||
+           rows_capacity < rows_len || self.data_cursor + rows_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + rows_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        let state = 0;
+        if show_scrollbar { state = 1; }
+        if row_count < 0 || row_count > UI_MAX_LIST_ROWS ||
+           selected < UI_SELECTION_NONE || selected >= row_count ||
+           row_height < 1 || row_height > 32767 || rows_len < row_count * 12 {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::List, flags, state, x, y, width, height,
+            0, 0, 0, self.data_cursor, rows_len, rows_capacity,
+            row_count, selected, row_height, 0);
+        let i = 0;
+        while i < rows_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < rows_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(rows + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + rows_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn list_builder(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        rows: UiListRowsBuilder, rows_capacity: int,
+        selected: int, row_height: int, show_scrollbar: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if !rows.complete || rows.active || rows.status != UI_SDK_OK ||
+           ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || rows_capacity < rows.label_cursor ||
+           self.data_cursor + rows_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + rows_capacity > self.capacity ||
+           selected < UI_SELECTION_NONE || selected >= rows.row_count ||
+           row_height < 1 || row_height > 32767 {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let state = 0; if show_scrollbar { state = 1; }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::List, flags, state, x, y, width, height,
+            0, 0, 0, self.data_cursor, rows.label_cursor, rows_capacity,
+            rows.row_count, selected, row_height, 0);
+        let i = 0;
+        while i < rows_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < rows.label_cursor {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(rows.blob + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + rows_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn text_field(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        label: int, label_len: int, label_capacity: int,
+        value: int, value_len: int, value_capacity: int, cursor: int, ime: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || label_len < 0 || value_len < 0 ||
+           label_capacity < label_len || value_capacity < value_len ||
+           self.data_cursor + label_capacity + value_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + label_capacity + value_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        let state = 0;
+        if ime { state = 1; }
+        let value_offset = self.data_cursor + label_capacity;
+        if cursor < UI_CURSOR_END || cursor > value_len ||
+           value_capacity > UI_MAX_TEXT_FIELD_BYTES {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::TextField, flags, state, x, y, width, height,
+            self.data_cursor, label_len, label_capacity,
+            value_offset, value_len, value_capacity, cursor, 0, 0, 0);
+        let i = 0;
+        while i < label_capacity + value_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < label_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(label + i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < value_len {
+            heap_set_u8(self.packet + self.data_offset + value_offset + i,
+                heap_get_u8(value + i));
+            i = i + 1;
+        }
+        self.data_cursor = value_offset + value_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn panel(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        title: int, title_len: int, title_capacity: int,
+        padding: int, title_height: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || title_len < 0 ||
+           title_capacity < title_len || self.data_cursor + title_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + title_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        if padding < 0 || padding > 32 || title_height < 0 || title_height > 64 {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::Panel, flags, 0, x, y, width, height,
+            self.data_cursor, title_len, title_capacity, 0, 0, 0,
+            padding, title_height, 0, 0);
+        let i = 0;
+        while i < title_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < title_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(title + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + title_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn dialog(self, id: int, parent: int, flags: int,
+        x: int, y: int, width: int, height: int,
+        title: int, title_len: int, title_capacity: int,
+        padding: int, title_height: int, default_action: int, cancel_action: int,
+        open: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if ui_sdk_builder_node_args_valid(id, parent, flags, x, y, width, height) != UI_SDK_OK ||
+           self.record_count >= self.record_capacity || title_len < 0 ||
+           title_capacity < title_len || self.data_cursor + title_capacity > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + title_capacity > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        let state = 0;
+        if open { state = 1; }
+        if padding < 0 || padding > 32 || title_height < 0 || title_height > 64 ||
+           default_action < UI_ACTION_NONE || default_action == 0 || default_action >= 65535 ||
+           cancel_action < UI_ACTION_NONE || cancel_action == 0 || cancel_action >= 65535 {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        ui_sdk_builder_node_write(self.packet, self.record_count,
+            id, parent, UiNodeKind::Dialog, flags, state, x, y, width, height,
+            self.data_cursor, title_len, title_capacity, 0, 0, 0,
+            padding, title_height, default_action, cancel_action);
+        let i = 0;
+        while i < title_capacity {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while i < title_len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(title + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + title_capacity;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn finish(self) -> int {
+        if !self.active { return UI_SDK_BAD_ARGUMENT; }
+        self.active = false;
+        if self.status != UI_SDK_OK { return self.status; }
+        if self.record_count < 1 {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        heap_set_u16(self.packet + 12, self.record_count);
+        let total_len = self.data_offset + self.data_cursor;
+        let status = ui_mount_finish(self.packet, self.capacity, total_len, self.data_offset);
+        self.status = status;
+        if status != UI_SDK_OK { return status; }
+        return total_len;
+    }
+}
+
+impl UiUpdateBuilder {
+    fn begin(self, packet: int, capacity: int, record_capacity: int) -> int {
+        if self.active {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            return self.status;
+        }
+        if capacity < UI_UPDATE_HEADER_BYTES || capacity > UI_MAX_UPDATE_BYTES ||
+           record_capacity < 1 || record_capacity > UI_MAX_UPDATE_RECORDS {
+            self.status = UI_SDK_BAD_ARGUMENT;
+            self.active = false;
+            return self.status;
+        }
+        let data_offset = UI_UPDATE_HEADER_BYTES + record_capacity * UI_UPDATE_RECORD_BYTES;
+        let status = ui_update_begin(packet, capacity, record_capacity, data_offset);
+        self.status = status;
+        self.active = status == UI_SDK_OK;
+        if status == UI_SDK_OK {
+            self.packet = packet;
+            self.capacity = capacity;
+            self.record_capacity = record_capacity;
+            self.record_count = 0;
+            self.data_offset = data_offset;
+            self.data_cursor = 0;
+        }
+        return status;
+    }
+
+    fn text(self, widget_id: int, src: int, len: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity || len < 0 ||
+           self.data_cursor + len > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + len > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_set_text(self.packet, self.capacity, self.record_count,
+            widget_id, self.data_cursor, len);
+        if status == UI_SDK_OK {
+            status = ui_packet_copy(self.packet, self.capacity,
+                self.data_offset + self.data_cursor, src, len);
+        }
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.data_cursor = self.data_cursor + len;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    // Copy one completed TextResource line directly into this transaction.
+    // Validation is performed before either the record or data area changes;
+    // the resource remains caller-owned for the duration of this call only.
+    fn text_resource(self, widget_id: int, resource: TextResource, line: int) -> int {
+        if !self.active {
+            if self.status == UI_SDK_OK { self.status = UI_SDK_BAD_ARGUMENT; }
+            return self.status;
+        }
+        if self.status != UI_SDK_OK { return self.status; }
+        if !resource.complete || resource.status != UI_SDK_OK ||
+           line < 0 || line >= resource.line_count ||
+           self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let len = heap_get_u16(resource.storage + line * 4 + 2);
+        let offset = heap_get_u16(resource.storage + line * 4);
+        if offset < 0 || len < 0 || offset + len > resource.payload_len ||
+           resource.payload_offset + offset + len > resource.capacity ||
+           self.data_cursor + len > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + len > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_set_text(self.packet, self.capacity, self.record_count,
+            widget_id, self.data_cursor, len);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        let src = resource.storage + resource.payload_offset + offset;
+        let i = 0;
+        while i < len {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(src + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + len;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn enabled(self, widget_id: int, enabled: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let value = 0; if enabled { value = 1; }
+        let status = ui_update_set_enabled(self.packet, self.capacity, self.record_count,
+            widget_id, value);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.record_count = self.record_count + 1; return UI_SDK_OK;
+    }
+
+    fn visible(self, widget_id: int, visible: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let value = 0; if visible { value = 1; }
+        let status = ui_update_set_visible(self.packet, self.capacity, self.record_count,
+            widget_id, value);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.record_count = self.record_count + 1; return UI_SDK_OK;
+    }
+
+    fn checked(self, widget_id: int, checked: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let value = 0; if checked { value = 1; }
+        let status = ui_update_set_checked(self.packet, self.capacity, self.record_count,
+            widget_id, value);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.record_count = self.record_count + 1; return UI_SDK_OK;
+    }
+
+    fn selection(self, widget_id: int, selected: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_set_selection(self.packet, self.capacity, self.record_count,
+            widget_id, selected);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.record_count = self.record_count + 1; return UI_SDK_OK;
+    }
+
+    fn text_value(self, widget_id: int, src: int, len: int, cursor: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity || len < 0 ||
+           self.data_cursor + len > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + len > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_set_text_value(self.packet, self.capacity, self.record_count,
+            widget_id, self.data_cursor, len, cursor);
+        if status == UI_SDK_OK {
+            status = ui_packet_copy(self.packet, self.capacity,
+                self.data_offset + self.data_cursor, src, len);
+        }
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.data_cursor = self.data_cursor + len;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn bounds(self, widget_id: int, x: int, y: int, width: int, height: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_set_bounds(self.packet, self.capacity, self.record_count,
+            widget_id, x, y, width, height);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.record_count = self.record_count + 1; return UI_SDK_OK;
+    }
+
+    fn list_rows(self, widget_id: int, rows: int, rows_len: int,
+        row_count: int, selected: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity || rows_len < 0 ||
+           self.data_cursor + rows_len > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + rows_len > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_set_list_rows(self.packet, self.capacity, self.record_count,
+            widget_id, self.data_cursor, rows_len, row_count, selected);
+        if status == UI_SDK_OK {
+            status = ui_packet_copy(self.packet, self.capacity,
+                self.data_offset + self.data_cursor, rows, rows_len);
+        }
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.data_cursor = self.data_cursor + rows_len;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn list_rows_builder(self, widget_id: int, rows: UiListRowsBuilder,
+        selected: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if !rows.complete || rows.active || rows.status != UI_SDK_OK ||
+           self.record_count >= self.record_capacity ||
+           self.data_cursor + rows.label_cursor > UI_MAX_DATA_BYTES ||
+           self.data_offset + self.data_cursor + rows.label_cursor > self.capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_set_list_rows(self.packet, self.capacity,
+            self.record_count, widget_id, self.data_cursor, rows.label_cursor,
+            rows.row_count, selected);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        let i = 0;
+        while i < rows.label_cursor {
+            heap_set_u8(self.packet + self.data_offset + self.data_cursor + i,
+                heap_get_u8(rows.blob + i));
+            i = i + 1;
+        }
+        self.data_cursor = self.data_cursor + rows.label_cursor;
+        self.record_count = self.record_count + 1;
+        return UI_SDK_OK;
+    }
+
+    fn dialog_open(self, widget_id: int, open: bool) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let value = 0; if open { value = 1; }
+        let status = ui_update_set_dialog_open(self.packet, self.capacity, self.record_count,
+            widget_id, value);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.record_count = self.record_count + 1; return UI_SDK_OK;
+    }
+
+    fn request_focus(self, widget_id: int) -> int {
+        if !self.active || self.status != UI_SDK_OK { return self.status; }
+        if self.record_count >= self.record_capacity {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        let status = ui_update_request_focus(self.packet, self.capacity, self.record_count, widget_id);
+        if status != UI_SDK_OK { self.status = status; return status; }
+        self.record_count = self.record_count + 1; return UI_SDK_OK;
+    }
+
+    fn finish(self) -> int {
+        if !self.active { return UI_SDK_BAD_ARGUMENT; }
+        self.active = false;
+        if self.status != UI_SDK_OK { return self.status; }
+        if self.record_count < 1 {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        heap_set_u16(self.packet + 12, self.record_count);
+        let total_len = self.data_offset + self.data_cursor;
+        let status = ui_update_finish(self.packet, self.capacity, total_len, self.data_offset);
+        self.status = status;
+        if status != UI_SDK_OK { return status; }
+        return total_len;
+    }
+
+    // Seal and submit exactly one active KUP1 transaction. Presentation stays
+    // explicit so callers may batch accepted updates before ui_present().
+    fn submit(self) -> int {
+        if !self.active { return UI_SDK_BAD_ARGUMENT; }
+        self.active = false;
+        if self.status != UI_SDK_OK { return self.status; }
+        if self.record_count < 1 {
+            self.status = UI_SDK_BAD_ARGUMENT; return self.status;
+        }
+        heap_set_u16(self.packet + 12, self.record_count);
+        let total_len = self.data_offset + self.data_cursor;
+        let status = ui_update_finish(self.packet, self.capacity, total_len, self.data_offset);
+        self.status = status;
+        if status != UI_SDK_OK { return status; }
+        status = ui_update(self.packet, total_len);
+        self.status = status;
+        return status;
+    }
+}

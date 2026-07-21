@@ -1,0 +1,331 @@
+// Koto Weather (KOTO-0247): a bilingual reference app proving a packaged Koto
+// application can retrieve, decode, cache, and present bounded Internet data
+// through the public SDK only. It uses the manifest-allowlisted Fetch origin
+// (KOTO-0245), the bounded incremental JSON decoder (KOTO-0246), and the
+// advisory time query (this issue's `time_query`, ABI minor 21). It stays
+// useful and honest when Wi-Fi, time, the provider, or the cache is missing.
+//
+// The response contract is the provider-neutral `kwd1` document in
+// docs/spec/WEATHER_DATA_MODEL.md; whatever server answers the GET adapts a
+// real provider into it, so no provider key ever reaches the package.
+include <sdk/koto_ui.koto>;
+
+enum WLocale {
+    En,
+    Ja,
+    QpsPloc,
+}
+
+enum WWidget {
+    Panel = 1,
+    Field,
+    Refresh,
+    Unit,
+    Status,
+    Loc,
+    Cond,
+    Temp,
+    Range,
+    Precip,
+    Updated,
+}
+
+// Status indexes select locale line W_STATUS_FIRST + value (see locales/*.txt).
+enum WStatus {
+    Ready = 0,
+    Loading,
+    Updated,
+    Offline,
+    Timeout,
+    ProviderError,
+    BadData,
+    Oversized,
+    NoLocation,
+    Cooldown,
+    SaveFailed,
+}
+
+// Fixed hard-failure exit codes (KOTO-0234 pattern): resource -1x, capabilities
+// -20, mount -2x, sync -3x, apply/locale -3x.
+enum WError {
+    ResourceLoad = -10,
+    ResourceParse = -11,
+    ResourceLineCap = -12,
+    Capabilities = -20,
+    MountBegin = -21,
+    MountFinish = -22,
+    MountSubmit = -23,
+    MountPresent = -24,
+    SyncBegin = -30,
+    SyncSubmit = -31,
+    SyncPresent = -32,
+    ApplyBegin = -33,
+    ApplySubmit = -34,
+    ApplyPresent = -35,
+    LocaleValidate = -36,
+}
+
+// Depth-1 key -> staged field selector.
+const W_T_NONE = 0;
+const W_T_SCHEMA = 1;
+const W_T_LOC = 2;
+const W_T_COND = 3;
+const W_T_TEMP = 4;
+const W_T_MIN = 5;
+const W_T_MAX = 6;
+const W_T_PRECIP = 7;
+const W_T_OBS = 8;
+
+// Field-selection outcomes: missing(0) < found(1) < duplicate/wrong/bad. The
+// ordering lets w_commit reject any optional field that is worse than "found"
+// while still allowing "missing".
+const W_F_MISSING = 0;
+const W_F_FOUND = 1;
+const W_F_DUP = 2;
+const W_F_WRONG = 3;
+const W_F_BAD = 4;
+
+// Sentinel for a malformed/overflowing integer token, below every valid range.
+const W_PARSE_BAD = -2000000001;
+
+// Locale resource line map (identical line order across every locale file).
+const W_LINE_TITLE = 0;
+const W_LINE_FIELD = 1;
+const W_LINE_REFRESH = 2;
+const W_LINE_CANCEL = 3;
+const W_LINE_UNIT = 4;
+const W_LINE_NODATA = 5;
+const W_LINE_STALE = 6;
+const W_LINE_TIME_UNKNOWN = 7;
+const W_COND_FIRST = 8;
+const W_COND_COUNT = 9;
+const W_STATUS_FIRST = 17;
+
+// Bounded storage capacities.
+const W_CFG_LOC_BYTES = 32;   // location key: [a-z0-9-_]{1,32}
+const W_LOC_BYTES = 48;       // decoded location label
+const W_LOC_TEXT_BYTES = 48;
+const W_TEMP_TEXT_BYTES = 16;
+const W_RANGE_TEXT_BYTES = 24;
+const W_PRECIP_TEXT_BYTES = 8;
+const W_UPD_TEXT_BYTES = 48;
+const TOK_BYTES = 256;        // == JSON_MAX_TOKEN, guarded in main
+const W_CACHE_BYTES = 73;     // KWC1 snapshot slot image
+const W_SETTINGS_BYTES = 40;  // KWF1 non-secret settings image
+const W_BODY_CAP = 2048;      // reject a response larger than the contract bound
+const W_COOLDOWN_MS = 15000;  // app-level bounded refresh interval / dedup
+
+// Locale-derived capacities: a grown translation re-sizes the retained slots
+// and packets on the next build (KOTO-0236/0238) instead of failing at load.
+const W_RESOURCE_LINES = asset_text_line_count(
+    "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_RESOURCE_RAW_BYTES = asset_len(
+    "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_TITLE_BYTES = asset_text_max_line_bytes(
+    0, 1, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_FIELD_BYTES = asset_text_max_line_bytes(
+    1, 1, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_BTN_BYTES = asset_text_max_line_bytes(
+    2, 2, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_UNIT_BYTES = asset_text_max_line_bytes(
+    4, 1, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_MISC_BYTES = asset_text_max_line_bytes(
+    5, 3, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_COND_BYTES = asset_text_max_line_bytes(
+    8, 9, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const W_STATUS_BYTES = asset_text_max_line_bytes(
+    W_STATUS_FIRST, W_RESOURCE_LINES - W_STATUS_FIRST,
+    "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+
+const W_MOUNT_RECORDS = 11;
+const W_MOUNT_DATA_CAPACITY = W_TITLE_BYTES + W_FIELD_BYTES + W_CFG_LOC_BYTES
+    + W_BTN_BYTES + W_UNIT_BYTES + W_STATUS_BYTES + W_LOC_TEXT_BYTES
+    + W_COND_BYTES + W_TEMP_TEXT_BYTES + W_RANGE_TEXT_BYTES + W_PRECIP_TEXT_BYTES
+    + W_UPD_TEXT_BYTES;
+
+static weather_mount_builder: UiMountBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+static weather_update_builder: UiUpdateBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+static weather_text: TextResource = {
+    storage: 0, capacity: 0, line_capacity: 0, line_count: 0,
+    payload_offset: 0, payload_len: 0, status: 0, complete: false,
+};
+
+// One compiler-owned record (KOTO-0235): buffers plus every scalar of app
+// state, so helpers pass a single typed base reference and the deeply inlined
+// SDK validators stay within the 45-slot local frame. Zero-initialized, so the
+// scalar fields add no KBC image bytes (they sit after the last initialized
+// buffer region).
+struct WApp {
+    raw: buf[W_RESOURCE_RAW_BYTES],
+    resource: buf[ui_text_resource_capacity(W_RESOURCE_LINES, W_RESOURCE_RAW_BYTES)],
+    mount: buf[ui_mount_capacity(W_MOUNT_RECORDS, W_MOUNT_DATA_CAPACITY)],
+    event: buf[96],
+    chunk: buf[128],
+    tok: buf[TOK_BYTES],
+    cfg_loc: buf[W_CFG_LOC_BYTES],
+    loc: buf[W_LOC_BYTES],
+    s_loc: buf[W_LOC_BYTES],
+    file: buf[W_CACHE_BYTES],
+    loc_text: buf[W_LOC_TEXT_BYTES],
+    temp_text: buf[W_TEMP_TEXT_BYTES],
+    range_text: buf[W_RANGE_TEXT_BYTES],
+    precip_text: buf[W_PRECIP_TEXT_BYTES],
+    upd_text: buf[W_UPD_TEXT_BYTES],
+    // committed snapshot
+    status: int,
+    unit_f: int,
+    cfg_loc_len: int,
+    have: int,
+    fresh: int,
+    cond: int,
+    temp: int,
+    min: int,
+    max: int,
+    precip: int,
+    obs: int,
+    fetched: int,
+    loc_len: int,
+    gen_a: int,
+    gen_b: int,
+    // request/refresh
+    active: int,
+    request: int,
+    last_start: int,
+    dirty: int,
+    // composed presentation lengths
+    cond_line: int,
+    loc_text_len: int,
+    temp_text_len: int,
+    range_text_len: int,
+    precip_text_len: int,
+    upd_text_len: int,
+    // staging (per in-flight decode)
+    consumed: int,
+    target: int,
+    parse_bad: int,
+    doc_done: int,
+    chunk_len: int,
+    chunk_pos: int,
+    http_ok: int,
+    s_loc_len: int,
+    s_loc_flag: int,
+    s_schema_flag: int,
+    s_schema_ok: int,
+    s_cond_flag: int,
+    s_temp_flag: int,
+    s_min_flag: int,
+    s_max_flag: int,
+    s_precip_flag: int,
+    s_obs_flag: int,
+    s_cond: int,
+    s_temp: int,
+    s_min: int,
+    s_max: int,
+    s_precip: int,
+    s_obs: int,
+}
+
+// Buffer fields are never initializer entries (KOTO-0235); the scalar fields
+// are all zeroed here. The zero regions add no KBC image bytes because they
+// follow the last initialized buffer.
+static weather_app: WApp = {
+    status: 0, unit_f: 0, cfg_loc_len: 0, have: 0, fresh: 0,
+    cond: 0, temp: 0, min: 0, max: 0, precip: 0, obs: 0, fetched: 0,
+    loc_len: 0, gen_a: 0, gen_b: 0,
+    active: 0, request: 0, last_start: 0, dirty: 0,
+    cond_line: 0, loc_text_len: 0, temp_text_len: 0, range_text_len: 0,
+    precip_text_len: 0, upd_text_len: 0,
+    consumed: 0, target: 0, parse_bad: 0, doc_done: 0, chunk_len: 0,
+    chunk_pos: 0, http_ok: 0, s_loc_len: 0, s_loc_flag: 0, s_schema_flag: 0,
+    s_schema_ok: 0, s_cond_flag: 0, s_temp_flag: 0, s_min_flag: 0,
+    s_max_flag: 0, s_precip_flag: 0, s_obs_flag: 0,
+    s_cond: 0, s_temp: 0, s_min: 0, s_max: 0, s_precip: 0, s_obs: 0,
+};
+
+include "helpers.koto";
+
+fn main() {
+    if TOK_BYTES < JSON_MAX_TOKEN { exit(1); }
+    w_load_resource(w_host_resource(), weather_app);
+    yield_frame();
+
+    weather_app.request = -1;
+    weather_app.last_start = -1;
+    w_load_settings(weather_app);
+    w_load_cache(weather_app);
+    if weather_app.cfg_loc_len == 0 {
+        weather_app.status = WStatus::NoLocation;
+    } else {
+        weather_app.status = WStatus::Ready;
+    }
+    w_compose(weather_app);
+    yield_frame();
+    w_mount(weather_app);
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            if weather_app.active == 1 { fetch_cancel(weather_app.request); }
+            ui_reset();
+            exit(0);
+        }
+
+        let event_len = ui_poll_event(weather_app.event, len(weather_app.event));
+        if event_len < 0 { w_fail_hard(event_len); }
+        while event_len > 0 {
+            if ui_event_validate(weather_app.event, event_len) != 0 {
+                w_fail_hard(UI_SDK_BAD_ARGUMENT);
+            }
+            let response = ui_event_response(weather_app.event);
+            let widget = ui_event_widget_id(weather_app.event);
+            if response == UiResponse::TextChanged && widget == WWidget::Field {
+                w_take_field(weather_app);
+            } else if response == UiResponse::Submitted && widget == WWidget::Field {
+                w_take_field(weather_app);
+                w_attempt_start(weather_app);
+            } else if response == UiResponse::Activated && widget == WWidget::Refresh {
+                if weather_app.active == 1 { w_cancel(weather_app); }
+                else { w_attempt_start(weather_app); }
+            } else if response == UiResponse::Activated && widget == WWidget::Unit {
+                weather_app.unit_f = 1 - weather_app.unit_f;
+                w_save_settings(weather_app);
+                weather_app.dirty = 1;
+            } else if response == UiResponse::LocaleChanged {
+                // Keep the worst-case re-parse, the static relabel, and the
+                // dynamic recompose/sync on separate deterministic frames so
+                // no single frame approaches the instruction budget.
+                w_locale_changed(weather_app);
+                yield_frame();
+                w_apply_locale(weather_app);
+                yield_frame();
+            } else if response == UiResponse::Cancelled {
+                if weather_app.active == 1 { fetch_cancel(weather_app.request); }
+                ui_reset();
+                exit(0);
+            } else if response == UiResponse::FocusChanged {
+                if ui_present() != 0 { w_fail_hard(WError::SyncPresent); }
+            }
+            event_len = ui_poll_event(weather_app.event, len(weather_app.event));
+            if event_len < 0 { w_fail_hard(event_len); }
+        }
+
+        // Advance any in-flight request with bounded work, then repaint only
+        // when something actually changed. Input, redraw, exit, and audio stay
+        // responsive because at most one 128-byte chunk decodes per frame.
+        w_poll(weather_app);
+        if weather_app.dirty == 1 {
+            w_compose(weather_app);
+            w_sync(weather_app);
+            weather_app.dirty = 0;
+        }
+        yield_frame();
+    }
+}

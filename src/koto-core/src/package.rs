@@ -11,7 +11,8 @@ pub const PACKAGE_ICON_WIDTH: usize = 40;
 pub const PACKAGE_ICON_HEIGHT: usize = 40;
 pub const PACKAGE_ICON_1BPP_BYTES: usize = (PACKAGE_ICON_WIDTH * PACKAGE_ICON_HEIGHT) / 8;
 pub const KPA_MANIFEST_FORMAT: &str = "kpa-manifest";
-pub const KPA_MANIFEST_VERSION: u32 = 1;
+pub const KPA_MANIFEST_VERSION: u32 = 2;
+pub const KPA_MANIFEST_MIN_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManifestError {
@@ -124,7 +125,7 @@ impl PackageManifest {
         if fields.format != KPA_MANIFEST_FORMAT {
             return Err(ManifestError::InvalidFormat);
         }
-        if fields.version != KPA_MANIFEST_VERSION {
+        if !(KPA_MANIFEST_MIN_VERSION..=KPA_MANIFEST_VERSION).contains(&fields.version) {
             return Err(ManifestError::UnsupportedVersion);
         }
 

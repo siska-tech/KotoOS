@@ -1,0 +1,38 @@
+{
+  "format": "kpa-manifest",
+  "version": 2,
+  "app_id": "dev.koto.samples.mqtt-telemetry",
+  "name": "SDK MQTT Telemetry",
+  "entry": "bytecode/sample_mqtt_telemetry.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample_mqtt_telemetry.kicon",
+  "description": "Receives bounded live telemetry from an OS-owned MQTT subscribe service.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_mqtt_telemetry.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample_mqtt_telemetry.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "mqtt": {
+      "brokers": [
+        "mqtts://broker.example.com"
+      ],
+      "topics": [
+        "sensors/room/temp"
+      ]
+    }
+  }
+}

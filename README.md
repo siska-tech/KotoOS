@@ -1,7 +1,7 @@
-# KotoOS v0.2
+# KotoOS v0.3.0-alpha
 
 KotoOS is a lightweight Japanese PDA environment, game platform, and small-app
-runtime for the ClockworkPi PicoCalc, written in Rust. Version 0.2 supports
+runtime for the ClockworkPi PicoCalc, written in Rust. Version 0.3.0-alpha supports
 both the original RP2040 Pico profile and the RP2350A Pico 2 W profile on real
 hardware.
 
@@ -18,7 +18,21 @@ architecture, debugging, performance investigation, testing, and documentation.
 
 See [How Codex & GPT-5.6 were used](#how-codex--gpt-56-were-used) for details.
 
-## Version 0.2 Highlights
+## Version 0.3.0-alpha Highlights
+
+This OpenAI Build Week alpha adds OS-brokered networking for sandboxed apps.
+The release is intentionally marked alpha while the remaining device and
+configuration issues listed in [CHANGELOG.md](CHANGELOG.md) are resolved.
+
+- **Bounded app networking:** capability-gated HTTPS Fetch, MQTT subscribe,
+  SNTP, JSON decoding, and an OS-owned credential vault keep raw sockets and
+  TLS state outside the app VM.
+- **HTTPS on both Pico generations:** authenticated HTTPS Fetch is
+  hardware-validated on RP2040 Pico W and RP2350A Pico 2 W. RP2040 uses a
+  TLS-scoped audio exclusion policy to fit safely in SRAM; audio is restored
+  after the network session ends.
+- **Wi-Fi configuration:** KotoConfig can scan, connect, persist credentials,
+  and expose bounded network status through the product firmware.
 
 - **Pico 2 W support:** RP2350A firmware, linker/UF2 profiles, PicoCalc LCD,
   keyboard, audio, SD, power, and external PSRAM paths are hardware-validated.
@@ -105,6 +119,17 @@ Run KotoSim with the committed package set:
 cargo run -p koto-sim
 ```
 
+Replay the deterministic fake NetworkService fixture without opening a window
+or touching the host network:
+
+```powershell
+cargo run -p koto-sim -- --fake-network harness/fixtures/network_service/network_service_v1.json
+```
+
+The same `--fake-network` option may be combined with `--window` to attach the
+validated fake to the native KotoConfig development path. Normal simulator
+startup leaves this option off and does not advertise Wi-Fi configuration.
+
 The source-install instructions for the KotoIDE VS Code extension are in
 [`tools/vscode-koto/README.md`](tools/vscode-koto/README.md).
 
@@ -157,6 +182,27 @@ The build selects `board-picocalc-pico2w` (which owns the internal
 linker profile, identifies itself as `picocalc-pico2w-rp2350a` in the UART
 banner, and leaves wireless initialization disabled. The product firmware and
 retained peripheral probes have passed the PicoCalc hardware validation gate.
+
+For the KOTO-0243 Pico 2 W product profile with the KotoShell-accessible Wi-Fi
+settings page and bounded NetworkService enabled, run:
+
+```powershell
+tools\build-rp2350a.ps1 -WifiConfig
+```
+
+This emits
+`target/thumbv8m.main-none-eabihf/release/koto_firmware-picocalc-pico2w-rp2350a-wifi-config.uf2`.
+
+For the KOTO-0245 authenticated app Fetch profile, including NetworkService
+and the RP2350A concurrent HTTPS workspace, run:
+
+```powershell
+tools\build-rp2350a.ps1 -AppFetchHttps
+```
+
+This uses `picotool uf2 convert` with the RP2350 Arm Secure family ID and
+absolute image-definition block, and emits
+`target/thumbv8m.main-none-eabihf/release/koto_firmware-picocalc-pico2w-rp2350a-app-fetch-https.uf2`.
 
 To cross-check every retained embedded binary for RP2040 and RP2350A:
 

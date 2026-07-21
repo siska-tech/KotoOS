@@ -15,5 +15,24 @@
   "permissions": {
     "fs": "sandbox",
     "network": false
+  },
+  "assets": [
+    {
+      "source": "locales/en-US.txt",
+      "output": "locales/en-US.txt"
+    },
+    {
+      "source": "locales/ja-JP.txt",
+      "output": "locales/ja-JP.txt"
+    },
+    {
+      "source": "locales/qps-ploc.txt",
+      "output": "locales/qps-ploc.txt"
+    }
+  ],
+  "codegen": {
+    "comment": "KOTO-0221: SDK packet validators inline deeply; relocate one-time setup and outline event/update branches so the steady idle loop stays inside the resident code window.",
+    "relocate_preamble": true,
+    "outline_cold_blocks": true
   }
 }

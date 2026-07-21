@@ -305,9 +305,9 @@ pub(crate) async fn present_app_commands(
                 let Ok(text) = core::str::from_utf8(&bytes[..*len as usize]) else {
                     continue;
                 };
-                // The 17-line text band (16 glyph rows + descender line) is one
-                // line taller than the RASTER_STRIP_LINES(16) strip since 520db8b
-                // halved the strip, so it is rastered and shipped in strip-sized
+                // The 17-line text band (16 glyph rows + descender line) is
+                // taller than the bounded RASTER_STRIP_LINES strip, so it is
+                // rastered and shipped in strip-sized
                 // slices — the viewport clips glyph rows to each slice. Indexing
                 // the whole band into `strip` was an out-of-bounds panic, and
                 // panic-halt froze the device on the only path that reaches this
@@ -785,8 +785,8 @@ pub(crate) async fn present_app_delta(
 /// Half of the RGB666 scratch: the pipelined present (KOTO-0174 H-A2) ping-pongs
 /// the existing strip-sized scratch as two halves — zero extra SRAM — so one
 /// half can be on the SPI data DMA while the other receives the next band's
-/// convert. Caps a band at 8 full-width rows (2,560 px); narrower rects get
-/// proportionally taller bands, still within the RGB565 strip.
+/// convert. A full-width band is capped at half of `RASTER_STRIP_LINES`;
+/// narrower rects get proportionally taller bands, still within the RGB565 strip.
 const RGB666_HALF_BYTES: usize = RGB666_STRIP_BYTES / 2;
 const PIPELINE_BAND_PX: usize = RGB666_HALF_BYTES / 3;
 
@@ -855,7 +855,7 @@ async fn present_rects_pipelined(
     let mut band_y: Option<i32> = None;
     loop {
         // Derive the next band of the stream: rects in order, each split into
-        // <= PIPELINE_BAND_PX bands (full width -> 8 rows per band).
+        // <= PIPELINE_BAND_PX bands (full width -> half a raster strip per band).
         let mut next: Option<Rect> = None;
         while rect_index < rects.len() {
             let rect = rects[rect_index];

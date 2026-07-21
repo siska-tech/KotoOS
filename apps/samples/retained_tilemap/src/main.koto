@@ -12,6 +12,21 @@ const KIM_HEADER = 8;
 const SHEET_BYTES = 2056;
 const UPLOAD_PER_FRAME = 50;
 
+struct TilemapState {
+    eol: int,
+    upload: int,
+}
+
+static tilemap: TilemapState = { eol: 0, upload: 0, };
+
+impl TilemapState {
+    fn batch_end(self) -> int {
+        let stop = self.upload + UPLOAD_PER_FRAME;
+        if stop > CELL_COUNT { return CELL_COUNT; }
+        return stop;
+    }
+}
+
 fn glyph_tile(glyph: int) -> int {
     if glyph == 35 { return 1; }  // # stone
     if glyph == 126 { return 2; } // ~ water
@@ -40,31 +55,24 @@ fn main() {
     buf raw_map[440];
 
     let map_loaded = 0;
-    let eol = 0;
-    let upload = 0;
-    let stop = 0;
-    let glyph = 0;
-    let intent = 0;
-
     map_loaded = asset_load("maps/world.map", 14, raw_map, MAP_RAW_BYTES);
     if map_loaded < 0 { exit(2); }
-    eol = map_eol(raw_map, map_loaded, MAP_W, MAP_H);
-    if eol < 0 { exit(2); }
+    tilemap.eol = map_eol(raw_map, map_loaded, MAP_W, MAP_H);
+    if tilemap.eol < 0 { exit(2); }
     asset_load("sprites/static_tiles.kim", 24, sheet, SHEET_BYTES);
     game2d_configure_tilemap(0, MAP_W, MAP_H, 0, 0);
 
     loop {
-        intent = text_intent();
+        let intent = text_intent();
         if (intent & INTENT_EXIT) != 0 { exit(0); }
 
-        if upload < CELL_COUNT {
-            stop = upload + UPLOAD_PER_FRAME;
-            if stop > CELL_COUNT { stop = CELL_COUNT; }
-            while upload < stop {
-                glyph = glyph_tile(map_glyph(raw_map, upload, MAP_W, eol));
-                game2d_set_tile(0, upload % MAP_W, upload / MAP_W,
+        if tilemap.upload < CELL_COUNT {
+            let stop = tilemap.batch_end();
+            while tilemap.upload < stop {
+                let glyph = glyph_tile(map_glyph(raw_map, tilemap.upload, MAP_W, tilemap.eol));
+                game2d_set_tile(0, tilemap.upload % MAP_W, tilemap.upload / MAP_W,
                     sheet + KIM_HEADER + glyph * TILE_BYTES);
-                upload = upload + 1;
+                tilemap.upload = tilemap.upload + 1;
             }
         }
 

@@ -88,6 +88,20 @@
         "legacy_compare_templates": { "type": "boolean" }
       }
     },
+    "assets": {
+      "type": "array",
+      "description": "App-local files packaged byte-for-byte as read-only data assets.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source"],
+        "properties": {
+          "source": { "type": "string", "minLength": 1, "description": "App-relative authored file." },
+          "output": { "type": "string", "minLength": 1, "description": "Package path; defaults to source." },
+          "sequential": { "type": "boolean", "default": true }
+        }
+      }
+    },
     "maps": {
       "type": "object",
       "description": "Validate and package *.map tilemaps as read-only data assets.",

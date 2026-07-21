@@ -1,0 +1,26 @@
+{
+  "app_id": "dev.koto.samples.mqtt-telemetry",
+  "kind": "koto",
+  "package": "sample_mqtt_telemetry",
+  "name": "SDK MQTT Telemetry",
+  "description": "Receives bounded live telemetry from an OS-owned MQTT subscribe service.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "mqtt": {
+      "brokers": [
+        "mqtts://broker.example.com"
+      ],
+      "topics": [
+        "sensors/room/temp"
+      ]
+    }
+  }
+}

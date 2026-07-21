@@ -11,11 +11,21 @@ compile_error!("select exactly one MCU feature: `mcu-rp2040` or `mcu-rp235xa`");
 #[cfg(not(any(feature = "mcu-rp2040", feature = "mcu-rp235xa")))]
 compile_error!("no MCU selected; select a `board-*` feature instead of enabling an MCU directly");
 
-#[cfg(all(feature = "board-picocalc-pico", feature = "board-picocalc-pico2w"))]
+#[cfg(any(
+    all(feature = "board-picocalc-pico", feature = "board-picocalc-picow"),
+    all(feature = "board-picocalc-pico", feature = "board-picocalc-pico2w"),
+    all(feature = "board-picocalc-picow", feature = "board-picocalc-pico2w")
+))]
 compile_error!("select exactly one board feature");
 
-#[cfg(not(any(feature = "board-picocalc-pico", feature = "board-picocalc-pico2w")))]
-compile_error!("no board selected; enable `board-picocalc-pico` or `board-picocalc-pico2w`");
+#[cfg(not(any(
+    feature = "board-picocalc-pico",
+    feature = "board-picocalc-picow",
+    feature = "board-picocalc-pico2w"
+)))]
+compile_error!(
+	"no board selected; enable `board-picocalc-pico`, `board-picocalc-picow`, or `board-picocalc-pico2w`"
+);
 
 pub mod board;
 pub mod dashboard;

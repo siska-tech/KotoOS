@@ -47,6 +47,24 @@ extern "C" {
 /// `used` by 4 bytes — noise against the KiB-scale margins this measures.
 const CANARY_WORD: u32 = 0x6F74_6F6B;
 
+/// Floor-guard band (KOTO-0252): the very bottom [`GUARD_BYTES`] of the
+/// painted gap carry [`GUARD_WORD`] instead of [`CANARY_WORD`]. A transient
+/// frame that crosses the static floor (`__euninit`) — the KOTO-0251 boot
+/// blocker's silent-corruption class, which lands *below* the painted region
+/// where the ordinary low-water scan cannot distinguish "touched the floor"
+/// from "punched through it" — necessarily writes through this band first, so
+/// a changed guard word turns that corruption into an explicit
+/// `phase=176` `guard=HIT` report on the next scan (and doubles as a
+/// within-32-bytes-of-the-floor early warning). Purely a software convention
+/// over the existing gap: no linker changes, no `.bss` growth; `free_min` is
+/// measured from the top of the band, so readings shift down by 32 bytes
+/// against pre-KOTO-0252 captures.
+pub const GUARD_BYTES: usize = 32;
+
+/// Guard fill pattern: "toko" in little-endian ASCII — [`CANARY_WORD`]
+/// reversed, so a dump shows where the band starts.
+const GUARD_WORD: u32 = 0x6F6B_6F74;
+
 /// Words left unpainted immediately below the boot-time stack pointer.
 /// Painting strictly below SP is already safe on ARM (no red zone; exception
 /// frames complete before thread code resumes), so this only trims the
@@ -98,10 +116,17 @@ pub fn paint() {
     if top <= bottom {
         return;
     }
+    let guard_top = (bottom + GUARD_BYTES).min(top);
     let mut word = bottom as *mut u32;
-    while (word as usize) < top {
+    while (word as usize) < guard_top {
         // Volatile: the compiler must not elide or reorder the fill against
         // the later scans of the same untyped memory.
+        unsafe {
+            word.write_volatile(GUARD_WORD);
+            word = word.add(1);
+        }
+    }
+    while (word as usize) < top {
         unsafe {
             word.write_volatile(CANARY_WORD);
             word = word.add(1);
@@ -111,12 +136,16 @@ pub fn paint() {
 }
 
 /// A scanned low-water snapshot: the session-peak stack depth (`used`, from
-/// the top of RAM) and the minimum margin left above the statics (`free_min`).
+/// the top of RAM), the minimum margin left above the floor-guard band
+/// (`free_min`), and whether the band itself is still intact
+/// (`guard_intact` — `false` means the stack reached within [`GUARD_BYTES`]
+/// of the statics or punched through the floor, KOTO-0252).
 #[derive(Clone, Copy)]
 pub struct StackPeak {
     pub used: usize,
     pub free_min: usize,
     pub low_water: usize,
+    pub guard_intact: bool,
 }
 
 /// Scan for the low-water mark. `None` until [`paint`] has run.
@@ -126,7 +155,17 @@ pub fn scan() -> Option<StackPeak> {
         return None;
     }
     let bottom = region_bottom();
+    let guard_top = (bottom + GUARD_BYTES).min(painted_top);
+    let mut guard_intact = true;
     let mut word = bottom as *const u32;
+    while (word as usize) < guard_top {
+        if unsafe { word.read_volatile() } != GUARD_WORD {
+            guard_intact = false;
+            break;
+        }
+        word = unsafe { word.add(1) };
+    }
+    let mut word = guard_top as *const u32;
     while (word as usize) < painted_top {
         if unsafe { word.read_volatile() } != CANARY_WORD {
             break;
@@ -136,8 +175,9 @@ pub fn scan() -> Option<StackPeak> {
     let low_water = word as usize;
     Some(StackPeak {
         used: stack_top() - low_water,
-        free_min: low_water - bottom,
+        free_min: low_water - guard_top,
         low_water,
+        guard_intact,
     })
 }
 
@@ -167,8 +207,12 @@ pub fn emit_peak(uart: &mut UartTx<'_, embassy_rp::uart::Blocking>, at: &str) {
     let mut line = LineBuffer::new();
     let _ = write!(
         line,
-        "phase=176 stack-peak at={} used={} free_min={} lw=0x{:08x}\r\n",
-        at, peak.used, peak.free_min, peak.low_water,
+        "phase=176 stack-peak at={} used={} free_min={} lw=0x{:08x} guard={}\r\n",
+        at,
+        peak.used,
+        peak.free_min,
+        peak.low_water,
+        if peak.guard_intact { "ok" } else { "HIT" },
     );
     uart_write_line(uart, &line);
 }

@@ -1,0 +1,12 @@
+[package]
+name = "koto-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# KotoUI is a bounded, allocation-free component foundation. Concrete font,
+# graphics, input, and hardware adapters live in integration crates.
+[dependencies]

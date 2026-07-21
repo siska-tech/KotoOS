@@ -9,7 +9,9 @@ For each app's worst-ish scripted scenario this:
 
 It WARNS when a VM peak reaches >=90% of its fixed profile capacity (operand stack,
 call depth, frame fuel) or when user-local-slot usage nears the user-slot cap, and
-FAILS when a tracked peak exceeds the per-scenario threshold configured below.
+FAILS when a tracked deterministic peak exceeds the per-scenario threshold below.
+Wall-clock ``frame_time_us_peak`` is reported for observation but deliberately not
+gated because scheduler and build-host load are nondeterministic.
 
 Note on locals: the runtime ``local_peak`` counts the highest VM slot touched. The
 three codegen scratch slots (one of them the return slot) now *float* just above the
@@ -50,6 +52,37 @@ CAP_OF = {
 # call-site inline slot reuse brought koto-blocks to 42/45; the KOTO-0103 score-popup
 # value (`pop`) spends one more main local for 43/45, with two still free.
 SCENARIOS = [
+    {
+        "app": "dev.koto.samples.koto-ui-gallery",
+        "source": "apps/samples/koto_ui_gallery/src/main.koto",
+        "script": "apps/samples/koto_ui_gallery/scenarios/interaction.txt",
+        "max": {
+            "stack_peak": 14,
+            "heap_peak": 4096,
+            "fuel_peak": 59000,
+            "host_calls_peak": 12,
+            "ui_session_sram": 8192,
+            "ui_render_commands_peak": 80,
+            "max_user_slots": 45,
+        },
+    },
+    {
+        # KOTO-0221 pilot: edits then reloads through the KotoUI form, so the
+        # note bytes end unchanged and repeated gate runs stay deterministic.
+        "app": "dev.koto.samples.file-note",
+        "source": "apps/samples/file_note/src/main.koto",
+        "script": "apps/samples/file_note/scenarios/interaction.txt",
+        "max": {
+            "stack_peak": 14,
+            "heap_peak": 3072,
+            # KOTO-0230 measured baseline and KOTO-0231 compatibility ceiling.
+            "fuel_peak": 30095,
+            "host_calls_peak": 12,
+            "ui_session_sram": 8192,
+            "ui_render_commands_peak": 40,
+            "max_user_slots": 45,
+        },
+    },
     {
         "app": "dev.koto.memo",
         "source": "apps/memo/src/main.koto",

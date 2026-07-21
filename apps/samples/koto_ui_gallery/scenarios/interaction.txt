@@ -1,0 +1,19 @@
+# Mount the scene, exercise modal focus/restoration, toggle the checkbox,
+# change/activate the list selection, edit/submit text, then remain yielded.
+frame
+frame
+activate
+frame
+cancel
+right
+activate
+left
+down
+down
+down
+activate
+right
+activate
+'あ'
+newline
+frame

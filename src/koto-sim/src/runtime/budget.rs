@@ -21,7 +21,14 @@ pub struct AppBudgetReport {
     pub heap_budget: Option<u32>,
     pub frame_fuel_peak: u32,
     pub frame_fuel_cap: u32,
+    /// Slowest observed host wall-clock frame. Informational rather than a
+    /// deterministic CI gate; fuel remains the reproducible execution bound.
+    pub frame_time_us_peak: u64,
     pub host_calls_per_frame_peak: u32,
+    /// Fixed host-owned retained KotoUI session state.
+    pub ui_session_sram_bytes: usize,
+    /// Highest retained KotoUI rectangle + text command count.
+    pub ui_render_commands_peak: usize,
     pub open_files_peak: usize,
     pub open_files_cap: usize,
     pub draw_rects_peak: usize,
@@ -30,8 +37,8 @@ pub struct AppBudgetReport {
     pub audio_events_peak: usize,
 }
 
-/// Render an [`AppBudgetReport`] as one deterministic `key=value` line, parseable
-/// by the budget-gate harness (`harness/check_budgets.py`) and stable for tests.
+/// Render an [`AppBudgetReport`] as one parseable `key=value` line. All fields
+/// except observational `frame_time_us_peak` are deterministic for a scenario.
 /// `heap_budget` is `none` when the manifest declares no SRAM working budget.
 pub fn describe_app_budget_report(report: &AppBudgetReport) -> String {
     let heap_budget = match report.heap_budget {
@@ -42,7 +49,8 @@ pub fn describe_app_budget_report(report: &AppBudgetReport) -> String {
         "budget app={} frames={} \
          stack_peak={} stack_cap={} call_peak={} call_cap={} \
          local_peak={} local_cap={} heap_peak={} heap_request={} heap_budget={} \
-         fuel_peak={} fuel_cap={} host_calls_peak={} \
+         fuel_peak={} fuel_cap={} frame_time_us_peak={} host_calls_peak={} \
+         ui_session_sram={} ui_render_commands_peak={} \
          open_files_peak={} open_files_cap={} draw_rects_peak={} draw_pixels_peak={} \
          text_draws_peak={} audio_events_peak={}",
         report.app_id,
@@ -58,7 +66,10 @@ pub fn describe_app_budget_report(report: &AppBudgetReport) -> String {
         heap_budget,
         report.frame_fuel_peak,
         report.frame_fuel_cap,
+        report.frame_time_us_peak,
         report.host_calls_per_frame_peak,
+        report.ui_session_sram_bytes,
+        report.ui_render_commands_peak,
         report.open_files_peak,
         report.open_files_cap,
         report.draw_rects_peak,

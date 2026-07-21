@@ -149,6 +149,9 @@ pub fn launch_package(
         heap[..end - start].copy_from_slice(&bytecode[start..end]);
     }
     let host_audio = Arc::new(Mutex::new(SimAudio::new(DEFAULT_SAMPLE_RATE)));
+    let fetch_allowlist = *launch.fetch_allowlist();
+    let mqtt_brokers = *launch.mqtt_brokers();
+    let mqtt_topics = *launch.mqtt_topics();
     let mut host = if let Some(archive) = archive {
         SimRuntimeHost::with_audio_and_package(
             HostFs::mounted(&root).map_err(|_| SimError::Io)?,
@@ -165,6 +168,8 @@ pub fn launch_package(
         )
     }
     .map_err(|_| SimError::RuntimeExecutionFailed)?;
+    host.set_fetch_allowlist(fetch_allowlist);
+    host.set_mqtt_permission(mqtt_brokers, mqtt_topics);
     let result = vm
         .execute_frame(
             &bytecode,

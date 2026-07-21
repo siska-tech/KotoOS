@@ -1,0 +1,96 @@
+// KOTO-0248 credential-vault sample: use an OS-owned network credential without
+// ever seeing the secret. The app resolves an opaque handle for a granted TLS
+// origin, starts an authenticated GET (the OS injects the credential inside its
+// own transport), and shows the outcome. It also shows that an ungranted origin
+// yields no handle at all — the default-denied contract.
+//
+// The application only ever holds a URL and an opaque handle; the token bytes
+// stay entirely inside the OS vault and its transport.
+
+// fetch_poll_state codes (host ABI): 0 pending, 1 headers, 2 body, 3 complete,
+// 4 failed.
+const ST_COMPLETE = 3;
+const ST_FAILED = 4;
+
+// Demo phases.
+const P_START = 0;
+const P_POLL = 1;
+const P_OK = 2;
+const P_FAILED = 3;
+const P_DENIED = 4;
+
+struct VaultDemo {
+    phase: int,
+    req: int,
+}
+
+static demo: VaultDemo = { phase: 0, req: 0, };
+
+fn main() {
+    // Scratch sink for the response body. The demo does not inspect the payload;
+    // it only drains it so the transfer advances to completion.
+    buf sink[64];
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            exit(0);
+        }
+
+        draw_rect(0, 0, 320, 320, 0);
+        draw_text(16, 16, "KOTO-0248 vault", 15);
+
+        // An ungranted origin never resolves to a handle (default-denied).
+        let other = vault_handle(VAULT_SERVICE_FETCH, "https://other.example.com/v1", 28);
+        if other == 0 {
+            draw_text(16, 48, "other: no grant", 15);
+        } else {
+            draw_text(16, 48, "other: LEAK", 11);
+        }
+
+        if demo.phase == P_START {
+            let handle = vault_handle(VAULT_SERVICE_FETCH, "https://api.example.com/v1/data", 31);
+            if handle == 0 {
+                demo.phase = P_DENIED;
+            } else {
+                let request = fetch_start_authenticated("https://api.example.com/v1/data", 31, handle);
+                if request < 0 {
+                    demo.phase = P_FAILED;
+                } else {
+                    demo.req = request;
+                    demo.phase = P_POLL;
+                }
+            }
+        }
+
+        if demo.phase == P_POLL {
+            let state = fetch_poll_state(demo.req);
+            // Drain one bounded chunk once headers/body are available so the
+            // transfer can advance to completion. The bytes are discarded.
+            if state == 1 || state == 2 {
+                fetch_read(demo.req, sink, 64);
+            }
+            if state == ST_COMPLETE {
+                demo.phase = P_OK;
+            }
+            if state == ST_FAILED {
+                demo.phase = P_FAILED;
+            }
+        }
+
+        if demo.phase == P_POLL {
+            draw_text(16, 80, "auth: fetching", 14);
+        }
+        if demo.phase == P_OK {
+            draw_text(16, 80, "auth: ok", 8);
+        }
+        if demo.phase == P_FAILED {
+            draw_text(16, 80, "auth: failed", 12);
+        }
+        if demo.phase == P_DENIED {
+            draw_text(16, 80, "auth: no grant", 14);
+        }
+
+        yield_frame();
+    }
+}

@@ -208,7 +208,8 @@ pub fn describe_app_scenario_report(report: &AppScenarioReport) -> String {
 /// Parse a per-frame app input script. Each non-empty line is one frame; tokens
 /// are a single-quoted character (`'a'`, `'\n'`) and/or intent names (`shift`,
 /// `convert`, `commit`, `cancel`, `backspace`, `delete`, `left`, `right`, `up`,
-/// `down`, `home`, `end`, `newline`, `save`, `exit`, `ime-toggle`). The bare
+/// `down`, `activate`/`confirm`, `home`, `end`, `newline`, `save`, `exit`,
+/// `ime-toggle`). The bare
 /// token `frame` denotes an empty frame. `#` starts a comment.
 pub fn parse_app_script(text: &str) -> Result<Vec<VmInputSnapshot>, SimError> {
     let mut frames = Vec::new();
@@ -221,6 +222,8 @@ pub fn parse_app_script(text: &str) -> Result<Vec<VmInputSnapshot>, SimError> {
         for token in line.split_whitespace() {
             if token == "frame" {
                 continue;
+            } else if token == "activate" || token == "confirm" {
+                snapshot.pressed_bits |= 1 << 4;
             } else if let Some(codepoint) = parse_char_token(token) {
                 snapshot.text_codepoint = codepoint;
             } else if let Some(bit) = intent_bit(token) {

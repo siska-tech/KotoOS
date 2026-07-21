@@ -1,0 +1,13 @@
+# Mount the form (locale asset, sandbox read, mount+present each get one
+# deterministic frame), append two characters to the note, then restore the
+# file content with Reload so repeated runs leave the note bytes unchanged.
+frame
+frame
+frame
+activate
+'K'
+'!'
+down
+right
+activate
+frame

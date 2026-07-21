@@ -15,6 +15,33 @@ CHECKS = [
         ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"],
     ),
     ("Rust tests", ["cargo", "test"]),
+    ("CPU0 audio scratch", [sys.executable, "harness/check_audio_scratch.py"]),
+    ("Audio residency transitions", [sys.executable, "harness/check_audio_residency.py"]),
+    ("Arena-owned future lifecycle", [sys.executable, "harness/check_arena_future.py"]),
+    (
+        "Audio residency memory parser",
+        [sys.executable, "harness/check_audio_residency_memory.py", "--self-test"],
+    ),
+    (
+        "Wi-Fi residency layout parser",
+        [sys.executable, "harness/check_wifi_residency_layout.py", "--self-test"],
+    ),
+    (
+        "NetworkService budget parser",
+        [sys.executable, "harness/check_network_service_budget.py", "--self-test"],
+    ),
+    (
+        "App Fetch budget parser",
+        [sys.executable, "harness/check_app_fetch_budget.py", "--self-test"],
+    ),
+    (
+        "App Fetch TLS feasibility model",
+        [sys.executable, "harness/check_app_fetch_tls_feasibility.py", "--self-test"],
+    ),
+    (
+        "App Fetch embedded-tls probe parser",
+        [sys.executable, "harness/check_app_fetch_tls_probe.py", "--self-test"],
+    ),
     ("App build sync", [sys.executable, "harness/build_apps.py", "--check"]),
     ("Memo validation", ["cargo", "run", "-p", "koto-sim", "--", "--memo-validation"]),
     ("Golden frame validation", [sys.executable, "harness/check_golden_frames.py"]),

@@ -13,10 +13,12 @@ opcode_stats = ["koto-core/opcode_stats"]
 
 [dependencies]
 koto-core = { path = "../koto-core" }
+koto-ui = { path = "../koto-ui" }
 # Bounded audio runtime used for fixed host cues and SD-loaded owned KMML cues.
 koto-audio = { path = "../koto-audio/crates/koto-audio", features = [
     "sldpcm4-drums",
 ] }
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 minifb = { version = "0.28", optional = true }
 cpal = { version = "0.15", optional = true }

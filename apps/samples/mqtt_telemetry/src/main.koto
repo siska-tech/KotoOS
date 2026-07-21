@@ -1,0 +1,127 @@
+// KOTO-0249 MQTT telemetry sample: receive bounded live telemetry from an
+// OS-owned, capability-gated MQTT subscribe service. The app names a
+// manifest-declared broker and topic *by index*; it never sees a socket, TLS
+// state, or credential byte. It connects, subscribes, then drains complete
+// messages into its own bounded buffers — one message per frame.
+//
+// The manifest grants exactly one broker (index 0) and one exact topic
+// (index 0 = "sensors/room/temp"). A subscription outside that grant, or a
+// message larger than the caller buffers, fails closed rather than truncating.
+
+// Demo phases.
+const P_CONNECT = 0;
+const P_SUBSCRIBE = 1;
+const P_LISTEN = 2;
+const P_OFFLINE = 3;
+
+// The single manifest broker/topic this app is granted.
+const BROKER = 0;
+const TOPIC = 0;
+
+// Caller buffers sized to the frozen service maxima: MQTT_MAX_TOPIC_BYTES (128)
+// and MQTT_MAX_PAYLOAD_BYTES (192). The runtime rejects a read into an oversized
+// buffer, so these mirror the SDK constants exactly.
+const TOPIC_CAP = 128;
+const PAYLOAD_CAP = 192;
+
+struct Telemetry {
+    phase: int,
+    session: int,
+    value_len: int,
+    retained: int,
+    updates: int,
+}
+
+static tel: Telemetry = { phase: 0, session: 0, value_len: 0, retained: 0, updates: 0, };
+
+fn main() {
+    // Caller-owned bounded buffers, sized to the frozen service maxima. Declared
+    // once before the loop, so the latest payload persists across frames for the
+    // display even when no new message arrives.
+    buf topic[TOPIC_CAP];
+    buf payload[PAYLOAD_CAP];
+
+    loop {
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            mqtt_disconnect(tel.session);
+            exit(0);
+        }
+
+        draw_rect(0, 0, 320, 320, 0);
+        draw_text(16, 16, "KOTO-0249 MQTT", 14);
+
+        if tel.phase == P_CONNECT {
+            let session = mqtt_connect(BROKER);
+            if session < 0 {
+                tel.phase = P_OFFLINE;
+            } else {
+                tel.session = session;
+                tel.phase = P_SUBSCRIBE;
+            }
+        }
+
+        if tel.phase == P_SUBSCRIBE {
+            let state = mqtt_poll(tel.session);
+            if state == MQTT_CONNECTED || state == MQTT_MESSAGE {
+                // Subscribe to the one granted exact topic filter.
+                mqtt_subscribe(tel.session, TOPIC);
+                tel.phase = P_LISTEN;
+            }
+            if state == MQTT_FAILED || state == MQTT_DISCONNECTED {
+                tel.phase = P_OFFLINE;
+            }
+        }
+
+        if tel.phase == P_LISTEN {
+            let state = mqtt_poll(tel.session);
+            if state == MQTT_MESSAGE {
+                // Size the read from the queued message, then consume it.
+                let plen = mqtt_peek_payload_len(tel.session);
+                let kind = mqtt_read(
+                    tel.session,
+                    topic,
+                    TOPIC_CAP,
+                    payload,
+                    PAYLOAD_CAP,
+                );
+                if kind != MQTT_READ_NONE {
+                    tel.value_len = plen;
+                    tel.updates = tel.updates + 1;
+                    if kind == MQTT_READ_RETAINED {
+                        tel.retained = 1;
+                    } else {
+                        tel.retained = 0;
+                    }
+                }
+            }
+            if state == MQTT_DISCONNECTED || state == MQTT_FAILED {
+                tel.phase = P_OFFLINE;
+            }
+        }
+
+        // Connection status line.
+        if tel.phase == P_CONNECT || tel.phase == P_SUBSCRIBE {
+            draw_text(16, 48, "mqtt: connecting", 16);
+        }
+        if tel.phase == P_LISTEN {
+            draw_text(16, 48, "mqtt: online", 12);
+        }
+        if tel.phase == P_OFFLINE {
+            draw_text(16, 48, "mqtt: offline", 13);
+        }
+
+        // Latest reading and whether it came from the broker's retained value.
+        if tel.value_len > 0 {
+            draw_text(16, 80, "temp:", 5);
+            draw_text(72, 80, payload, tel.value_len);
+            if tel.retained == 1 {
+                draw_text(16, 104, "source: retained", 16);
+            } else {
+                draw_text(16, 104, "source: live", 12);
+            }
+        }
+
+        yield_frame();
+    }
+}

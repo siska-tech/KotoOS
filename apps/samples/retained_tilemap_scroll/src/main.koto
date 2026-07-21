@@ -15,6 +15,34 @@ const KIM_HEADER = 8;
 const SHEET_BYTES = 2056;
 const UPLOAD_PER_FRAME = 50;
 
+struct ScrollState {
+    eol: int,
+    camera_x: int,
+    camera_y: int,
+    upload: int,
+}
+
+static scroll: ScrollState = {
+    eol: 0,
+    camera_x: 0,
+    camera_y: 0,
+    upload: 0,
+};
+
+impl ScrollState {
+    fn restart_upload(self, camera_x: int, camera_y: int) {
+        self.camera_x = camera_x;
+        self.camera_y = camera_y;
+        self.upload = 0;
+    }
+
+    fn batch_end(self) -> int {
+        let stop = self.upload + UPLOAD_PER_FRAME;
+        if stop > VIEW_CELLS { return VIEW_CELLS; }
+        return stop;
+    }
+}
+
 fn glyph_tile(glyph: int) -> int {
     if glyph == 35 { return 1; }
     if glyph == 126 { return 2; }
@@ -44,13 +72,9 @@ fn main() {
     buf shown[400];
 
     let map_loaded = 0;
-    let eol = 0;
-    let cam_x = 0;
-    let cam_y = 0;
     let next_x = 0;
     let next_y = 0;
     let marker = 0;
-    let upload = 0;
     let stop = 0;
     let tile = 0;
     let row = 0;
@@ -61,18 +85,18 @@ fn main() {
 
     map_loaded = asset_load("maps/world.map", 14, raw_world, MAP_RAW_BYTES);
     if map_loaded < 0 { exit(2); }
-    eol = map_eol(raw_world, map_loaded, WORLD_W, WORLD_H);
-    if eol < 0 { exit(2); }
+    scroll.eol = map_eol(raw_world, map_loaded, WORLD_W, WORLD_H);
+    if scroll.eol < 0 { exit(2); }
 
-    while marker < WORLD_CELLS && map_glyph(raw_world, marker, WORLD_W, eol) != 64 {
+    while marker < WORLD_CELLS && map_glyph(raw_world, marker, WORLD_W, scroll.eol) != 64 {
         marker = marker + 1;
     }
-    cam_x = (marker % WORLD_W) - VIEW_W / 2;
-    cam_y = (marker / WORLD_W) - VIEW_H / 2;
-    if cam_x < 0 { cam_x = 0; }
-    if cam_y < 0 { cam_y = 0; }
-    if cam_x > WORLD_W - VIEW_W { cam_x = WORLD_W - VIEW_W; }
-    if cam_y > WORLD_H - VIEW_H { cam_y = WORLD_H - VIEW_H; }
+    scroll.camera_x = (marker % WORLD_W) - VIEW_W / 2;
+    scroll.camera_y = (marker / WORLD_W) - VIEW_H / 2;
+    if scroll.camera_x < 0 { scroll.camera_x = 0; }
+    if scroll.camera_y < 0 { scroll.camera_y = 0; }
+    if scroll.camera_x > WORLD_W - VIEW_W { scroll.camera_x = WORLD_W - VIEW_W; }
+    if scroll.camera_y > WORLD_H - VIEW_H { scroll.camera_y = WORLD_H - VIEW_H; }
 
     asset_load("sprites/scroll_tiles.kim", 24, sheet, SHEET_BYTES);
     game2d_configure_tilemap(0, VIEW_W, VIEW_H, 0, 0);
@@ -81,39 +105,36 @@ fn main() {
         intent = text_intent();
         if (intent & INTENT_EXIT) != 0 { exit(0); }
 
-        next_x = cam_x;
-        next_y = cam_y;
-        if upload >= VIEW_CELLS {
-            if (intent & INTENT_LEFT) != 0 { next_x = cam_x - 1; }
-            else if (intent & INTENT_RIGHT) != 0 { next_x = cam_x + 1; }
-            else if (intent & INTENT_UP) != 0 { next_y = cam_y - 1; }
-            else if (intent & INTENT_DOWN) != 0 { next_y = cam_y + 1; }
+        next_x = scroll.camera_x;
+        next_y = scroll.camera_y;
+        if scroll.upload >= VIEW_CELLS {
+            if (intent & INTENT_LEFT) != 0 { next_x = scroll.camera_x - 1; }
+            else if (intent & INTENT_RIGHT) != 0 { next_x = scroll.camera_x + 1; }
+            else if (intent & INTENT_UP) != 0 { next_y = scroll.camera_y - 1; }
+            else if (intent & INTENT_DOWN) != 0 { next_y = scroll.camera_y + 1; }
 
             if next_x < 0 { next_x = 0; }
             if next_y < 0 { next_y = 0; }
             if next_x > WORLD_W - VIEW_W { next_x = WORLD_W - VIEW_W; }
             if next_y > WORLD_H - VIEW_H { next_y = WORLD_H - VIEW_H; }
-            if next_x != cam_x || next_y != cam_y {
-                cam_x = next_x;
-                cam_y = next_y;
-                upload = 0;
+            if next_x != scroll.camera_x || next_y != scroll.camera_y {
+                scroll.restart_upload(next_x, next_y);
             }
         }
 
-        if upload < VIEW_CELLS {
-            stop = upload + UPLOAD_PER_FRAME;
-            if stop > VIEW_CELLS { stop = VIEW_CELLS; }
-            while upload < stop {
-                x = upload % VIEW_W;
-                row = upload / VIEW_W;
-                world_cell = (cam_y + row) * WORLD_W + cam_x + x;
-                tile = glyph_tile(map_glyph(raw_world, world_cell, WORLD_W, eol));
-                if shown[upload] != tile + 1 {
+        if scroll.upload < VIEW_CELLS {
+            stop = scroll.batch_end();
+            while scroll.upload < stop {
+                x = scroll.upload % VIEW_W;
+                row = scroll.upload / VIEW_W;
+                world_cell = (scroll.camera_y + row) * WORLD_W + scroll.camera_x + x;
+                tile = glyph_tile(map_glyph(raw_world, world_cell, WORLD_W, scroll.eol));
+                if shown[scroll.upload] != tile + 1 {
                     game2d_set_tile(0, x, row,
                         sheet + KIM_HEADER + tile * TILE_BYTES);
-                    shown[upload] = tile + 1;
+                    shown[scroll.upload] = tile + 1;
                 }
-                upload = upload + 1;
+                scroll.upload = scroll.upload + 1;
             }
         }
 

@@ -1,0 +1,42 @@
+{
+  "app_id": "dev.koto.weather",
+  "kind": "koto",
+  "package": "weather",
+  "name": "Koto Weather",
+  "description": "Bilingual Internet-weather reference app over the bounded Fetch/JSON SDK.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "icon": "icon.kicon",
+  "memory": {
+    "sram_work_bytes": 24576,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": {
+      "origins": [
+        "https://weather.example"
+      ]
+    }
+  },
+  "assets": [
+    {
+      "source": "locales/en-US.txt",
+      "output": "locales/en-US.txt"
+    },
+    {
+      "source": "locales/ja-JP.txt",
+      "output": "locales/ja-JP.txt"
+    },
+    {
+      "source": "locales/qps-ploc.txt",
+      "output": "locales/qps-ploc.txt"
+    }
+  ],
+  "codegen": {
+    "comment": "KOTO-0247: SDK packet validators and the fetch/JSON state machine inline deeply; relocate one-time setup and outline cold branches so the steady idle loop stays inside the resident code window.",
+    "relocate_preamble": true,
+    "outline_cold_blocks": true
+  }
+}

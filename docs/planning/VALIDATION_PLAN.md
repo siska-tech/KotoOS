@@ -90,6 +90,40 @@ testing (KOTO-0204 and KOTO-0205). Pico Plus 2(W) is the subsequent KOTO-0206
 gate and additionally requires module QMI PSRAM identity, boundary, and soak
 tests plus a forced fallback to the separate PicoCalc baseboard PSRAM.
 
+## Phase 6: Optional Wi-Fi Configuration Gate
+
+Networking remains optional. Before device tests, simulator tests replay
+[`network_service_v1.json`](../../harness/fixtures/network_service/network_service_v1.json)
+without host network access and require exact ordered snapshots for capability
+absence, scan/connect/disconnect, authentication failure, cancellation, radio
+loss, stale completion rejection, and forget commit.
+
+The exact focused command for all fake-service replay and KotoConfig Wi-Fi
+controller scenarios is:
+
+```powershell
+cargo test -p koto-sim --test koto_network_service
+```
+
+Run the portable service boundary suite (queue/event overflow, exact timeout,
+retry schedule, empty/full/deduplicated scans, invalid input, corrupt secret
+store, and generation/request wrap) alongside it:
+
+```powershell
+cargo test -p koto-core net::tests
+```
+
+`python harness/check_project.py` additionally parses every checked-in fake
+fixture and rejects nondeterministic fields, host-network dependencies, and
+host-network/wall-clock/RNG APIs in the fake execution path.
+
+Device promotion then requires the fixed capacities and SRAM ceilings in the
+[KotoConfig Wi-Fi extension contract](../architecture/KOTOCONFIG_WIFI_EXTENSION.md),
+release ELF accounting on RP2040 and RP2350, controlled-AP tests, secret
+corruption/factory-reset checks, 100 lifecycle transitions, and the KOTO-0227
+Wi-Fi-plus-stream soak. Any Wi-Fi failure must leave boot, language settings,
+KotoShell, and offline app launch operational.
+
 ## Release Gates
 
 MVP is not considered complete until:

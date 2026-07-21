@@ -34,10 +34,14 @@
 //! (KOTO-0148 headroom notes updated in the issue doc).
 
 use core::{
-    cell::RefCell,
+    cell::{RefCell, UnsafeCell},
+    mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::firmware::audio_residency::{
+    AudioResidencyOwner, ResidencyState, ResidencyToken, TransitionError,
+};
 use critical_section::Mutex;
 use embassy_rp::{
     clocks::clk_sys_freq,
@@ -45,7 +49,7 @@ use embassy_rp::{
     pac,
     pac::dma::vals::{DataSize, TreqSel},
     peripherals::CORE1,
-    pwm::{Config as PwmConfig, Pwm, SetDutyCycle},
+    pwm::{Config as PwmConfig, Pwm},
     Peri,
 };
 use embassy_time::{block_for, Duration, Instant};
@@ -56,7 +60,6 @@ use koto_audio::{
     DEFAULT_MIXER_BLOCK_FRAMES,
 };
 use portable_atomic::{AtomicBool, AtomicU32};
-use static_cell::StaticCell;
 
 /// Output sample rate. Matches `AudioLimits::v0_default()` and the sample rate
 /// the koto-audio built-in drum tables are authored at, so drums play at pitch.
@@ -95,7 +98,6 @@ const RUNTIME_SFX_PLAYERS: usize = 3;
 pub const AUDIO_CORE1_STACK_BYTES: usize = 8192;
 const PCM_PWM_DIVIDER: u8 = 6;
 const PCM_PWM_TOP: u16 = 250;
-const IDLE_SILENCE_DUTY: u16 = 0;
 
 // --- DMA-paced output (KOTO-0114 pattern) -----------------------------------
 //
@@ -185,6 +187,7 @@ enum AudioCommand {
     PlayRuntimeClip,
     StopBgm,
     StopAll,
+    QuiesceRich(u32),
 }
 
 struct AudioCommandQueue {
@@ -232,35 +235,46 @@ impl AudioCommandQueue {
     }
 }
 
-/// Everything shared between the CPU0 facade, the service backend sink, and the
-/// CPU1 worker, behind one critical-section cell.
-struct AudioShared {
+/// Permanently resident state required by PCM16/SLDPCM4 package streaming.
+struct StreamAudioShared {
     /// Raw `audio_submit_i16` PCM from CPU0.
     raw: PcmRing<PCM_RING_CAPACITY>,
+}
+
+impl StreamAudioShared {
+    const fn new() -> Self {
+        Self {
+            raw: PcmRing::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.raw.clear();
+    }
+}
+
+/// State used only by the full sequence/cue/owned-clip audio service.
+struct RichAudioShared {
     /// Service-rendered output blocks awaiting the PWM cadence.
     out: PcmRing<OUT_RING_CAPACITY>,
     commands: AudioCommandQueue,
     high_priority: AudioCommand,
-    runtime_image: [u8; RUNTIME_CUE_IMAGE_CAPACITY],
     runtime_image_len: usize,
     runtime_image_busy: bool,
 }
 
-impl AudioShared {
+impl RichAudioShared {
     const fn new() -> Self {
         Self {
-            raw: PcmRing::new(),
             out: PcmRing::new(),
             commands: AudioCommandQueue::new(),
             high_priority: AudioCommand::None,
-            runtime_image: [0; RUNTIME_CUE_IMAGE_CAPACITY],
             runtime_image_len: 0,
             runtime_image_busy: false,
         }
     }
 
     fn reset(&mut self) {
-        self.raw.clear();
         self.out.clear();
         self.commands.clear();
         self.high_priority = AudioCommand::None;
@@ -269,8 +283,40 @@ impl AudioShared {
     }
 }
 
-static AUDIO_SHARED: Mutex<RefCell<AudioShared>> = Mutex::new(RefCell::new(AudioShared::new()));
+#[repr(transparent)]
+struct StreamAudioArena(UnsafeCell<StreamAudioShared>);
+
+// Safety: ordinary access is serialized by the cross-core critical section.
+// Direct TLS workspace access is possible only after the CPU1/DMA offline ACK
+// and remains exclusive until the generation-owned handle is returned.
+unsafe impl Sync for StreamAudioArena {}
+
+#[unsafe(no_mangle)]
+static AUDIO_STREAM_SHARED: StreamAudioArena =
+    StreamAudioArena(UnsafeCell::new(StreamAudioShared::new()));
+
+fn with_stream_audio<R>(use_shared: impl FnOnce(&mut StreamAudioShared) -> R) -> R {
+    critical_section::with(|_| use_shared(unsafe { &mut *AUDIO_STREAM_SHARED.0.get() }))
+}
+
 static AUDIO_STATS: AudioAtomicStats = AudioAtomicStats::new();
+static AUDIO_RESIDENCY_OWNER: Mutex<RefCell<AudioResidencyOwner>> =
+    Mutex::new(RefCell::new(AudioResidencyOwner::new()));
+static WORKER_RICH_ACTIVE: AtomicBool = AtomicBool::new(true);
+static RICH_SERVICE_READY: AtomicBool = AtomicBool::new(false);
+static WORKER_RICH_OFFLINE_GENERATION: AtomicU32 = AtomicU32::new(0);
+static WORKER_RICH_ONLINE_GENERATION: AtomicU32 = AtomicU32::new(0);
+static WORKER_STREAM_ACTIVE: AtomicBool = AtomicBool::new(true);
+static WORKER_STREAM_OFFLINE_GENERATION: AtomicU32 = AtomicU32::new(0);
+static WORKER_STREAM_ONLINE_GENERATION: AtomicU32 = AtomicU32::new(0);
+static TLS_AUDIO_WORKSPACE_CLAIMED: AtomicBool = AtomicBool::new(false);
+const WORKER_CONTROL_NONE: u32 = 0;
+const WORKER_CONTROL_QUIESCE_RICH: u32 = 1;
+const WORKER_CONTROL_ACTIVATE_RICH: u32 = 2;
+const WORKER_CONTROL_QUIESCE_STREAM: u32 = 3;
+const WORKER_CONTROL_ACTIVATE_STREAM: u32 = 4;
+static WORKER_CONTROL: AtomicU32 = AtomicU32::new(WORKER_CONTROL_NONE);
+static WORKER_CONTROL_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// CPU0 marks the host-managed KPA stream active after its first successful
 /// refill. CPU1 uses this only to distinguish an expected empty raw ring from
 /// a streaming starvation gap in the `underruns` diagnostic.
@@ -340,21 +386,203 @@ fn core1_stack_free_min() -> Option<usize> {
 /// The ported koto-audio service shape used on device.
 type PicoAudioService = DefaultAudioService<'static, PwmBlockSink>;
 
-/// CPU1-owned service storage (KOTO-0148: retained state in its own StaticCell,
-/// out of the CPU1 stack and the main-task future).
-static AUDIO_SERVICE: StaticCell<PicoAudioService> = StaticCell::new();
-static RUNTIME_BGM_PLAYER: StaticCell<RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>> =
-    StaticCell::new();
-static RUNTIME_SFX_PLAYER: StaticCell<
-    [RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS],
-> = StaticCell::new();
-static RUNTIME_CLIP_PLAYER: StaticCell<OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>> =
-    StaticCell::new();
+#[repr(transparent)]
+struct RichSlot<T>(UnsafeCell<MaybeUninit<T>>);
 
-// Shared-cell and service budgets: the long-stream raw ring occupies 8 KiB;
-// the service replaces the two removed
-// by-value `PicoBgmScore` command slots and the legacy players.
-const _: () = assert!(core::mem::size_of::<AudioShared>() <= 24 * 1024);
+// `&'static self -> &'static mut T` goes through the `UnsafeCell`, the
+// sanctioned interior-mutability escape hatch; exclusive access is the
+// residency owner's serialization contract (see `RichAudioArena`), which the
+// `mut_from_ref` lint (deny-by-default since clippy 1.96) cannot see.
+#[allow(clippy::mut_from_ref)]
+impl<T> RichSlot<T> {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+
+    unsafe fn init(&'static self, value: T) -> &'static mut T {
+        let slot = self.0.get();
+        unsafe {
+            slot.write(MaybeUninit::new(value));
+            &mut *slot.cast::<T>()
+        }
+    }
+
+    /// Copies `template` into the slot without materializing a `T` on the
+    /// caller's stack (KOTO-0252): [`Self::init`] receives its value by value,
+    /// so a player-sized argument is built on the calling frame first — the
+    /// ~18 KiB BGM temporary set the shell-path stack low-water mark. Here the
+    /// source stays wherever it lives (XIP flash for the idle-player
+    /// templates) and the copy is one direct `memcpy` into the arena.
+    unsafe fn init_from(&'static self, template: &T) -> &'static mut T
+    where
+        T: Copy,
+    {
+        let slot = self.0.get().cast::<T>();
+        unsafe {
+            core::ptr::copy_nonoverlapping(template, slot, 1);
+            &mut *slot
+        }
+    }
+    unsafe fn assume_init_mut(&'static self) -> &'static mut T {
+        unsafe { &mut *self.0.get().cast::<T>() }
+    }
+}
+
+pub const RICH_AUDIO_RESIDENCY_BYTES: usize = 36 * 1024;
+const RICH_AUDIO_STORAGE_BYTES: usize = core::mem::size_of::<Mutex<RefCell<RichAudioShared>>>()
+    + core::mem::size_of::<UnsafeCell<[u8; RUNTIME_CUE_IMAGE_CAPACITY]>>()
+    + core::mem::size_of::<RichSlot<PicoAudioService>>()
+    + core::mem::size_of::<RichSlot<RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>>>()
+    + core::mem::size_of::<
+        RichSlot<[RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS]>,
+    >()
+    + core::mem::size_of::<RichSlot<OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>>>();
+const RICH_AUDIO_RESERVE_BYTES: usize = RICH_AUDIO_RESIDENCY_BYTES - RICH_AUDIO_STORAGE_BYTES;
+
+/// CPU1-owned rich-service storage, kept contiguous for RP2040 residency reuse.
+#[repr(C, align(8))]
+struct RichAudioResidency {
+    shared: Mutex<RefCell<RichAudioShared>>,
+    runtime_image: UnsafeCell<[u8; RUNTIME_CUE_IMAGE_CAPACITY]>,
+    service: RichSlot<PicoAudioService>,
+    runtime_bgm: RichSlot<RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>>,
+    runtime_sfx: RichSlot<[RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS]>,
+    runtime_clip: RichSlot<OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>>,
+    reserve: [u8; RICH_AUDIO_RESERVE_BYTES],
+}
+
+impl RichAudioResidency {
+    const fn new() -> Self {
+        Self {
+            shared: Mutex::new(RefCell::new(RichAudioShared::new())),
+            runtime_image: UnsafeCell::new([0; RUNTIME_CUE_IMAGE_CAPACITY]),
+            service: RichSlot::new(),
+            runtime_bgm: RichSlot::new(),
+            runtime_sfx: RichSlot::new(),
+            runtime_clip: RichSlot::new(),
+            reserve: [0; RICH_AUDIO_RESERVE_BYTES],
+        }
+    }
+}
+
+#[repr(transparent)]
+struct RichAudioArena(UnsafeCell<RichAudioResidency>);
+
+// Safety: the residency owner serializes whole-arena reuse. Field access is
+// allowed only in FullAudio, and CPU1 releases every field reference before an
+// Offline acknowledgement permits the alternate owner to reuse these bytes.
+unsafe impl Sync for RichAudioArena {}
+
+#[unsafe(no_mangle)]
+static AUDIO_RICH_RESIDENCY: RichAudioArena =
+    RichAudioArena(UnsafeCell::new(RichAudioResidency::new()));
+
+fn rich_residency() -> &'static RichAudioResidency {
+    unsafe { &*AUDIO_RICH_RESIDENCY.0.get() }
+}
+
+fn rich_shared() -> &'static Mutex<RefCell<RichAudioShared>> {
+    &rich_residency().shared
+}
+
+fn rich_runtime_image() -> *mut [u8; RUNTIME_CUE_IMAGE_CAPACITY] {
+    rich_residency().runtime_image.get()
+}
+/// Rebuilds the rich-audio residency fields in the arena.
+///
+/// KOTO-0251: every slot is constructed inside its own `#[inline(never)]`
+/// frame. The previous single-frame shape materialized *all* by-value
+/// temporaries at once (service, cue players, 8 KiB clip player, plus
+/// slot-sized `MaybeUninit` rewrites) on the caller's stack — KOTO-0172's
+/// by-value-ctor lesson — and on hardware that transient punched through
+/// `_stack_end` into the `.bss` tail (zeroing embassy's clock bookkeeping)
+/// once the wifi-config image grew the statics. Splitting the constructors
+/// bounds the transient depth to the largest single value instead of the sum,
+/// on boot and on every post-Wi-Fi reconstruction alike. The redundant
+/// `RichSlot::new()` pre-writes are dropped: the slots hold no `Drop` types
+/// and each `init` overwrites its slot completely.
+unsafe fn initialize_rich_residency() {
+    init_rich_shared();
+    let service_ready = init_rich_service();
+    init_rich_runtime_bgm();
+    for index in 0..RUNTIME_SFX_PLAYERS {
+        init_rich_runtime_sfx_player(index);
+    }
+    init_rich_runtime_clip();
+    RICH_SERVICE_READY.store(service_ready, Ordering::Release);
+}
+
+#[inline(never)]
+fn init_rich_shared() {
+    let residency = AUDIO_RICH_RESIDENCY.0.get();
+    unsafe {
+        core::ptr::addr_of_mut!((*residency).shared)
+            .write(Mutex::new(RefCell::new(RichAudioShared::new())));
+    }
+}
+
+#[inline(never)]
+fn init_rich_service() -> bool {
+    let residency = rich_residency();
+    PicoAudioService::new(AudioPolicy::v0_default(), PwmBlockSink::new())
+        .ok()
+        .map(|service| unsafe { residency.service.init(service) })
+        .is_some()
+}
+
+/// Idle-player templates, const-built into `.rodata` (XIP flash) so the
+/// rebuild path copies flash -> arena directly (KOTO-0252). Passing
+/// `T::new(..)` to `RichSlot::init` staged each player on the constructing
+/// frame first; the ~18 KiB BGM temporary was the shell-path stack low-water
+/// mark (`phase=176 at=shell`), reached from page-exit teardown on every
+/// post-Wi-Fi rich-audio reconstruction.
+static IDLE_BGM_PLAYER: RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK> =
+    RuntimeCuePlayer::new(PCM_OUTPUT_SAMPLE_RATE_HZ);
+static IDLE_SFX_PLAYER: RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK> =
+    RuntimeCuePlayer::new(PCM_OUTPUT_SAMPLE_RATE_HZ);
+static IDLE_CLIP_PLAYER: OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY> = OwnedClipPlayer::new();
+
+#[inline(never)]
+fn init_rich_runtime_bgm() {
+    let residency = rich_residency();
+    unsafe {
+        residency.runtime_bgm.init_from(&IDLE_BGM_PLAYER);
+    }
+}
+
+/// One SFX player per frame: the whole-array temporary tripled the transient.
+#[inline(never)]
+fn init_rich_runtime_sfx_player(index: usize) {
+    let residency = rich_residency();
+    let array = residency
+        .runtime_sfx
+        .0
+        .get()
+        .cast::<[RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS]>();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &IDLE_SFX_PLAYER,
+            core::ptr::addr_of_mut!((*array)[index]),
+            1,
+        );
+    }
+}
+
+#[inline(never)]
+fn init_rich_runtime_clip() {
+    let residency = rich_residency();
+    unsafe {
+        residency.runtime_clip.init_from(&IDLE_CLIP_PLAYER);
+    }
+}
+
+// Residency budgets: the permanent stream cell is dominated by the 8 KiB raw
+// ring. The rich cell owns the service output, commands, and runtime staging.
+const _: () = assert!(core::mem::size_of::<StreamAudioShared>() <= 9 * 1024);
+const _: () = assert!(core::mem::align_of::<RichAudioArena>() >= 8);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<RichAudioArena>() == RICH_AUDIO_RESIDENCY_BYTES);
+#[cfg(target_pointer_width = "32")]
 const _: () = assert!(core::mem::size_of::<PicoAudioService>() <= 4 * 1024);
 
 struct AudioAtomicStats {
@@ -371,6 +599,7 @@ struct AudioAtomicStats {
     mixer_saturations: AtomicU32,
     worker_late: AtomicU32,
     worker_max_jitter_us: AtomicU32,
+    arena_guard_failures: AtomicU32,
     /// Monotonic CPU1 worker-loop pass counter (KOTO-0186). A live worker bumps
     /// this every `run()` pass (~1 ms); if it stops advancing across two
     /// `phase=173` samples the worker is wedged or dead, so worker liveness is a
@@ -395,6 +624,7 @@ impl AudioAtomicStats {
             mixer_saturations: AtomicU32::new(0),
             worker_late: AtomicU32::new(0),
             worker_max_jitter_us: AtomicU32::new(0),
+            arena_guard_failures: AtomicU32::new(0),
             worker_heartbeat: AtomicU32::new(0),
         }
     }
@@ -413,6 +643,7 @@ impl AudioAtomicStats {
         self.mixer_saturations.store(0, Ordering::Relaxed);
         self.worker_late.store(0, Ordering::Relaxed);
         self.worker_max_jitter_us.store(0, Ordering::Relaxed);
+        self.arena_guard_failures.store(0, Ordering::Relaxed);
     }
 
     fn inc(counter: &AtomicU32, by: u32) {
@@ -467,7 +698,7 @@ impl AudioBackend<BLOCK_FRAMES> for PwmBlockSink {
             return Err(BackendError::NotRunning);
         }
         let fitted = critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            let mut shared = rich_shared().borrow_ref_mut(cs);
             if shared.out.len() + BLOCK_FRAMES > OUT_RING_CAPACITY {
                 return false;
             }
@@ -506,6 +737,264 @@ impl AudioBackend<BLOCK_FRAMES> for PwmBlockSink {
 pub enum PcmSubmitError {
     BadArgument,
     Unsupported,
+    TemporaryUnavailable,
+}
+
+#[must_use]
+pub struct WifiResidencyArena {
+    generation: u32,
+}
+
+/// Exclusive RP2040 storage loan for one TLS connection future.
+/// Dropping this handle without returning it intentionally leaves audio
+/// unavailable; restoration must pass through the zeroizing release method.
+#[cfg(feature = "mcu-rp2040")]
+#[must_use]
+pub struct TlsAudioWorkspace {
+    generation: u32,
+}
+
+#[cfg(feature = "mcu-rp2040")]
+impl TlsAudioWorkspace {
+    pub const CAPACITY: usize = PCM_RING_CAPACITY * core::mem::size_of::<i16>();
+
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    pub fn bytes(&mut self) -> &mut [MaybeUninit<u8>] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                (*AUDIO_STREAM_SHARED.0.get())
+                    .raw
+                    .samples
+                    .as_mut_ptr()
+                    .cast(),
+                Self::CAPACITY,
+            )
+        }
+    }
+
+    pub fn try_start_future<'storage, F>(
+        &'storage mut self,
+        future: F,
+    ) -> Result<
+        crate::firmware::arena_future::ArenaFuture<'storage>,
+        crate::firmware::arena_future::ArenaFutureError,
+    >
+    where
+        F: core::future::Future<Output = ()> + 'storage,
+    {
+        crate::firmware::arena_future::ArenaFuture::try_new(self.bytes(), future)
+    }
+
+    /// Zero-initializes the whole 8 KiB PCM loan and returns it as the
+    /// dedicated TLS crypto stack. The P-256 CertVerify peak (~5.1 KiB) plus
+    /// nested interrupt frames must fit here: a stack whose peak reached the
+    /// base would push interrupt frames BELOW it into the live CYW43/net-stack
+    /// arena, wedging the transport (KOTO-0245 wire diagnosis). The adjacent
+    /// lower region is now fetch-local audio scratch rather than the net
+    /// stack. The crypto implementation must retain explicit interrupt
+    /// headroom within this fixed SRAM-neutral loan.
+    pub fn crypto_stack(&mut self) -> &mut [u8] {
+        let bytes = self.bytes();
+        for byte in bytes.iter_mut() {
+            byte.write(0);
+        }
+        // SAFETY: every byte was just initialized above.
+        unsafe { &mut *(core::ptr::from_mut(bytes) as *mut [u8]) }
+    }
+
+    /// Reads back the crypto-stack bytes (after the exchange, before release)
+    /// so the high-water mark can be recovered. The region was initialized by
+    /// [`Self::crypto_stack`].
+    pub fn crypto_stack_readback(&mut self) -> &[u8] {
+        let bytes = self.bytes();
+        // SAFETY: initialized by the preceding `crypto_stack` call.
+        unsafe { &*(core::ptr::from_ref(bytes) as *const [u8]) }
+    }
+}
+
+/// KOTO-0245 receive-record buffer. The controlled server handshake flight is
+/// 767 bytes; 1,792 bytes retains bounded overhead while freeing more of the
+/// adjacent audio scratch for the extended crypto stack. Oversized records
+/// fail closed as `Tls`.
+#[cfg(feature = "mcu-rp2040")]
+pub const TLS_RECORD_RX_BYTES: usize = 1792;
+/// Transmit-record buffer for the bounded GET head; served from the quiesced
+/// audio DMA ring.
+#[cfg(feature = "mcu-rp2040")]
+pub const TLS_RECORD_TX_BYTES: usize = 1024;
+
+#[cfg(feature = "mcu-rp2040")]
+const _: () = assert!(TLS_RECORD_TX_BYTES <= DMA_RING_SAMPLES * core::mem::size_of::<u32>());
+
+/// Lends the quiesced audio DMA ring as the TLS transmit-record buffer. Sound
+/// only while stream audio is quiesced (workspace claimed): the DMA is aborted
+/// and nothing else touches this storage during a fetch.
+///
+/// # Safety
+/// Caller holds the TLS/audio workspace claim (stream quiesced) for the whole
+/// borrow, on CPU0.
+#[cfg(all(feature = "mcu-rp2040", feature = "app_fetch_https"))]
+pub unsafe fn tls_record_tx_bytes() -> &'static mut [u8] {
+    let ring = unsafe { &mut *core::ptr::addr_of_mut!(AUDIO_DMA_RING) };
+    // SAFETY: [u32; N] reinterpreted as bytes; the DMA is aborted during a
+    // fetch so this is exclusively ours. Truncated to the TX record size.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::from_mut(&mut ring.0).cast::<u8>(),
+            TLS_RECORD_TX_BYTES,
+        )
+    };
+    bytes.fill(0);
+    bytes
+}
+
+/// Claims the globally fenced PCM workspace without retaining a
+/// `PicoAudioBackend` reference in the network future. The residency owner and
+/// one-owner CAS are checked at the instant ownership moves.
+#[cfg(feature = "mcu-rp2040")]
+pub(crate) fn claim_shared_tls_audio_workspace() -> Result<TlsAudioWorkspace, TransitionError> {
+    let generation = critical_section::with(|cs| {
+        let owner = *AUDIO_RESIDENCY_OWNER.borrow_ref(cs);
+        (owner.state() == ResidencyState::TlsExclusive).then(|| owner.token().generation())
+    })
+    .ok_or(TransitionError::InvalidState)?;
+    TLS_AUDIO_WORKSPACE_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| TransitionError::InvalidState)?;
+    Ok(TlsAudioWorkspace { generation })
+}
+
+/// Returns a network-owned workspace, overwrites every byte, and starts the
+/// normal CPU1 stream reconstruction. The audio facade synchronizes to the new
+/// residency generation on its next service pass.
+#[cfg(feature = "mcu-rp2040")]
+pub(crate) fn release_shared_tls_audio_workspace(
+    mut workspace: TlsAudioWorkspace,
+) -> Result<u32, TransitionError> {
+    let valid = TLS_AUDIO_WORKSPACE_CLAIMED.load(Ordering::Acquire)
+        && critical_section::with(|cs| {
+            let owner = *AUDIO_RESIDENCY_OWNER.borrow_ref(cs);
+            owner.state() == ResidencyState::TlsExclusive
+                && owner.token().generation() == workspace.generation
+        });
+    if !valid {
+        return Err(TransitionError::StaleToken);
+    }
+    crate::firmware::arena_future::zeroize_arena(workspace.bytes());
+    with_stream_audio(StreamAudioShared::reset);
+    let token = critical_section::with(|cs| {
+        AUDIO_RESIDENCY_OWNER
+            .borrow_ref_mut(cs)
+            .begin_stream_restore_after_tls()
+    })?;
+    TLS_AUDIO_WORKSPACE_CLAIMED.store(false, Ordering::Release);
+    WORKER_CONTROL_GENERATION.store(token.generation(), Ordering::Relaxed);
+    WORKER_CONTROL.store(WORKER_CONTROL_ACTIVATE_STREAM, Ordering::Release);
+    Ok(token.generation())
+}
+
+impl WifiResidencyArena {
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    pub fn bytes(&mut self) -> &mut [MaybeUninit<u8>] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                AUDIO_RICH_RESIDENCY.0.get().cast::<MaybeUninit<u8>>(),
+                RICH_AUDIO_RESIDENCY_BYTES,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioRequestError {
+    TemporaryUnavailable,
+    StaleHandle,
+    QueueFull,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LoadedAudioImage {
+    Cue { len: usize, bgm: bool },
+    Clip { len: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RichImageError {
+    TemporaryUnavailable,
+    Busy,
+}
+
+pub(crate) fn try_load_rich_audio_image(
+    load: impl FnOnce(&mut [u8; RUNTIME_CUE_IMAGE_CAPACITY]) -> Option<LoadedAudioImage>,
+) -> Result<bool, RichImageError> {
+    let rich_available = critical_section::with(|cs| {
+        let owner = *AUDIO_RESIDENCY_OWNER.borrow_ref(cs);
+        owner.rich_audio_available(owner.token())
+    });
+    if !rich_available {
+        return Err(RichImageError::TemporaryUnavailable);
+    }
+    let claimed = critical_section::with(|cs| {
+        let mut shared = rich_shared().borrow_ref_mut(cs);
+        if shared.runtime_image_busy {
+            return false;
+        }
+        shared.runtime_image_busy = true;
+        true
+    });
+    if !claimed {
+        return Err(RichImageError::Busy);
+    }
+
+    // The busy claim prevents CPU0 from lending this slot again. CPU1 can only
+    // read it after the command is queued below, after this mutable view ends.
+    let image = unsafe { &mut *rich_runtime_image() };
+    let loaded = load(image);
+
+    let queued = critical_section::with(|cs| {
+        let mut shared = rich_shared().borrow_ref_mut(cs);
+        let command = match loaded {
+            Some(LoadedAudioImage::Cue { len, bgm })
+                if len > 0 && len <= RUNTIME_CUE_IMAGE_CAPACITY =>
+            {
+                shared.runtime_image_len = len;
+                if bgm {
+                    AudioCommand::PlayRuntimeBgm
+                } else {
+                    AudioCommand::PlayRuntimeSfx
+                }
+            }
+            Some(LoadedAudioImage::Clip { len })
+                if len > 0 && len <= RUNTIME_CLIP_IMAGE_CAPACITY =>
+            {
+                shared.runtime_image_len = len;
+                AudioCommand::PlayRuntimeClip
+            }
+            _ => {
+                shared.runtime_image_len = 0;
+                shared.runtime_image_busy = false;
+                return false;
+            }
+        };
+        if shared.commands.push(command) {
+            true
+        } else {
+            shared.runtime_image_len = 0;
+            shared.runtime_image_busy = false;
+            false
+        }
+    });
+    if !queued {
+        AudioAtomicStats::inc(&AUDIO_STATS.command_drops, 1);
+        AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
+    }
+    Ok(queued)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -531,10 +1020,19 @@ pub struct AudioBackendStats {
     /// Untouched bytes below the deepest observed core1 worker frame
     /// (KOTO-0186); `u32::MAX` means the canary was not painted.
     pub core1_stack_free_min: u32,
+    pub residency_state: ResidencyState,
+    pub residency_generation: u32,
+    pub worker_offline_generation: u32,
+    pub worker_online_generation: u32,
+    pub worker_rich_active: bool,
+    pub transition_failures: u32,
+    pub arena_guard_failures: u32,
 }
 
 /// CPU0 facade over the CPU1 audio worker.
-pub struct PicoAudioBackend;
+pub struct PicoAudioBackend {
+    residency_token: ResidencyToken,
+}
 
 impl PicoAudioBackend {
     pub fn spawn_cpu1(
@@ -542,28 +1040,24 @@ impl PicoAudioBackend {
         stack: &'static mut Stack<AUDIO_CORE1_STACK_BYTES>,
         pwm: Pwm<'static>,
     ) -> Self {
-        critical_section::with(|cs| AUDIO_SHARED.borrow_ref_mut(cs).reset());
+        with_stream_audio(StreamAudioShared::reset);
+        critical_section::with(|cs| {
+            *AUDIO_RESIDENCY_OWNER.borrow_ref_mut(cs) = AudioResidencyOwner::new();
+        });
+        TLS_AUDIO_WORKSPACE_CLAIMED.store(false, Ordering::Release);
         AUDIO_STATS.reset();
         // KOTO-0186: paint the worker stack while core1 is still idle so the
         // cross-core `core1_stack_free_min` scan can measure the worst-case
         // worker frame depth after the LTO in-place-reset fix.
         paint_core1_stack(stack);
-        // Build the ~3 KiB service HERE on the CPU0 main stack and move it into
-        // its StaticCell before spawning: constructing it on the CPU1 stack
-        // would blow the whole core1 stack budget by itself. Construction only
-        // fails on an invalid policy, which `v0_default()` cannot produce; the
-        // `None` fallback keeps CPU1 in a silent, panic-free loop.
-        let service = PicoAudioService::new(AudioPolicy::v0_default(), PwmBlockSink::new())
-            .ok()
-            .map(|service| AUDIO_SERVICE.init(service));
-        let runtime_bgm = RUNTIME_BGM_PLAYER.init(RuntimeCuePlayer::new(PCM_OUTPUT_SAMPLE_RATE_HZ));
-        let runtime_sfx = RUNTIME_SFX_PLAYER
-            .init([RuntimeCuePlayer::new(PCM_OUTPUT_SAMPLE_RATE_HZ); RUNTIME_SFX_PLAYERS]);
-        let runtime_clip = RUNTIME_CLIP_PLAYER.init(OwnedClipPlayer::new());
-        spawn_core1(core1, stack, move || -> ! {
-            run_audio_worker(pwm, service, runtime_bgm, runtime_sfx, runtime_clip)
-        });
-        Self
+        // Construct the ~3 KiB service on CPU0 so it never consumes the
+        // bounded CPU1 worker stack. The same routine reconstructs these
+        // fields after the Wi-Fi owner releases the arena.
+        unsafe { initialize_rich_residency() };
+        spawn_core1(core1, stack, move || -> ! { run_audio_worker(pwm) });
+        let residency_token =
+            critical_section::with(|cs| AUDIO_RESIDENCY_OWNER.borrow_ref(cs).token());
+        Self { residency_token }
     }
 
     pub const fn backend_name(&self) -> &'static str {
@@ -581,6 +1075,9 @@ impl PicoAudioBackend {
         channels: i32,
         samples: &[u8],
     ) -> Result<i32, PcmSubmitError> {
+        if !self.stream_request_available() {
+            return Err(PcmSubmitError::TemporaryUnavailable);
+        }
         if sample_rate_hz != self.sample_rate_hz() {
             self.record_unsupported();
             return Err(PcmSubmitError::Unsupported);
@@ -598,8 +1095,7 @@ impl PicoAudioBackend {
         let channel_count = channels as usize;
         let mut accepted_frames = 0u32;
         let mut dropped_frames = 0u32;
-        critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+        with_stream_audio(|shared| {
             for frame_idx in 0..frames as usize {
                 let offset = frame_idx * channel_count * 2;
                 let mono = if channel_count == 1 {
@@ -627,6 +1123,9 @@ impl PicoAudioBackend {
         sample_rate_hz: u32,
         samples: &[i16],
     ) -> Result<i32, PcmSubmitError> {
+        if !self.stream_request_available() {
+            return Err(PcmSubmitError::TemporaryUnavailable);
+        }
         if sample_rate_hz != self.sample_rate_hz() {
             self.record_unsupported();
             return Err(PcmSubmitError::Unsupported);
@@ -634,8 +1133,7 @@ impl PicoAudioBackend {
 
         let mut accepted = 0u32;
         let mut dropped = 0u32;
-        critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+        with_stream_audio(|shared| {
             for &sample in samples {
                 if shared.raw.push(sample) {
                     accepted += 1;
@@ -651,9 +1149,10 @@ impl PicoAudioBackend {
 
     /// Number of mono frames the host streamer can enqueue without dropping.
     pub fn pcm_free_frames(&self) -> usize {
-        critical_section::with(|cs| {
-            PCM_RING_CAPACITY.saturating_sub(AUDIO_SHARED.borrow_ref(cs).raw.len())
-        })
+        if !self.stream_request_available() {
+            return 0;
+        }
+        with_stream_audio(|shared| PCM_RING_CAPACITY.saturating_sub(shared.raw.len()))
     }
 
     /// Tells the CPU1 diagnostics whether an empty raw ring is a stream gap.
@@ -662,27 +1161,37 @@ impl PicoAudioBackend {
     }
 
     /// Starts (or replaces) the looping BGM sequence for a routed cue.
-    pub fn play_bgm_cue(&mut self, sequence: &'static PolyphonicSequence<'static>) {
-        self.enqueue_command(AudioCommand::PlayBgm(sequence));
+    pub fn play_bgm_cue(
+        &mut self,
+        sequence: &'static PolyphonicSequence<'static>,
+    ) -> Result<(), AudioRequestError> {
+        self.enqueue_rich_command(AudioCommand::PlayBgm(sequence))
     }
 
     /// Plays a one-shot SFX sequence for a routed cue.
-    pub fn play_sfx_cue(&mut self, sequence: &'static Sequence<'static>) {
-        self.enqueue_command(AudioCommand::PlaySfx(sequence));
+    pub fn play_sfx_cue(
+        &mut self,
+        sequence: &'static Sequence<'static>,
+    ) -> Result<(), AudioRequestError> {
+        self.enqueue_rich_command(AudioCommand::PlaySfx(sequence))
     }
 
     /// Copies one PSRAM-loaded pointer-free cue image to the CPU1 staging slot.
     pub fn play_runtime_cue(&mut self, image: &[u8], bgm: bool) -> bool {
-        if image.is_empty() || image.len() > RUNTIME_CUE_IMAGE_CAPACITY {
+        if !self.rich_request_available()
+            || image.is_empty()
+            || image.len() > RUNTIME_CUE_IMAGE_CAPACITY
+        {
             self.record_drop();
             return false;
         }
         let accepted = critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            let mut shared = rich_shared().borrow_ref_mut(cs);
             if shared.runtime_image_busy {
                 return false;
             }
-            shared.runtime_image[..image.len()].copy_from_slice(image);
+            let runtime_image = unsafe { &mut *rich_runtime_image() };
+            runtime_image[..image.len()].copy_from_slice(image);
             shared.runtime_image_len = image.len();
             shared.runtime_image_busy = true;
             if !shared.commands.push(if bgm {
@@ -705,16 +1214,20 @@ impl PicoAudioBackend {
 
     /// Copies one runtime-ready KACL image into CPU1-owned playback storage.
     pub fn play_runtime_clip(&mut self, image: &[u8]) -> bool {
-        if image.is_empty() || image.len() > RUNTIME_CLIP_IMAGE_CAPACITY {
+        if !self.rich_request_available()
+            || image.is_empty()
+            || image.len() > RUNTIME_CLIP_IMAGE_CAPACITY
+        {
             self.record_drop();
             return false;
         }
         let accepted = critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            let mut shared = rich_shared().borrow_ref_mut(cs);
             if shared.runtime_image_busy {
                 return false;
             }
-            shared.runtime_image[..image.len()].copy_from_slice(image);
+            let runtime_image = unsafe { &mut *rich_runtime_image() };
+            runtime_image[..image.len()].copy_from_slice(image);
             shared.runtime_image_len = image.len();
             shared.runtime_image_busy = true;
             if !shared.commands.push(AudioCommand::PlayRuntimeClip) {
@@ -732,8 +1245,11 @@ impl PicoAudioBackend {
     }
 
     pub fn stop_bgm(&mut self) {
+        if !self.rich_request_available() {
+            return;
+        }
         critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            let mut shared = rich_shared().borrow_ref_mut(cs);
             // StopAll outranks StopBgm in the single high-priority slot.
             if !matches!(shared.high_priority, AudioCommand::StopAll) {
                 shared.high_priority = AudioCommand::StopBgm;
@@ -743,13 +1259,179 @@ impl PicoAudioBackend {
 
     pub fn stop(&mut self) {
         PCM_STREAM_ACTIVE.store(false, Ordering::Relaxed);
+        if !self.rich_request_available() {
+            return;
+        }
         critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            let mut shared = rich_shared().borrow_ref_mut(cs);
             shared.high_priority = AudioCommand::StopAll;
         });
     }
 
-    pub fn service(&mut self) {}
+    pub fn begin_wifi_quiesce(&mut self) -> Result<u32, TransitionError> {
+        let token = critical_section::with(|cs| {
+            let mut owner = AUDIO_RESIDENCY_OWNER.borrow_ref_mut(cs);
+            owner.begin_wifi()
+        })?;
+        self.residency_token = token;
+        critical_section::with(|cs| {
+            rich_shared().borrow_ref_mut(cs).commands.clear();
+        });
+        WORKER_CONTROL_GENERATION.store(token.generation(), Ordering::Relaxed);
+        WORKER_CONTROL.store(WORKER_CONTROL_QUIESCE_RICH, Ordering::Release);
+        Ok(token.generation())
+    }
+
+    pub fn service(&mut self) {
+        // A network-owned TLS workspace starts restoration without borrowing
+        // this facade. Adopt only that explicitly published owner generation;
+        // all other transitions remain token-driven by facade methods.
+        if let Some(token) = critical_section::with(|cs| {
+            let owner = *AUDIO_RESIDENCY_OWNER.borrow_ref(cs);
+            (owner.state() == ResidencyState::RestoringStreamAfterTls
+                && owner.token().generation() != self.residency_token.generation())
+            .then(|| owner.token())
+        }) {
+            self.residency_token = token;
+        }
+        let offline_acknowledged = WORKER_RICH_OFFLINE_GENERATION.load(Ordering::Acquire)
+            == self.residency_token.generation();
+        let online_acknowledged = WORKER_RICH_ONLINE_GENERATION.load(Ordering::Acquire)
+            == self.residency_token.generation();
+        let stream_offline_acknowledged = WORKER_STREAM_OFFLINE_GENERATION.load(Ordering::Acquire)
+            == self.residency_token.generation();
+        let stream_online_acknowledged = WORKER_STREAM_ONLINE_GENERATION.load(Ordering::Acquire)
+            == self.residency_token.generation();
+        critical_section::with(|cs| {
+            let mut owner = AUDIO_RESIDENCY_OWNER.borrow_ref_mut(cs);
+            if owner.state() == ResidencyState::QuiescingAudio && offline_acknowledged {
+                let _ = owner.mark_audio_offline(self.residency_token);
+            } else if owner.state() == ResidencyState::Offline && online_acknowledged {
+                let _ = owner.activate_full_audio(self.residency_token);
+            } else if owner.state() == ResidencyState::QuiescingStreamForTls
+                && stream_offline_acknowledged
+            {
+                let _ = owner.activate_tls_exclusive(self.residency_token);
+            } else if owner.state() == ResidencyState::RestoringStreamAfterTls
+                && stream_online_acknowledged
+            {
+                let _ = owner.activate_stream_after_tls(self.residency_token);
+            }
+        });
+    }
+
+    /// Requests the RP2040 worker/DMA ownership fence required before TLS may
+    /// reuse permanent stream-audio storage. Completion is observable as
+    /// [`ResidencyState::TlsExclusive`] after repeated [`Self::service`] calls.
+    #[cfg(feature = "mcu-rp2040")]
+    pub fn begin_tls_audio_quiesce(&mut self) -> Result<u32, TransitionError> {
+        let token = critical_section::with(|cs| {
+            AUDIO_RESIDENCY_OWNER
+                .borrow_ref_mut(cs)
+                .begin_tls_exclusive()
+        })?;
+        self.residency_token = token;
+        PCM_STREAM_ACTIVE.store(false, Ordering::Release);
+        WORKER_CONTROL_GENERATION.store(token.generation(), Ordering::Relaxed);
+        WORKER_CONTROL.store(WORKER_CONTROL_QUIESCE_STREAM, Ordering::Release);
+        Ok(token.generation())
+    }
+
+    /// Claims the stopped PCM sample region for exactly one TLS future.
+    /// Callers must wait for `TlsExclusive`; transitional states never expose
+    /// the bytes even if the worker has started quiescing.
+    #[cfg(feature = "mcu-rp2040")]
+    pub fn claim_tls_audio_workspace(&mut self) -> Result<TlsAudioWorkspace, TransitionError> {
+        let valid = critical_section::with(|cs| {
+            let owner = *AUDIO_RESIDENCY_OWNER.borrow_ref(cs);
+            owner.state() == ResidencyState::TlsExclusive
+                && owner.token().generation() == self.residency_token.generation()
+        });
+        if !valid {
+            return Err(TransitionError::InvalidState);
+        }
+        claim_shared_tls_audio_workspace()
+    }
+
+    /// Drops the TLS ownership epoch, overwrites every loaned byte, and only
+    /// then asks CPU1 to reconstruct the PCM/DMA path. Rust's borrow of
+    /// `workspace.bytes()` prevents this call while an [`ArenaFuture`](crate::firmware::arena_future::ArenaFuture)
+    /// still occupies the storage.
+    #[cfg(feature = "mcu-rp2040")]
+    pub fn release_tls_audio_workspace(
+        &mut self,
+        workspace: TlsAudioWorkspace,
+    ) -> Result<u32, TransitionError> {
+        if workspace.generation != self.residency_token.generation()
+            || self.residency_state() != ResidencyState::TlsExclusive
+        {
+            return Err(TransitionError::StaleToken);
+        }
+        let generation = release_shared_tls_audio_workspace(workspace)?;
+        self.residency_token =
+            critical_section::with(|cs| AUDIO_RESIDENCY_OWNER.borrow_ref(cs).token());
+        Ok(generation)
+    }
+
+    pub fn activate_wifi_stream_audio(&mut self) -> Result<WifiResidencyArena, TransitionError> {
+        critical_section::with(|cs| {
+            AUDIO_RESIDENCY_OWNER
+                .borrow_ref_mut(cs)
+                .activate_wifi(self.residency_token)
+        })?;
+        Ok(WifiResidencyArena {
+            generation: self.residency_token.generation(),
+        })
+    }
+
+    pub fn begin_full_audio_quiesce(
+        &mut self,
+        mut arena: WifiResidencyArena,
+    ) -> Result<WifiResidencyArena, TransitionError> {
+        // `arena.generation` is the Wi-Fi lifecycle generation installed when
+        // rich audio first lent these bytes to the radio. An HTTPS transaction
+        // legitimately advances the audio owner generation twice while that
+        // same (linear, non-Copy) arena remains owned by WifiRuntime: once for
+        // TLS exclusion and once for stream restoration. Consequently the
+        // lifecycle generation must not be compared with the current audio
+        // transition token here. `begin_full_audio` still proves that the
+        // global owner has reached WifiStreamAudio, and consuming the unique
+        // arena handle proves that the Wi-Fi runtime returned the bytes.
+        let token = critical_section::with(|cs| {
+            AUDIO_RESIDENCY_OWNER.borrow_ref_mut(cs).begin_full_audio()
+        })?;
+        self.residency_token = token;
+        // Rebase the returned arena onto the new reverse-transition token so
+        // `complete_wifi_quiesce` retains its stale-token fence.
+        arena.generation = token.generation();
+        Ok(arena)
+    }
+
+    /// Completes the Wi-Fi teardown after its runner and all arena users have
+    /// joined. The worker remains on permanent PCM/DMA state until it acquires
+    /// the reconstructed rich fields and publishes the matching generation.
+    pub fn complete_wifi_quiesce(
+        &mut self,
+        arena: WifiResidencyArena,
+    ) -> Result<(), TransitionError> {
+        if arena.generation != self.residency_token.generation() {
+            AudioAtomicStats::inc(&AUDIO_STATS.arena_guard_failures, 1);
+            return Err(TransitionError::StaleToken);
+        }
+        critical_section::with(|cs| {
+            AUDIO_RESIDENCY_OWNER
+                .borrow_ref_mut(cs)
+                .mark_wifi_offline(self.residency_token)
+        })?;
+        unsafe { initialize_rich_residency() };
+        WORKER_CONTROL_GENERATION.store(self.residency_token.generation(), Ordering::Relaxed);
+        WORKER_CONTROL.store(WORKER_CONTROL_ACTIVATE_RICH, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn residency_state(&self) -> ResidencyState {
+        critical_section::with(|cs| AUDIO_RESIDENCY_OWNER.borrow_ref(cs).state())
+    }
 
     pub fn record_samples_submitted(&mut self, frames: u32) {
         AudioAtomicStats::inc(&AUDIO_STATS.samples_submitted, frames);
@@ -764,8 +1446,12 @@ impl PicoAudioBackend {
     }
 
     pub fn stats(&self) -> AudioBackendStats {
-        let buffer_level =
-            critical_section::with(|cs| AUDIO_SHARED.borrow_ref(cs).raw.len() as u32);
+        let buffer_level = if TLS_AUDIO_WORKSPACE_CLAIMED.load(Ordering::Acquire) {
+            0
+        } else {
+            with_stream_audio(|shared| shared.raw.len() as u32)
+        };
+        let residency = critical_section::with(|cs| *AUDIO_RESIDENCY_OWNER.borrow_ref(cs));
         AudioBackendStats {
             samples_submitted: AUDIO_STATS.samples_submitted.load(Ordering::Relaxed),
             samples_played: AUDIO_STATS.samples_played.load(Ordering::Relaxed),
@@ -786,18 +1472,54 @@ impl PicoAudioBackend {
             core1_stack_free_min: core1_stack_free_min()
                 .and_then(|free| u32::try_from(free).ok())
                 .unwrap_or(u32::MAX),
+            residency_state: residency.state(),
+            residency_generation: residency.token().generation(),
+            worker_offline_generation: WORKER_RICH_OFFLINE_GENERATION.load(Ordering::Acquire),
+            worker_online_generation: WORKER_RICH_ONLINE_GENERATION.load(Ordering::Acquire),
+            worker_rich_active: WORKER_RICH_ACTIVE.load(Ordering::Acquire),
+            transition_failures: residency.transition_failures(),
+            arena_guard_failures: AUDIO_STATS.arena_guard_failures.load(Ordering::Relaxed),
         }
     }
 
-    fn enqueue_command(&mut self, command: AudioCommand) {
+    fn enqueue_rich_command(&mut self, command: AudioCommand) -> Result<(), AudioRequestError> {
+        let availability = critical_section::with(|cs| {
+            let owner = *AUDIO_RESIDENCY_OWNER.borrow_ref(cs);
+            if owner.rich_audio_available(self.residency_token) {
+                Ok(())
+            } else if owner.token().generation() != self.residency_token.generation() {
+                Err(AudioRequestError::StaleHandle)
+            } else {
+                Err(AudioRequestError::TemporaryUnavailable)
+            }
+        });
+        availability?;
         let accepted = critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            let mut shared = rich_shared().borrow_ref_mut(cs);
             shared.commands.push(command)
         });
         if !accepted {
             AudioAtomicStats::inc(&AUDIO_STATS.command_drops, 1);
             AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
+            return Err(AudioRequestError::QueueFull);
         }
+        Ok(())
+    }
+
+    fn rich_request_available(&self) -> bool {
+        critical_section::with(|cs| {
+            AUDIO_RESIDENCY_OWNER
+                .borrow_ref(cs)
+                .rich_audio_available(self.residency_token)
+        })
+    }
+
+    fn stream_request_available(&self) -> bool {
+        critical_section::with(|cs| {
+            AUDIO_RESIDENCY_OWNER
+                .borrow_ref(cs)
+                .stream_audio_available(self.residency_token)
+        })
     }
 }
 
@@ -810,21 +1532,18 @@ impl PicoAudioBackend {
 /// exactly 16 kHz. The worker only *fills* the ring ahead of the DMA read
 /// position on a coarse ~1 ms pass, so a multi-millisecond service render burst
 /// never disturbs sample timing (the CPU-paced first cut audibly did).
-fn run_audio_worker(
-    mut pwm: Pwm<'static>,
-    service: Option<&'static mut PicoAudioService>,
-    runtime_bgm: &'static mut RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>,
-    runtime_sfx: &'static mut [RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS],
-    runtime_clip: &'static mut OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>,
-) -> ! {
+fn run_audio_worker(mut pwm: Pwm<'static>) -> ! {
+    let residency = rich_residency();
+    let mut service = RICH_SERVICE_READY
+        .load(Ordering::Acquire)
+        .then(|| unsafe { residency.service.assume_init_mut() });
+    let runtime_bgm = unsafe { residency.runtime_bgm.assume_init_mut() };
+    let runtime_sfx = unsafe { residency.runtime_sfx.assume_init_mut() };
+    let runtime_clip = unsafe { residency.runtime_clip.assume_init_mut() };
     configure_pcm_output(&mut pwm);
-    let Some(service) = service else {
-        let _ = pwm.set_duty_cycle(IDLE_SILENCE_DUTY);
-        loop {
-            block_for(Duration::from_millis(100));
-        }
-    };
-    let _ = service.start();
+    if let Some(service) = service.as_deref_mut() {
+        let _ = service.start();
+    }
 
     let ring = unsafe { &mut *core::ptr::addr_of_mut!(AUDIO_DMA_RING) };
     let silence = duty_word(0);
@@ -833,13 +1552,18 @@ fn run_audio_worker(
     }
     setup_dma_pacing_timer();
     arm_audio_dma(ring);
+    WORKER_RICH_ACTIVE.store(service.is_some(), Ordering::Release);
+    WORKER_RICH_OFFLINE_GENERATION.store(0, Ordering::Release);
+    WORKER_STREAM_ACTIVE.store(true, Ordering::Release);
+    WORKER_STREAM_OFFLINE_GENERATION.store(0, Ordering::Release);
+    WORKER_STREAM_ONLINE_GENERATION.store(0, Ordering::Release);
 
     let mut worker = PicoAudioWorker {
         _pwm: pwm,
         service,
-        runtime_bgm,
-        runtime_sfx,
-        runtime_clip,
+        runtime_bgm: Some(runtime_bgm),
+        runtime_sfx: Some(runtime_sfx),
+        runtime_clip: Some(runtime_clip),
         runtime_sfx_cursor: 0,
         pending_sources: 0,
         underrun_latched: false,
@@ -856,11 +1580,12 @@ struct PicoAudioWorker<'d> {
     /// Held only to keep the PWM slice configured and alive; the compare
     /// register is written by DMA, not by this handle.
     _pwm: Pwm<'d>,
-    service: &'static mut PicoAudioService,
-    runtime_bgm: &'static mut RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>,
-    runtime_sfx: &'static mut [RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS],
+    service: Option<&'static mut PicoAudioService>,
+    runtime_bgm: Option<&'static mut RuntimeCuePlayer<RUNTIME_BGM_EVENTS_PER_TRACK>>,
+    runtime_sfx:
+        Option<&'static mut [RuntimeCuePlayer<RUNTIME_SFX_EVENTS_PER_TRACK>; RUNTIME_SFX_PLAYERS]>,
     runtime_sfx_cursor: usize,
-    runtime_clip: &'static mut OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>,
+    runtime_clip: Option<&'static mut OwnedClipPlayer<RUNTIME_CLIP_IMAGE_CAPACITY>>,
     /// Active + queued service sources after the last command/tick.
     pending_sources: u32,
     underrun_latched: bool,
@@ -881,9 +1606,16 @@ impl<'d> PicoAudioWorker<'d> {
             // even if a later stage would wedge on the next pass.
             AudioAtomicStats::inc(&AUDIO_STATS.worker_heartbeat, 1);
 
-            self.drain_commands();
-            self.render_ahead();
-            self.fill_dma_ring();
+            self.drain_transition_command();
+            if WORKER_RICH_ACTIVE.load(Ordering::Acquire) {
+                self.drain_commands();
+                if WORKER_RICH_ACTIVE.load(Ordering::Acquire) {
+                    self.render_ahead();
+                }
+            }
+            if WORKER_STREAM_ACTIVE.load(Ordering::Acquire) {
+                self.fill_dma_ring();
+            }
 
             let elapsed_us = pass_start.elapsed().as_micros();
             // Diagnostics: max pass duration approximates the worst render
@@ -901,9 +1633,83 @@ impl<'d> PicoAudioWorker<'d> {
         }
     }
 
+    fn drain_transition_command(&mut self) {
+        let control = WORKER_CONTROL.load(Ordering::Acquire);
+        if control == WORKER_CONTROL_NONE {
+            return;
+        }
+        let generation = WORKER_CONTROL_GENERATION.load(Ordering::Relaxed);
+        WORKER_CONTROL.store(WORKER_CONTROL_NONE, Ordering::Release);
+        if control == WORKER_CONTROL_QUIESCE_RICH {
+            self.apply_command(AudioCommand::QuiesceRich(generation));
+        } else if control == WORKER_CONTROL_ACTIVATE_RICH {
+            self.activate_rich(generation);
+        } else if control == WORKER_CONTROL_QUIESCE_STREAM {
+            self.quiesce_stream(generation);
+        } else if control == WORKER_CONTROL_ACTIVATE_STREAM {
+            self.activate_stream(generation);
+        }
+    }
+
+    fn quiesce_stream(&mut self, generation: u32) {
+        PCM_STREAM_ACTIVE.store(false, Ordering::Release);
+        pac::DMA
+            .chan_abort()
+            .modify(|w| w.set_chan_abort(1 << AUDIO_DMA_CH));
+        let channel = pac::DMA.ch(AUDIO_DMA_CH);
+        while channel.ctrl_trig().read().busy() {}
+
+        // Leave both PWM outputs at the silent midpoint after DMA has stopped.
+        let midpoint = (PCM_PWM_TOP / 2).max(1);
+        pac::PWM.ch(5).cc().write(|w| {
+            w.set_a(midpoint);
+            w.set_b(midpoint);
+        });
+        with_stream_audio(StreamAudioShared::reset);
+        self.write_pos = 0;
+        self.sent_base = 0;
+        self.raw_underrun_latched = false;
+        WORKER_STREAM_ACTIVE.store(false, Ordering::Release);
+        WORKER_STREAM_OFFLINE_GENERATION.store(generation, Ordering::Release);
+    }
+
+    fn activate_stream(&mut self, generation: u32) {
+        with_stream_audio(StreamAudioShared::reset);
+        let ring = unsafe { &mut *core::ptr::addr_of_mut!(AUDIO_DMA_RING) };
+        let silence = duty_word(0);
+        for slot in ring.0.iter_mut() {
+            *slot = silence;
+        }
+        self.write_pos = DMA_RING_SAMPLES as u64;
+        self.sent_base = 0;
+        self.raw_underrun_latched = false;
+        setup_dma_pacing_timer();
+        arm_audio_dma(ring);
+        WORKER_STREAM_ACTIVE.store(true, Ordering::Release);
+        WORKER_STREAM_ONLINE_GENERATION.store(generation, Ordering::Release);
+    }
+
+    fn activate_rich(&mut self, generation: u32) {
+        let residency = rich_residency();
+        self.service = RICH_SERVICE_READY
+            .load(Ordering::Acquire)
+            .then(|| unsafe { residency.service.assume_init_mut() });
+        self.runtime_bgm = Some(unsafe { residency.runtime_bgm.assume_init_mut() });
+        self.runtime_sfx = Some(unsafe { residency.runtime_sfx.assume_init_mut() });
+        self.runtime_clip = Some(unsafe { residency.runtime_clip.assume_init_mut() });
+        self.runtime_sfx_cursor = 0;
+        self.pending_sources = 0;
+        self.underrun_latched = false;
+        if let Some(service) = self.service.as_deref_mut() {
+            let _ = service.start();
+        }
+        WORKER_RICH_ACTIVE.store(true, Ordering::Release);
+        WORKER_RICH_ONLINE_GENERATION.store(generation, Ordering::Release);
+    }
+
     fn drain_commands(&mut self) {
         let high_command = critical_section::with(|cs| {
-            let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+            let mut shared = rich_shared().borrow_ref_mut(cs);
             let high_command = shared.high_priority;
             shared.high_priority = AudioCommand::None;
             high_command
@@ -911,7 +1717,7 @@ impl<'d> PicoAudioWorker<'d> {
         self.apply_command(high_command);
         // The queue is bounded (16), so this pass-local drain is bounded too.
         while let Some(command) =
-            critical_section::with(|cs| AUDIO_SHARED.borrow_ref_mut(cs).commands.pop())
+            critical_section::with(|cs| rich_shared().borrow_ref_mut(cs).commands.pop())
         {
             self.apply_command(command);
         }
@@ -929,12 +1735,15 @@ impl<'d> PicoAudioWorker<'d> {
     fn render_ahead(&mut self) {
         let mut rendered = 0;
         while self.pending_sources > 0 && rendered < 1 {
-            let out_level = critical_section::with(|cs| AUDIO_SHARED.borrow_ref(cs).out.len());
+            let out_level = critical_section::with(|cs| rich_shared().borrow_ref(cs).out.len());
             if out_level + BLOCK_FRAMES > OUT_RING_CAPACITY {
                 break;
             }
-            let _ = self.service.tick();
-            while self.service.poll_audio_event().is_some() {}
+            let Some(service) = self.service.as_deref_mut() else {
+                return;
+            };
+            let _ = service.tick();
+            while service.poll_audio_event().is_some() {}
             self.refresh_source_stats();
             rendered += 1;
         }
@@ -983,21 +1792,25 @@ impl<'d> PicoAudioWorker<'d> {
                 ((sent + DMA_RING_SAMPLES as u64 - self.write_pos) as usize).min(FILL_CHUNK);
             let mut seq_buf = [0i16; FILL_CHUNK];
             let mut raw_buf = [0i16; FILL_CHUNK];
+            let rich_active = WORKER_RICH_ACTIVE.load(Ordering::Acquire);
             let (seq_len, raw_len) = critical_section::with(|cs| {
-                let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+                let stream = unsafe { &mut *AUDIO_STREAM_SHARED.0.get() };
                 let mut seq_len = 0;
-                while seq_len < needed {
-                    match shared.out.pop() {
-                        Some(sample) => {
-                            seq_buf[seq_len] = sample;
-                            seq_len += 1;
+                if rich_active {
+                    let mut rich = rich_shared().borrow_ref_mut(cs);
+                    while seq_len < needed {
+                        match rich.out.pop() {
+                            Some(sample) => {
+                                seq_buf[seq_len] = sample;
+                                seq_len += 1;
+                            }
+                            None => break,
                         }
-                        None => break,
                     }
                 }
                 let mut raw_len = 0;
                 while raw_len < needed {
-                    match shared.raw.pop() {
+                    match stream.raw.pop() {
                         Some(sample) => {
                             raw_buf[raw_len] = sample;
                             raw_len += 1;
@@ -1029,16 +1842,22 @@ impl<'d> PicoAudioWorker<'d> {
             for index in 0..needed {
                 let seq = if index < seq_len { seq_buf[index] } else { 0 };
                 let mut mixed = i32::from(seq);
-                if let DecodeResult::Sample(sample) = self.runtime_bgm.next_sample() {
-                    mixed = mixed.saturating_add(scale_runtime_sample(sample, 150));
+                if let Some(player) = self.runtime_bgm.as_deref_mut() {
+                    if let DecodeResult::Sample(sample) = player.next_sample() {
+                        mixed = mixed.saturating_add(scale_runtime_sample(sample, 150));
+                    }
                 }
-                for player in &mut *self.runtime_sfx {
+                if let Some(players) = self.runtime_sfx.as_deref_mut() {
+                    for player in players {
+                        if let DecodeResult::Sample(sample) = player.next_sample() {
+                            mixed = mixed.saturating_add(scale_runtime_sample(sample, 200));
+                        }
+                    }
+                }
+                if let Some(player) = self.runtime_clip.as_deref_mut() {
                     if let DecodeResult::Sample(sample) = player.next_sample() {
                         mixed = mixed.saturating_add(scale_runtime_sample(sample, 200));
                     }
-                }
-                if let DecodeResult::Sample(sample) = self.runtime_clip.next_sample() {
-                    mixed = mixed.saturating_add(scale_runtime_sample(sample, 200));
                 }
                 if index < raw_len {
                     mixed = mixed.saturating_add(i32::from(raw_buf[index]));
@@ -1063,7 +1882,11 @@ impl<'d> PicoAudioWorker<'d> {
         match command {
             AudioCommand::None => {}
             AudioCommand::PlayBgm(sequence) => {
-                if self.service.play_bgm_sequence(*sequence).is_ok() {
+                if self
+                    .service
+                    .as_deref_mut()
+                    .is_some_and(|service| service.play_bgm_sequence(*sequence).is_ok())
+                {
                     AudioAtomicStats::inc(&AUDIO_STATS.bgm_starts, 1);
                 } else {
                     AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
@@ -1071,19 +1894,27 @@ impl<'d> PicoAudioWorker<'d> {
                 self.refresh_source_stats();
             }
             AudioCommand::PlaySfx(sequence) => {
-                if self.service.play_sequence(*sequence).is_err() {
+                if !self
+                    .service
+                    .as_deref_mut()
+                    .is_some_and(|service| service.play_sequence(*sequence).is_ok())
+                {
                     AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
                 }
                 self.refresh_source_stats();
             }
             AudioCommand::PlayRuntimeBgm => {
                 let ok = critical_section::with(|cs| {
-                    let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+                    let mut shared = rich_shared().borrow_ref_mut(cs);
                     let len = shared.runtime_image_len;
-                    let result = self.runtime_bgm.play_image(&shared.runtime_image[..len]);
+                    let result = self.runtime_bgm.as_deref_mut().is_some_and(|player| {
+                        player
+                            .play_image(&unsafe { &*rich_runtime_image() }[..len])
+                            .is_ok()
+                    });
                     shared.runtime_image_len = 0;
                     shared.runtime_image_busy = false;
-                    result.is_ok()
+                    result
                 });
                 if ok {
                     AudioAtomicStats::inc(&AUDIO_STATS.bgm_starts, 1);
@@ -1092,67 +1923,128 @@ impl<'d> PicoAudioWorker<'d> {
                 }
             }
             AudioCommand::PlayRuntimeSfx => {
-                let slot = self
-                    .runtime_sfx
+                let Some(players) = self.runtime_sfx.as_deref_mut() else {
+                    AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
+                    return;
+                };
+                let slot = players
                     .iter()
                     .position(|player| !player.is_playing())
                     .unwrap_or(self.runtime_sfx_cursor);
                 let ok = critical_section::with(|cs| {
-                    let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+                    let mut shared = rich_shared().borrow_ref_mut(cs);
                     let len = shared.runtime_image_len;
-                    let result = self.runtime_sfx[slot].play_image(&shared.runtime_image[..len]);
+                    let result =
+                        players[slot].play_image(&unsafe { &*rich_runtime_image() }[..len]);
                     shared.runtime_image_len = 0;
                     shared.runtime_image_busy = false;
                     result.is_ok()
                 });
-                self.runtime_sfx_cursor = (slot + 1) % self.runtime_sfx.len();
+                self.runtime_sfx_cursor = (slot + 1) % players.len();
                 if !ok {
                     AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
                 }
             }
             AudioCommand::PlayRuntimeClip => {
                 let ok = critical_section::with(|cs| {
-                    let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
+                    let mut shared = rich_shared().borrow_ref_mut(cs);
                     let len = shared.runtime_image_len;
-                    let result = self
-                        .runtime_clip
-                        .play_image(&shared.runtime_image[..len], AudioLimits::v0_default());
+                    let result = self.runtime_clip.as_deref_mut().is_some_and(|player| {
+                        player
+                            .play_image(
+                                &unsafe { &*rich_runtime_image() }[..len],
+                                AudioLimits::v0_default(),
+                            )
+                            .is_ok()
+                    });
                     shared.runtime_image_len = 0;
                     shared.runtime_image_busy = false;
-                    result.is_ok()
+                    result
                 });
                 if !ok {
                     AudioAtomicStats::inc(&AUDIO_STATS.drops, 1);
                 }
             }
             AudioCommand::StopBgm => {
-                let _ = self.service.stop_bgm();
-                self.runtime_bgm.stop();
+                if let Some(service) = self.service.as_deref_mut() {
+                    let _ = service.stop_bgm();
+                }
+                if let Some(player) = self.runtime_bgm.as_deref_mut() {
+                    player.stop();
+                }
                 AudioAtomicStats::inc(&AUDIO_STATS.bgm_stops, 1);
                 self.refresh_source_stats();
             }
             AudioCommand::StopAll => {
                 // Full bounded reset: sources, mixer, events, and both rings.
-                let _ = self.service.reset();
-                let _ = self.service.start();
-                self.runtime_bgm.stop();
-                for player in &mut *self.runtime_sfx {
+                if let Some(service) = self.service.as_deref_mut() {
+                    let _ = service.reset();
+                    let _ = service.start();
+                }
+                if let Some(player) = self.runtime_bgm.as_deref_mut() {
                     player.stop();
                 }
-                self.runtime_clip.stop();
+                if let Some(players) = self.runtime_sfx.as_deref_mut() {
+                    for player in players {
+                        player.stop();
+                    }
+                }
+                if let Some(player) = self.runtime_clip.as_deref_mut() {
+                    player.stop();
+                }
                 critical_section::with(|cs| {
-                    let mut shared = AUDIO_SHARED.borrow_ref_mut(cs);
-                    shared.raw.clear();
-                    shared.out.clear();
+                    unsafe { &mut *AUDIO_STREAM_SHARED.0.get() }.raw.clear();
+                    rich_shared().borrow_ref_mut(cs).out.clear();
                 });
                 AudioAtomicStats::inc(&AUDIO_STATS.bgm_stops, 1);
                 self.refresh_source_stats();
+            }
+            AudioCommand::QuiesceRich(generation) => {
+                if let Some(service) = self.service.as_deref_mut() {
+                    let _ = service.reset();
+                }
+                if let Some(player) = self.runtime_bgm.as_deref_mut() {
+                    player.stop();
+                }
+                if let Some(players) = self.runtime_sfx.as_deref_mut() {
+                    for player in players {
+                        player.stop();
+                    }
+                }
+                if let Some(player) = self.runtime_clip.as_deref_mut() {
+                    player.stop();
+                }
+                critical_section::with(|cs| rich_shared().borrow_ref_mut(cs).reset());
+                self.pending_sources = 0;
+                if let Some(service) = self.service.take() {
+                    unsafe { core::ptr::drop_in_place(service) };
+                }
+                if let Some(player) = self.runtime_bgm.take() {
+                    unsafe { core::ptr::drop_in_place(player) };
+                }
+                if let Some(players) = self.runtime_sfx.take() {
+                    unsafe { core::ptr::drop_in_place(players) };
+                }
+                if let Some(player) = self.runtime_clip.take() {
+                    unsafe { core::ptr::drop_in_place(player) };
+                }
+                RICH_SERVICE_READY.store(false, Ordering::Release);
+                AUDIO_STATS.active_bgm_voices.store(0, Ordering::Relaxed);
+                AUDIO_STATS.active_sfx_voices.store(0, Ordering::Relaxed);
+                WORKER_RICH_ACTIVE.store(false, Ordering::Release);
+                WORKER_RICH_OFFLINE_GENERATION.store(generation, Ordering::Release);
             }
         }
     }
 
     fn refresh_source_stats(&mut self) {
-        let snapshot = self.service.counter_snapshot();
+        let Some(service) = self.service.as_deref() else {
+            self.pending_sources = 0;
+            AUDIO_STATS.active_bgm_voices.store(0, Ordering::Relaxed);
+            AUDIO_STATS.active_sfx_voices.store(0, Ordering::Relaxed);
+            return;
+        };
+        let snapshot = service.counter_snapshot();
         self.pending_sources =
             u32::from(snapshot.active_source_count) + u32::from(snapshot.queued_source_count);
         AUDIO_STATS.active_bgm_voices.store(

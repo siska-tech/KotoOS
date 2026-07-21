@@ -10,8 +10,9 @@ use koto_sim::{
     describe_launch_report, describe_memo_validation_report, describe_render_command,
     describe_save_data_clear_report, describe_save_data_namespace, describe_shell_action,
     golden_frame_trace, launch_package, list_save_data, load_font_bytes, load_packages,
-    parse_app_script, parse_input_script, render_app_frame, render_splash_frame, run_app_scenario,
-    run_memo_validation, run_shell_script, write_bmp, Framebuffer, RenderRecorder,
+    load_system_config, parse_app_script, parse_input_script, render_app_frame,
+    render_splash_frame, run_app_scenario, run_memo_validation, run_shell_script, write_bmp,
+    Framebuffer, RenderRecorder, UiGallery,
 };
 
 const DEFAULT_FONT: &str = "assets/fonts/mplus12.kfont";
@@ -41,7 +42,8 @@ fn main() -> ExitCode {
                 "usage: koto-sim [--script PATH] [--image PATH] [--font PATH] [--window] [--memo-validation]\n\
                  \x20               [--app APP_ID] [--app-script PATH] [--inspect] [--budget] [--audio PATH]\n\
                  \x20               [--watch DIR] [--watch-replay PATH]\n\
-                 \x20               [--golden-frames] [--splash] [--system-view]\n\
+                 \x20               [--fake-network PATH]\n\
+                 \x20               [--golden-frames] [--ui-gallery] [--splash] [--system-view]\n\
                  \x20               [--save-list] [--save-clear APP_ID]\n\
                  \x20               [--battery PERCENT] [--charging] [--voltage MV] [--power-unknown]"
             );
@@ -61,8 +63,41 @@ fn main() -> ExitCode {
         return run_memo_validation_cli();
     }
 
+    let fake_network_json = match args.fake_network.as_deref() {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(json) => match koto_sim::fake_network::replay_trace(&json) {
+                Ok(trace) => {
+                    println!(
+                        "fake NetworkService: replayed {} snapshot boundaries from {path}",
+                        trace.len()
+                    );
+                    Some(json)
+                }
+                Err(error) => {
+                    eprintln!("invalid fake-network fixture {path}: {error}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Err(error) => {
+                eprintln!("failed to read fake-network fixture {path}: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
+    // Headless fake replay is a focused CI/development mode. In window mode
+    // the checked fixture stays attached to the native KotoConfig launch path.
+    if fake_network_json.is_some() && !args.window {
+        return ExitCode::SUCCESS;
+    }
+
     if args.golden_frames {
         return golden_frames_cli();
+    }
+
+    if args.ui_gallery {
+        return ui_gallery_cli(&args.font, args.image.as_deref(), args.window);
     }
 
     if args.splash {
@@ -105,6 +140,7 @@ fn main() -> ExitCode {
         }
     };
     let mut shell = ShellState::new(packages);
+    shell.apply_config_snapshot(load_system_config("sdcard_mock").snapshot());
     if let Some(power_state) = args.power_state {
         shell.set_power_state(power_state);
     }
@@ -159,6 +195,7 @@ fn main() -> ExitCode {
             args.app.as_deref(),
             args.watch.as_deref(),
             args.watch_replay.as_deref(),
+            fake_network_json.as_deref(),
         );
     }
 
@@ -225,6 +262,7 @@ fn main() -> ExitCode {
                 );
                 print_launch_result(&package);
             }
+            ShellAction::OpenConfig => println!("open KotoConfig"),
         }
     }
 
@@ -313,6 +351,50 @@ fn golden_frames_cli() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn ui_gallery_cli(font_path: &str, image: Option<&str>, window: bool) -> ExitCode {
+    let font_bytes = match load_font_bytes(font_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("failed to load font: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if window {
+        #[cfg(feature = "window")]
+        return match koto_sim::window::run_ui_gallery(&font_bytes) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("gallery window failed: {error:?}");
+                ExitCode::FAILURE
+            }
+        };
+        #[cfg(not(feature = "window"))]
+        {
+            eprintln!("--window requires cargo run -p koto-sim --features window");
+            return ExitCode::FAILURE;
+        }
+    }
+    let font = match BitmapFont::from_bytes(&font_bytes) {
+        Ok(font) => font,
+        Err(error) => {
+            eprintln!("invalid font: {error:?}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut gallery = UiGallery::new();
+    let framebuffer = gallery.render(&font);
+    if let Some(path) = image {
+        if let Err(error) = write_bmp(path, &framebuffer) {
+            eprintln!("failed to write gallery image: {error:?}");
+            return ExitCode::FAILURE;
+        }
+        println!("wrote KotoUI gallery to {path}");
+    } else {
+        println!("KotoUI gallery ready; add --image PATH or --window");
+    }
+    ExitCode::SUCCESS
 }
 
 fn memo_validation_root() -> PathBuf {
@@ -544,6 +626,7 @@ fn run_window_mode(
     app: Option<&str>,
     watch: Option<&str>,
     watch_replay: Option<&str>,
+    fake_network_json: Option<&str>,
 ) -> ExitCode {
     let font_bytes = match load_font_bytes(font_path) {
         Ok(bytes) => bytes,
@@ -559,7 +642,13 @@ fn run_window_mode(
         watch_dir: watch.map(PathBuf::from),
         replay: watch_replay.map(PathBuf::from),
     });
-    match koto_sim::window::run(shell, &font_bytes, Path::new("sdcard_mock"), direct) {
+    match koto_sim::window::run(
+        shell,
+        &font_bytes,
+        Path::new("sdcard_mock"),
+        direct,
+        fake_network_json.map(str::to_owned),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("window error: {error:?}");
@@ -575,6 +664,7 @@ fn run_window_mode(
     _app: Option<&str>,
     _watch: Option<&str>,
     _watch_replay: Option<&str>,
+    _fake_network_json: Option<&str>,
 ) -> ExitCode {
     eprintln!("--window requires building with the `window` feature:");
     eprintln!("    cargo run -p koto-sim --features window -- --window");
@@ -626,11 +716,13 @@ struct CliArgs {
     save_list: bool,
     save_clear: Option<String>,
     golden_frames: bool,
+    ui_gallery: bool,
     splash: bool,
     audio: Option<String>,
     system_view: bool,
     watch: Option<String>,
     watch_replay: Option<String>,
+    fake_network: Option<String>,
 }
 
 impl CliArgs {
@@ -651,11 +743,13 @@ impl CliArgs {
         let mut save_list = false;
         let mut save_clear = None;
         let mut golden_frames = false;
+        let mut ui_gallery = false;
         let mut splash = false;
         let mut audio = None;
         let mut system_view = false;
         let mut watch = None;
         let mut watch_replay = None;
+        let mut fake_network = None;
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
@@ -675,11 +769,13 @@ impl CliArgs {
                 "--save-list" => save_list = true,
                 "--save-clear" => save_clear = Some(Self::value(&mut args, "--save-clear")?),
                 "--golden-frames" => golden_frames = true,
+                "--ui-gallery" => ui_gallery = true,
                 "--splash" => splash = true,
                 "--audio" => audio = Some(Self::value(&mut args, "--audio")?),
                 "--system-view" => system_view = true,
                 "--watch" => watch = Some(Self::value(&mut args, "--watch")?),
                 "--watch-replay" => watch_replay = Some(Self::value(&mut args, "--watch-replay")?),
+                "--fake-network" => fake_network = Some(Self::value(&mut args, "--fake-network")?),
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -708,6 +804,16 @@ impl CliArgs {
         {
             return Err("--golden-frames cannot be combined with other modes".to_string());
         }
+        if ui_gallery
+            && (script.is_some()
+                || app.is_some()
+                || app_script.is_some()
+                || memo_validation
+                || golden_frames
+                || splash)
+        {
+            return Err("--ui-gallery only combines with --window/--image/--font".to_string());
+        }
         if audio.is_some() && app.is_none() {
             return Err("--audio requires --app".to_string());
         }
@@ -719,6 +825,26 @@ impl CliArgs {
         }
         if watch_replay.is_some() && watch.is_none() {
             return Err("--watch-replay requires --watch".to_string());
+        }
+        if fake_network.is_some()
+            && (script.is_some()
+                || image.is_some()
+                || memo_validation
+                || app.is_some()
+                || app_script.is_some()
+                || inspect
+                || budget
+                || save_list
+                || save_clear.is_some()
+                || golden_frames
+                || ui_gallery
+                || splash
+                || audio.is_some()
+                || system_view
+                || watch.is_some()
+                || watch_replay.is_some())
+        {
+            return Err("--fake-network only combines with --window/--font".to_string());
         }
 
         let power_state = Self::resolve_power_state(battery, charging, voltage, power_unknown)?;
@@ -737,11 +863,13 @@ impl CliArgs {
             save_list,
             save_clear,
             golden_frames,
+            ui_gallery,
             splash,
             audio,
             system_view,
             watch,
             watch_replay,
+            fake_network,
         })
     }
 

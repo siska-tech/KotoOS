@@ -44,7 +44,7 @@ const BANNER: &[u8] = concat!(
 )
 .as_bytes();
 
-#[cfg(feature = "board-picocalc-pico")]
+#[cfg(any(feature = "board-picocalc-pico", feature = "board-picocalc-picow"))]
 const TRANSPORT_PROFILE: &[u8] =
     b"spi_requested_hz=62500000 dma=DMA_CH0 dreq=SPI1_TX profile=rp2040-validated\r\n";
 #[cfg(feature = "board-picocalc-pico2w")]

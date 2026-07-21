@@ -137,7 +137,7 @@ impl<const READING: usize, const CANDIDATE: usize> MemoIme<READING, CANDIDATE> {
         match key {
             MemoImeKey::Shift => {
                 if self.has_active_composition() {
-                    return self.commit(editor);
+                    return Ok(());
                 }
                 self.sticky.process(StickyShiftKey::Shift);
                 editor.dirty_mut().mark_ime();
@@ -152,6 +152,18 @@ impl<const READING: usize, const CANDIDATE: usize> MemoIme<READING, CANDIDATE> {
                     editor.insert_char(ch).map_err(MemoImeError::Memo)?;
                     editor.dirty_mut().mark_ime();
                     return Ok(());
+                }
+                // SKK ▼-mode: a character key while a candidate is shown first
+                // commits that candidate, then acts as fresh input (an
+                // uppercase key opens the next conversion, punctuation is
+                // inserted, and so on). `q`'s SKK role here is a kana-mode
+                // toggle, which has no equivalent in this IME, so it only
+                // commits.
+                if self.candidate_len > 0 {
+                    self.commit(editor)?;
+                    if ch == 'q' || ch == 'Q' {
+                        return Ok(());
+                    }
                 }
                 // SKK-style `q`: while converting, commit the reading as katakana.
                 if self.converting && (ch == 'q' || ch == 'Q') {
@@ -717,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_commits_active_candidate_for_right_shift_fallback() {
+    fn shift_does_not_commit_active_candidate() {
         let mut editor = editor();
         let mut ime = TestIme::new();
         let index = SkkLeadingIndex::build(DICT).unwrap();
@@ -732,6 +744,79 @@ mod tests {
         assert_eq!(ime.line().mode, MemoImeMode::Candidate);
 
         ime.process_key(MemoImeKey::Shift, &mut editor).unwrap();
+        assert_eq!(editor.as_str(), "");
+        assert_eq!(ime.line().candidate, Some("傘"));
+        assert_eq!(ime.line().mode, MemoImeMode::Candidate);
+
+        ime.process_key(MemoImeKey::Commit, &mut editor).unwrap();
+        assert_eq!(editor.as_str(), "傘");
+        assert_eq!(ime.line().mode, MemoImeMode::Empty);
+    }
+
+    /// Drive the IME into candidate mode showing 傘 (かさ -> /傘/笠/).
+    fn ime_showing_kasa_candidate(editor: &mut MemoEditor<128>) -> (TestIme, SkkLeadingIndex) {
+        let mut ime = TestIme::new();
+        let index = SkkLeadingIndex::build(DICT).unwrap();
+        ime.process_key(MemoImeKey::Toggle, editor).unwrap();
+        ime.process_key(MemoImeKey::Shift, editor).unwrap();
+        for key in ['k', 'a', 's', 'a'] {
+            ime.process_key(MemoImeKey::Character(key), editor).unwrap();
+        }
+        ime.convert_with(&index, DICT, editor).unwrap();
+        assert_eq!(ime.line().candidate, Some("傘"));
+        (ime, index)
+    }
+
+    #[test]
+    fn lowercase_key_commits_shown_candidate_then_composes() {
+        let mut editor = editor();
+        let (mut ime, _) = ime_showing_kasa_candidate(&mut editor);
+
+        for key in ['n', 'o'] {
+            ime.process_key(MemoImeKey::Character(key), &mut editor)
+                .unwrap();
+        }
+        assert_eq!(editor.as_str(), "傘の");
+        assert_eq!(ime.line().mode, MemoImeMode::Empty);
+    }
+
+    #[test]
+    fn uppercase_key_commits_shown_candidate_then_opens_next_conversion() {
+        let mut editor = editor();
+        let (mut ime, index) = ime_showing_kasa_candidate(&mut editor);
+
+        for key in ['K', 'a', 'i'] {
+            ime.process_key(MemoImeKey::Character(key), &mut editor)
+                .unwrap();
+        }
+        assert_eq!(editor.as_str(), "傘");
+        assert_eq!(ime.line().mode, MemoImeMode::Converting);
+        assert_eq!(ime.line().reading, "かい");
+
+        ime.convert_with(&index, DICT, &mut editor).unwrap();
+        assert_eq!(ime.line().candidate, Some("回"));
+        ime.process_key(MemoImeKey::Commit, &mut editor).unwrap();
+        assert_eq!(editor.as_str(), "傘回");
+    }
+
+    #[test]
+    fn punctuation_commits_shown_candidate_then_inserts_fullwidth() {
+        let mut editor = editor();
+        let (mut ime, _) = ime_showing_kasa_candidate(&mut editor);
+
+        ime.process_key(MemoImeKey::Character('.'), &mut editor)
+            .unwrap();
+        assert_eq!(editor.as_str(), "傘。");
+        assert_eq!(ime.line().mode, MemoImeMode::Empty);
+    }
+
+    #[test]
+    fn q_commits_shown_candidate_without_katakana_conversion() {
+        let mut editor = editor();
+        let (mut ime, _) = ime_showing_kasa_candidate(&mut editor);
+
+        ime.process_key(MemoImeKey::Character('q'), &mut editor)
+            .unwrap();
         assert_eq!(editor.as_str(), "傘");
         assert_eq!(ime.line().mode, MemoImeMode::Empty);
     }

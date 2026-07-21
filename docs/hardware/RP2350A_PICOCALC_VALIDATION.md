@@ -18,6 +18,21 @@ The bundle is written under
 firmware, six retained peripheral probes, and
 `koto_firmware-picocalc-pico2w-rp2350a-forced-psram-fallback.uf2`.
 
+For the KOTO-0245 Pico 2 W HTTPS validation image, run:
+
+```powershell
+tools\build-rp2350a.ps1 -AppFetchHttps
+```
+
+The helper builds `network_service,app_fetch_https` and uses `picotool` to
+emit the RP2350 Arm Secure UF2 family plus the required absolute image block:
+`koto_firmware-picocalc-pico2w-rp2350a-app-fetch-https.uf2`.
+
+Hardware result (2026-07-22): pass. The controlled Fetch returned HTTP 200 and
+12 body bytes in 389 ms; TLS completed with session 2,776/3,072 bytes and crypto
+stack 8,352/16,384 bytes. PCM/SLDPCM and game audio remained normal during and
+after the concurrent HTTPS path.
+
 ## Test environment
 
 - Module: Raspberry Pi Pico 2 W / RP2350A

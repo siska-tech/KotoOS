@@ -119,6 +119,7 @@ pub fn describe_shell_action(action: ShellAction) -> String {
                 package.app_id()
             )
         }
+        ShellAction::OpenConfig => "open KotoConfig".to_string(),
     }
 }
 

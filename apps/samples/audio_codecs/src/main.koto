@@ -1,4 +1,23 @@
-// KotoAudio runtime-ready clip demo. Press 1 for PCM16, 2 for SLD4.
+// KotoAudio runtime-ready clip demo and KOTO-0226 product-path regression.
+// Press 3 to run the deterministic five-minute stream/cue soak.
+
+struct RegressionState {
+    running: bool,
+    frame: int,
+}
+
+static regression: RegressionState = { running: false, frame: 0, };
+
+impl RegressionState {
+    fn start(self) {
+        self.running = true;
+        self.frame = 0;
+    }
+
+    fn tick(self) {
+        self.frame = self.frame + 1;
+    }
+}
 
 fn main() {
     loop {
@@ -13,12 +32,48 @@ fn main() {
         if key == 50 {
             play_sfx_asset("audio/sample_audio_sld4.kacl", 28);
         }
+        if key == 51 && !regression.running {
+            regression.start();
+            play_sfx_asset("audio/sample_audio_pcm16.kacl", 29);
+        }
+
+        if regression.running {
+            regression.tick();
+            // Restart before the finite source ends, keeping refills active for
+            // the complete stage. Cue requests land halfway between restarts so
+            // the one-request-per-frame host queue is never intentionally busy.
+            if regression.frame < 9000 && (regression.frame % 300) == 0 {
+                play_sfx_asset("audio/sample_audio_pcm16.kacl", 29);
+            }
+            if regression.frame == 9000 {
+                play_sfx_asset("audio/sample_audio_sld4.kacl", 28);
+            }
+            if regression.frame > 9000 && (regression.frame % 300) == 0 {
+                play_sfx_asset("audio/sample_audio_sld4.kacl", 28);
+            }
+            if (regression.frame % 60) == 30 {
+                if ((regression.frame / 60) % 2) == 0 {
+                    play_sfx_asset("audio/scratch_cue_a.kmml", 24);
+                }
+                if ((regression.frame / 60) % 2) == 1 {
+                    play_sfx_asset("audio/scratch_cue_b.kmml", 24);
+                }
+            }
+            // 18,750 frames at the device's 16 ms cadence crosses five minutes.
+            if regression.frame >= 18750 {
+                exit(0);
+            }
+        }
 
         draw_rect(0, 0, 320, 320, 0);
         draw_text(16, 24, "KotoAudio clip demo", 20);
         draw_text(16, 52, "1: PCM16 KACL", 14);
         draw_text(16, 76, "2: SLD4 KACL", 13);
-        draw_text(16, 108, "Both load from this KPA", 23);
+        draw_text(16, 100, "3: 5 minute scratch soak", 24);
+        draw_text(16, 132, "All assets load from this KPA", 29);
+        if regression.running {
+            draw_text(16, 164, "Regression running", 18);
+        }
         yield_frame();
     }
 }

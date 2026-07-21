@@ -1,0 +1,40 @@
+{
+  "format": "kpa-manifest",
+  "version": 2,
+  "app_id": "dev.koto.samples.fetch-weather",
+  "name": "SDK Fetch Weather",
+  "entry": "bytecode/sample_fetch_weather.kbc",
+  "runtime": "kotoruntime-bytecode",
+  "icon": "icons/sample_fetch_weather.kicon",
+  "description": "Reads bounded weather JSON without blocking frames.",
+  "category": "Samples",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "assets": [
+    {
+      "path": "bytecode/sample_fetch_weather.kbc",
+      "type": "bytecode",
+      "sequential": true
+    },
+    {
+      "path": "icons/sample_fetch_weather.kicon",
+      "type": "image",
+      "sequential": false
+    }
+  ],
+  "permissions": {
+    "fs": "sandbox",
+    "network": {
+      "origins": [
+        {
+          "origin": "https://siska-tech.jp",
+          "spki_sha256": [
+            "e611a2493609ee56b711de32dfa162d5f2f803c0eb73942824ff0480174c7a47"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -17,6 +17,8 @@ FIXTURE = ROOT / "harness" / "fixtures" / "sample_app.kpa.json"
 FIXTURE_LAYOUT = ROOT / "harness" / "fixtures" / "sample_app.layout.csv"
 NON_MONOTONIC_LAYOUT = ROOT / "harness" / "fixtures" / "non_monotonic.layout.csv"
 ASSET_PIPELINE_FIXTURE = ROOT / "harness" / "fixtures" / "asset_pipeline"
+KOTOUI_ABI_FIXTURES = ROOT / "harness" / "fixtures" / "koto_ui_abi"
+NETWORK_SERVICE_FIXTURES = ROOT / "harness" / "fixtures" / "network_service"
 SDCARD_APPS = ROOT / "sdcard_mock" / "apps"
 PACKAGE_MANIFESTS = ROOT / "package_inputs" / "manifests"
 PACKAGE_INPUTS = ROOT / "package_inputs"
@@ -212,6 +214,7 @@ def validate_kpa_manifest(
     asset_root: Path,
     errors: list[str],
     app_dir: Path | None = None,
+    app_asset_sources: dict[str, Path] | None = None,
 ) -> None:
     rel = manifest_path.relative_to(ROOT)
     for key in KPA_REQUIRED_KEYS:
@@ -245,6 +248,8 @@ def validate_kpa_manifest(
             errors.append(f"{rel} contains duplicate asset path: {path}")
         asset_paths.add(path)
         asset_file = asset_root / path
+        if not asset_file.exists() and app_asset_sources is not None:
+            asset_file = app_asset_sources.get(path, asset_file)
         if (
             not asset_file.exists()
             and app_dir is not None
@@ -403,6 +408,7 @@ def check_sdcard_mock(errors: list[str]) -> None:
         return
 
     app_dirs: dict[str, Path] = {}
+    app_asset_sources: dict[str, dict[str, Path]] = {}
     for descriptor_path in sorted((ROOT / "apps").glob("**/app.json")):
         try:
             descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
@@ -411,6 +417,13 @@ def check_sdcard_mock(errors: list[str]) -> None:
         package = descriptor.get("package")
         if isinstance(package, str):
             app_dirs[package] = descriptor_path.parent
+            sources = {}
+            for asset in descriptor.get("assets", []):
+                if isinstance(asset, dict) and isinstance(asset.get("source"), str):
+                    output = asset.get("output", asset["source"])
+                    if isinstance(output, str):
+                        sources[output] = descriptor_path.parent / asset["source"]
+            app_asset_sources[package] = sources
 
     for manifest_path in manifests:
         try:
@@ -420,22 +433,31 @@ def check_sdcard_mock(errors: list[str]) -> None:
             continue
         package_stem = manifest_path.name.removesuffix(".kpa.json")
         app_dir = app_dirs.get(package_stem)
-        validate_kpa_manifest(manifest_path, manifest, PACKAGE_INPUTS, errors, app_dir)
+        validate_kpa_manifest(
+            manifest_path,
+            manifest,
+            PACKAGE_INPUTS,
+            errors,
+            app_dir,
+            app_asset_sources.get(package_stem),
+        )
         package_path = SDCARD_APPS / f"{package_stem}.kpa"
         if app_dir is not None and package_path.exists():
             try:
                 payloads = read_kpa_payloads(package_path)
+                sources = app_asset_sources.get(package_stem, {})
                 for asset in manifest.get("assets", []):
                     if (
                         isinstance(asset, dict)
                         and asset.get("type") == "data"
                         and isinstance(asset.get("path"), str)
-                        and asset["path"].endswith(".map")
                     ):
-                        source = app_dir / asset["path"]
-                        if payloads.get(asset["path"]) != source.read_bytes():
+                        source = sources.get(asset["path"])
+                        if source is None and asset["path"].endswith(".map"):
+                            source = app_dir / asset["path"]
+                        if source is not None and payloads.get(asset["path"]) != source.read_bytes():
                             errors.append(
-                                f"{package_path.relative_to(ROOT)} map payload differs from "
+                                f"{package_path.relative_to(ROOT)} data payload differs from "
                                 f"{source.relative_to(ROOT)}"
                             )
             except (OSError, ValueError, struct.error) as exc:
@@ -517,6 +539,155 @@ def check_board_boundary(errors: list[str]) -> None:
             )
 
 
+def check_koto_ui_abi_fixtures(errors: list[str]) -> None:
+    valid_path = KOTOUI_ABI_FIXTURES / "valid_panel_button_mount.hex"
+    truncated_path = KOTOUI_ABI_FIXTURES / "invalid_truncated_mount.hex"
+    capabilities_path = KOTOUI_ABI_FIXTURES / "valid_en_us_capabilities.hex"
+    for path in (
+        valid_path,
+        truncated_path,
+        capabilities_path,
+        KOTOUI_ABI_FIXTURES / "README.md",
+    ):
+        if not path.exists():
+            errors.append(f"missing KotoUI ABI fixture: {path.relative_to(ROOT)}")
+    if not valid_path.exists() or not truncated_path.exists():
+        return
+
+    def decode(path: Path) -> bytes | None:
+        encoded = path.read_text(encoding="ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]+", encoded) or len(encoded) % 2 != 0:
+            errors.append(f"invalid lowercase hex fixture: {path.relative_to(ROOT)}")
+            return None
+        return bytes.fromhex(encoded)
+
+    valid = decode(valid_path)
+    truncated = decode(truncated_path)
+    capabilities = decode(capabilities_path) if capabilities_path.exists() else None
+    if valid is not None:
+        if len(valid) != 142:
+            errors.append(f"KotoUI valid mount must be 142 bytes, got {len(valid)}")
+        elif valid[:4] != b"KUI1":
+            errors.append("KotoUI valid mount has wrong magic")
+        else:
+            total_len, = struct.unpack_from("<I", valid, 8)
+            node_count, node_stride = struct.unpack_from("<HH", valid, 12)
+            nodes_offset, data_offset, data_len = struct.unpack_from("<III", valid, 16)
+            root_id, initial_focus_id = struct.unpack_from("<HH", valid, 28)
+            second_id, second_parent = struct.unpack_from("<HH", valid, 88)
+            expected = (142, 2, 48, 40, 136, 6, 1, 2, 2, 1)
+            actual = (
+                total_len, node_count, node_stride, nodes_offset, data_offset,
+                data_len, root_id, initial_focus_id, second_id, second_parent,
+            )
+            if actual != expected:
+                errors.append(f"KotoUI valid mount header/node contract drifted: {actual}")
+            if valid[136:142] != b"DemoOK":
+                errors.append("KotoUI valid mount data payload drifted")
+    if truncated is not None and len(truncated) >= 40:
+        errors.append("KotoUI truncated mount fixture must be shorter than its header")
+    if capabilities is not None:
+        if len(capabilities) != 64:
+            errors.append(
+                f"KotoUI capabilities must be 64 bytes, got {len(capabilities)}"
+            )
+        elif capabilities[:4] != b"KUC1":
+            errors.append("KotoUI capabilities have wrong magic")
+        else:
+            locale_len, direction = struct.unpack_from("<BB", capabilities, 32)
+            generation, = struct.unpack_from("<I", capabilities, 36)
+            locale = capabilities[40:40 + locale_len]
+            if (locale_len, direction, generation, locale) != (5, 0, 1, b"en-US"):
+                errors.append("KotoUI canonical locale capability drifted")
+            if any(capabilities[40 + locale_len:64]):
+                errors.append("KotoUI canonical locale padding must be zero")
+
+
+def check_fake_network_fixtures(errors: list[str]) -> None:
+    """Keep KotoSim fake networking deterministic and host-network-free."""
+    paths = sorted(NETWORK_SERVICE_FIXTURES.glob("*.json"))
+    if not paths:
+        errors.append(
+            f"no fake-network fixtures in {NETWORK_SERVICE_FIXTURES.relative_to(ROOT)}"
+        )
+        return
+
+    expected_limits = {
+        "ssid_bytes": 32,
+        "scan_results": 16,
+        "credential_bytes": 63,
+        "status_records": 8,
+        "command_queue": 4,
+        "event_queue": 8,
+    }
+    nondeterministic_fields = {
+        "timestamp", "timestamp_ms", "wall_clock", "wall_clock_ms",
+        "random", "random_seed", "rng_seed", "dns", "hostname", "url",
+        "socket", "interface", "host_network", "sleep_ms",
+    }
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON field {key!r}")
+            result[key] = value
+        return result
+
+    def inspect_value(value: object, rel: Path, location: str = "$") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in nondeterministic_fields:
+                    errors.append(f"{rel} adds nondeterministic field {location}.{key}")
+                inspect_value(child, rel, f"{location}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                inspect_value(child, rel, f"{location}[{index}]")
+        elif isinstance(value, float):
+            errors.append(f"{rel} uses non-integer number at {location}")
+
+    for path in paths:
+        rel = path.relative_to(ROOT)
+        try:
+            fixture = json.loads(
+                path.read_text(encoding="utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"invalid fake-network fixture {rel}: {exc}")
+            continue
+        inspect_value(fixture, rel)
+        if not isinstance(fixture, dict):
+            errors.append(f"{rel} fake-network fixture root must be an object")
+            continue
+        if fixture.get("schema") != "koto.fake-network-service.v1":
+            errors.append(f"{rel} has unsupported fake-network schema")
+        if fixture.get("tick_unit_ms") != 100:
+            errors.append(f"{rel} tick_unit_ms must remain the fixed 100 ms unit")
+        if fixture.get("limits") != expected_limits:
+            errors.append(f"{rel} limits differ from the bounded NetworkService contract")
+        if not isinstance(fixture.get("networks"), list):
+            errors.append(f"{rel} networks must be a list")
+        if not isinstance(fixture.get("scenarios"), list) or not fixture["scenarios"]:
+            errors.append(f"{rel} scenarios must be a non-empty list")
+
+    cargo = (ROOT / "src" / "koto-sim" / "Cargo.toml").read_text(encoding="utf-8")
+    for dependency in ("reqwest", "ureq", "hyper", "socket2", "dns-lookup"):
+        if re.search(rf"(?m)^\s*{re.escape(dependency)}\s*=", cargo):
+            errors.append(f"koto-sim fake path must not add host-network dependency {dependency}")
+
+    fake_source = (
+        ROOT / "src" / "koto-sim" / "src" / "runtime" / "fake_network.rs"
+    ).read_text(encoding="utf-8")
+    forbidden_apis = (
+        "std::net", "tokio::net", "TcpStream", "UdpSocket", "ToSocketAddrs",
+        "SystemTime", "Instant::now", "thread_rng", "rand::",
+    )
+    for api in forbidden_apis:
+        if api in fake_source:
+            errors.append(f"fake NetworkService uses forbidden host/nondeterministic API {api}")
+
+
 def main() -> int:
     # Windows consoles may default to a legacy code page (e.g. cp932) that
     # cannot encode characters quoted from the docs; never let that mask the
@@ -533,6 +704,8 @@ def main() -> int:
     check_sdcard_mock(errors)
     check_rust_workspace(errors)
     check_board_boundary(errors)
+    check_koto_ui_abi_fixtures(errors)
+    check_fake_network_fixtures(errors)
 
     if errors:
         print("KotoOS harness: FAIL")
@@ -553,6 +726,8 @@ def main() -> int:
     print(f"- checked {SDCARD_APPS.relative_to(ROOT)}")
     print(f"- checked {CARGO_ROOT.relative_to(ROOT)}")
     print("- checked koto-pico board/GPIO boundary")
+    print(f"- checked {KOTOUI_ABI_FIXTURES.relative_to(ROOT)}")
+    print(f"- checked {NETWORK_SERVICE_FIXTURES.relative_to(ROOT)}")
     return 0
 
 

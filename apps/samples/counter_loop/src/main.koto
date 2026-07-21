@@ -1,8 +1,19 @@
-// Cooperative frame-loop sample: locals persist across yield_frame().
+// Cooperative frame-loop sample: static record state persists across yield_frame().
+
+struct CounterState {
+    count: int,
+}
+
+static counter: CounterState = { count: 0, };
+
+impl CounterState {
+    fn increment(self) {
+        self.count = self.count + 1;
+    }
+}
 
 fn main() {
     buf digit[1];
-    let count = 0;
 
     loop {
         let intent = text_intent();
@@ -10,11 +21,11 @@ fn main() {
             exit(0);
         }
 
-        digit[0] = 48 + (count % 10);
+        digit[0] = 48 + (counter.count % 10);
         draw_rect(0, 0, 320, 320, 0);
         draw_text(16, 24, "frame counter:", 14);
         draw_text(136, 24, digit, 1);
-        count = count + 1;
+        counter.increment();
         yield_frame();
     }
 }

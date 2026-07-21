@@ -1,0 +1,6 @@
+// Stable KotoUI SDK compatibility aggregator.
+// Implementations live in focused files for precise diagnostics and tooling.
+include "koto_ui/abi.koto";
+include "koto_ui/resources.koto";
+include "koto_ui/builders.koto";
+include "koto_ui/events_locale.koto";

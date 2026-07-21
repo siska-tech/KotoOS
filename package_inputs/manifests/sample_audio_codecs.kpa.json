@@ -6,7 +6,7 @@
   "entry": "bytecode/sample_audio_codecs.kbc",
   "runtime": "kotoruntime-bytecode",
   "icon": "icons/sample_audio_codecs.kicon",
-  "description": "Plays runtime-ready PCM16 and SLD4 KACL assets from its KPA.",
+  "description": "PCM16/SLD4 demo and five-minute CPU0 audio scratch regression.",
   "category": "Samples",
   "memory": {
     "sram_work_bytes": 16384,
@@ -30,6 +30,16 @@
     },
     {
       "path": "audio/sample_audio_sld4.kacl",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/scratch_cue_a.kmml",
+      "type": "audio",
+      "sequential": true
+    },
+    {
+      "path": "audio/scratch_cue_b.kmml",
       "type": "audio",
       "sequential": true
     }

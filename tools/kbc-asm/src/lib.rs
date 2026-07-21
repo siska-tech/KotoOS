@@ -482,6 +482,12 @@ fn host_call_id(name: &str) -> Option<u8> {
         "draw_text_color" => host_call::DRAW_TEXT_COLOR,
         "draw_pixels_rgb565" => host_call::DRAW_PIXELS_RGB565,
         "draw_pixels_persistent_rgb565" => host_call::DRAW_PIXELS_PERSISTENT_RGB565,
+        "ui_capabilities" => host_call::UI_CAPABILITIES,
+        "ui_mount" => host_call::UI_MOUNT,
+        "ui_update" => host_call::UI_UPDATE,
+        "ui_present" => host_call::UI_PRESENT,
+        "ui_poll_event" => host_call::UI_POLL_EVENT,
+        "ui_reset" => host_call::UI_RESET,
         "game2d_set_tile" => host_call::GAME2D_SET_TILE,
         "game2d_clear_layer" => host_call::GAME2D_CLEAR_LAYER,
         "game2d_configure_tilemap" => host_call::GAME2D_CONFIGURE_TILEMAP,
@@ -509,6 +515,26 @@ fn host_call_id(name: &str) -> Option<u8> {
         "file_close" => host_call::FILE_CLOSE,
         "asset_load" => host_call::ASSET_LOAD,
         "asset_load_range" => host_call::ASSET_LOAD_RANGE,
+        "fetch_start" => host_call::FETCH_START,
+        "fetch_poll" => host_call::FETCH_POLL,
+        "fetch_read" => host_call::FETCH_READ,
+        "fetch_cancel" => host_call::FETCH_CANCEL,
+        "json_reset" => host_call::JSON_RESET,
+        "json_next" => host_call::JSON_NEXT,
+        "json_finish" => host_call::JSON_FINISH,
+        "json_token" => host_call::JSON_TOKEN,
+        "json_error" => host_call::JSON_ERROR,
+        "json_status" => host_call::JSON_STATUS,
+        "time_query" => host_call::TIME_QUERY,
+        "vault_handle" => host_call::VAULT_HANDLE,
+        "fetch_start_authenticated" => host_call::FETCH_START_AUTHENTICATED,
+        "mqtt_connect" => host_call::MQTT_CONNECT,
+        "mqtt_subscribe" => host_call::MQTT_SUBSCRIBE,
+        "mqtt_poll" => host_call::MQTT_POLL,
+        "mqtt_peek" => host_call::MQTT_PEEK,
+        "mqtt_read" => host_call::MQTT_READ,
+        "mqtt_disconnect" => host_call::MQTT_DISCONNECT,
+        "mqtt_dropped" => host_call::MQTT_DROPPED,
         "ime_feed_key" => host_call::IME_FEED_KEY,
         "ime_convert" => host_call::IME_CONVERT,
         "ime_query_line" => host_call::IME_QUERY_LINE,
@@ -872,6 +898,24 @@ mod tests {
         verified(&bytes);
         let first = &bytes[KBC_HEADER_SIZE..KBC_HEADER_SIZE + 4];
         assert_eq!(u16::from_le_bytes([first[0], first[1]]), u16::from(b'k'));
+    }
+
+    #[test]
+    fn ui_host_call_names_assemble_to_the_canonical_ids() {
+        for (name, expected) in [
+            ("ui_capabilities", host_call::UI_CAPABILITIES),
+            ("ui_mount", host_call::UI_MOUNT),
+            ("ui_update", host_call::UI_UPDATE),
+            ("ui_present", host_call::UI_PRESENT),
+            ("ui_poll_event", host_call::UI_POLL_EVENT),
+            ("ui_reset", host_call::UI_RESET),
+        ] {
+            let source = format!(".stack 8\nhost_call {name}");
+            let bytes = assemble(&source).unwrap();
+            let instruction = &bytes[KBC_HEADER_SIZE..KBC_HEADER_SIZE + 4];
+            assert_eq!(instruction[3], opcode::HOST_CALL, "{name}");
+            assert_eq!(instruction[2], expected, "{name}");
+        }
     }
 
     #[test]

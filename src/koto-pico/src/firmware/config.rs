@@ -5,8 +5,11 @@
 //! markers stay in one place. The `StaticCell` instances themselves remain in the
 //! binary; only the sizing constants live here.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use embassy_time::Instant;
 use embedded_sdmmc::{TimeSource, Timestamp};
-use koto_core::Rect;
+use koto_core::{unix_to_calendar, Rect, ShellState};
 
 // Runtime diagnostic verbosity profiles (DIAG-0001 Stage 1). The profile *logic*
 // (which classes a profile enables, and its render sample cadence) lives beside the
@@ -51,12 +54,16 @@ pub const SD_TRANSFER_SPI_HZ: [u32; 7] = [
     SD_FALLBACK_SPI_HZ,
 ];
 pub const MAX_MANIFEST_BYTES: usize = 2304;
-// Keep the async task state modest while reducing the first build's 20 passes.
+// Sixteen rows retains the validated full-width present throughput. Stack
+// headroom is recovered structurally by overlaying the mutually-exclusive shell
+// state and app code window, rather than shrinking this performance-sensitive
+// strip or dropping the RP2040's second code-cache tile.
 pub const RASTER_STRIP_LINES: usize = 16;
 pub const RASTER_STRIP_BYTES: usize = 320 * RASTER_STRIP_LINES * 2;
 // RGB666 conversion target for one strip: 3 bytes/px instead of the 2 bytes/px
 // RGB565 source. Sized to the widest strip so the whole band ships in one DMA.
 pub const RGB666_STRIP_BYTES: usize = 320 * RASTER_STRIP_LINES * 3;
+const _: () = assert!(RASTER_STRIP_LINES > 0 && RASTER_STRIP_LINES % 2 == 0);
 // KOTO-0174 H-A2: software-pipeline the app present — while band N's RGB666
 // bytes are on the SPI data DMA, band N+1 rasters and converts on the CPU. The
 // `phase=178 spi-overlap` boot bench proved embassy-rp's `Spi::write().await`
@@ -114,9 +121,9 @@ pub const MAX_SHELL_PREFS_BYTES: usize = MAX_MANIFEST_BYTES;
 // it with `PsramCodeWindow::new_two_tile`, so two far-apart hot regions (e.g.
 // `main` in a high tile, helpers in tile 0 — the ~3 us/instruction ping-pong
 // signature) each keep their tile resident instead of evicting each other on
-// every call/return. If PSRAM is unavailable the launch path runs directly from
-// this buffer as a plain slice, so apps with code up to
-// `CODE_WINDOW_TOTAL_BYTES` now launch without PSRAM.
+// every call/return. The shell/code resident overlay requires PSRAM to preserve
+// launcher state, so firmware without PSRAM can still boot the shell but does
+// not launch apps.
 pub const CODE_WINDOW_BYTES: usize = 16 * 1024;
 // Resident tile-cache slots (KOTO-0173). The board profile owns this memory/
 // performance tradeoff: RP2040 retains 2; RP2350A uses 3 after its measured
@@ -125,7 +132,18 @@ pub const CODE_WINDOW_TILES: usize = crate::board::CODE_WINDOW_TILES;
 pub const CODE_WINDOW_TOTAL_BYTES: usize = CODE_WINDOW_BYTES * CODE_WINDOW_TILES;
 const _: () = assert!(CODE_WINDOW_TILES > 0);
 const _: () = assert!(CODE_WINDOW_TILES <= koto_core::psram::MAX_CODE_WINDOW_SLOTS);
-pub const DEVICE_CODE_CEILING: usize = 128 * 1024;
+// Staged code lives in the 8 MiB PSRAM and is executed through the bounded SRAM
+// window, so raising this gate does not increase resident SRAM. KotoUI Gallery's
+// validator-heavy, fully inlined SDK code is about 209 KiB.
+pub const DEVICE_CODE_CEILING: usize = 256 * 1024;
+// The launcher is copied here while its SRAM slot is reused as the app code
+// window. Reserve an aligned region at the top of PSRAM, outside both staged
+// bytecode and runtime audio-asset allocations.
+pub const SHELL_SWAP_BYTES: usize = (core::mem::size_of::<ShellState>() + 255) & !255;
+pub const SHELL_SWAP_PSRAM_ADDR: u32 = crate::psram::PSRAM_CAPACITY - SHELL_SWAP_BYTES as u32;
+pub const APP_PSRAM_LIMIT: u32 = SHELL_SWAP_PSRAM_ADDR;
+const _: () = assert!(SHELL_SWAP_BYTES >= core::mem::size_of::<ShellState>());
+const _: () = assert!(DEVICE_CODE_CEILING as u32 <= SHELL_SWAP_PSRAM_ADDR);
 // App heap ceiling. Each app is given a heap sized to its own KBC header request
 // (per-app profile, KOTO-0096); this static is the deliberate device ceiling that
 // request may not exceed. 16 KiB clears the heaviest current app (kotorogue, 10.8
@@ -245,21 +263,58 @@ pub const DEVICE_CELL_HEIGHT: u16 = 13;
 // Battery/storage/save indicators occupy the right side of the 20 px header.
 // Live status changes repaint only this cluster instead of the full surface.
 pub const SYSTEM_STATUS_RECT: Rect = Rect {
-    x: 200,
+    x: 176,
     y: 0,
-    w: 120,
+    w: 144,
     h: 20,
 };
 
 #[derive(Clone, Copy)]
 pub struct FirmwareClock;
 
+// Packed advisory local time. Zero means unsynchronized. FAT's safe fallback
+// is its minimum conventional date (1980-01-01), never an invented current
+// time and never a reason to block SD access.
+static FIRMWARE_UNIX_SECONDS: AtomicU32 = AtomicU32::new(0);
+static FIRMWARE_SYNC_MS: AtomicU32 = AtomicU32::new(0);
+static FIRMWARE_TIME_VALID: AtomicU32 = AtomicU32::new(0);
+
+pub fn publish_firmware_time(local_unix_seconds: i64) {
+    if !(315_532_800..=i64::from(u32::MAX)).contains(&local_unix_seconds) {
+        return;
+    }
+    FIRMWARE_UNIX_SECONDS.store(local_unix_seconds as u32, Ordering::Relaxed);
+    FIRMWARE_SYNC_MS.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
+    FIRMWARE_TIME_VALID.store(1, Ordering::Release);
+}
+
+pub fn clear_firmware_clock() {
+    FIRMWARE_TIME_VALID.store(0, Ordering::Release);
+    FIRMWARE_UNIX_SECONDS.store(0, Ordering::Relaxed);
+    FIRMWARE_SYNC_MS.store(0, Ordering::Relaxed);
+}
+
 impl TimeSource for FirmwareClock {
     fn get_timestamp(&self) -> Timestamp {
+        if FIRMWARE_TIME_VALID.load(Ordering::Acquire) != 0 {
+            let base = FIRMWARE_UNIX_SECONDS.load(Ordering::Relaxed);
+            let sync_ms = FIRMWARE_SYNC_MS.load(Ordering::Relaxed);
+            let elapsed_seconds = (Instant::now().as_millis() as u32).wrapping_sub(sync_ms) / 1_000;
+            if let Some(time) = unix_to_calendar(i64::from(base.saturating_add(elapsed_seconds))) {
+                return Timestamp {
+                    year_since_1970: (time.year - 1970) as u8,
+                    zero_indexed_month: time.month - 1,
+                    zero_indexed_day: time.day - 1,
+                    hours: time.hour,
+                    minutes: time.minute,
+                    seconds: time.second,
+                };
+            }
+        }
         Timestamp {
-            year_since_1970: 56,
-            zero_indexed_month: 5,
-            zero_indexed_day: 20,
+            year_since_1970: 10,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
             hours: 0,
             minutes: 0,
             seconds: 0,

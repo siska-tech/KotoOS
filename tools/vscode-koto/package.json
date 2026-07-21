@@ -116,7 +116,7 @@
         "koto.languageServer.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Enable live Koto diagnostics, definitions, hover, and slot inlays."
+          "description": "Enable live Koto diagnostics, definitions, completion, hover, and slot inlays."
         },
         "koto.languageServer.path": {
           "type": "string",

@@ -13,14 +13,18 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use koto_core::runtime::{audio_id, text_intent};
 use koto_core::shell::SHELL_SURFACE;
 use koto_core::{
-    BitmapFont, BootSplash, BootStep, BootStepStatus, Buttons, FontError, InputState, Rect, Rgb565,
-    ShellAction, ShellSound, ShellState, VmInputSnapshot,
+    BitmapFont, BootSplash, BootStep, BootStepStatus, Buttons, CanvasUiPainter, ConfigCapability,
+    FontError, InputState, KotoConfigAction, KotoConfigUi, KotoConfigWifiUi, Rect, Rgb565,
+    ShellAction, ShellCommandId, ShellSound, ShellState, VmInputSnapshot, WifiIntent, WifiKey,
+    KOTOCONFIG_SURFACE, KOTOCONFIG_WIFI_SURFACE,
 };
 use minifb::{Key, KeyRepeat, Scale, Window, WindowOptions};
 
 use crate::audio::{SimAudio, DEFAULT_SAMPLE_RATE};
+use crate::fake_network::FakeNetworkUiSession;
 use crate::{
     framebuffer_to_argb, parse_app_script, AppFailureSummary, BytecodeAppSession, Framebuffer,
+    UiGallery,
 };
 
 /// Launch straight into an app instead of the shell (`--window --app`), with
@@ -42,6 +46,76 @@ pub enum WindowError {
     Backend(minifb::Error),
 }
 
+/// Interactive developer-only KotoUI gallery (`--ui-gallery --window`).
+pub fn run_ui_gallery(font_bytes: &[u8]) -> Result<(), WindowError> {
+    let font = BitmapFont::from_bytes(font_bytes).map_err(WindowError::Font)?;
+    let (width, height) = (320usize, 320usize);
+    let mut window = Window::new(
+        "KotoUI Gallery",
+        width,
+        height,
+        WindowOptions {
+            scale: Scale::X2,
+            ..WindowOptions::default()
+        },
+    )?;
+    window.set_target_fps(60);
+    let mut gallery = UiGallery::new();
+    let mut composition = false;
+    println!(
+        "KotoUI Gallery: arrows/Tab navigate, Enter/Space activate, type to edit, F1 composition, LCtrl cancel, F10 exit"
+    );
+    while window.is_open() && !window.is_key_down(Key::F10) {
+        let mut events = Vec::new();
+        for (key, action) in [
+            (
+                Key::Up,
+                koto_ui::UiAction::Navigate(koto_ui::Navigation::Up),
+            ),
+            (
+                Key::Down,
+                koto_ui::UiAction::Navigate(koto_ui::Navigation::Down),
+            ),
+            (
+                Key::Left,
+                koto_ui::UiAction::Navigate(koto_ui::Navigation::Left),
+            ),
+            (
+                Key::Right,
+                koto_ui::UiAction::Navigate(koto_ui::Navigation::Right),
+            ),
+            (
+                Key::Tab,
+                koto_ui::UiAction::Navigate(koto_ui::Navigation::Next),
+            ),
+            (Key::Enter, koto_ui::UiAction::Activate),
+            (Key::Space, koto_ui::UiAction::Activate),
+            (Key::Backspace, koto_ui::UiAction::Backspace),
+            (Key::Delete, koto_ui::UiAction::Delete),
+            (Key::Home, koto_ui::UiAction::Home),
+            (Key::End, koto_ui::UiAction::End),
+            (Key::LeftCtrl, koto_ui::UiAction::Cancel),
+        ] {
+            if window.is_key_pressed(key, KeyRepeat::Yes) {
+                events.push(koto_ui::UiEvent::pressed(action));
+            }
+        }
+        if let Some(ch) = typed_char(&window, window.is_key_down(Key::LeftShift)) {
+            events.push(koto_ui::UiEvent::pressed(koto_ui::UiAction::Text(ch)));
+        }
+        if window.is_key_pressed(Key::F1, KeyRepeat::No) {
+            composition = !composition;
+            gallery.set_composition(composition);
+        }
+        for event in events {
+            gallery.handle_event(event);
+        }
+        let framebuffer = gallery.render(&font);
+        window.update_with_buffer(&framebuffer_to_argb(&framebuffer), width, height)?;
+    }
+    Ok(())
+}
+
 impl From<minifb::Error> for WindowError {
     fn from(error: minifb::Error) -> Self {
         WindowError::Backend(error)
@@ -55,6 +129,7 @@ pub fn run(
     font_bytes: &[u8],
     root: &std::path::Path,
     direct: Option<DirectApp>,
+    fake_network_json: Option<String>,
 ) -> Result<(), WindowError> {
     let font = BitmapFont::from_bytes(font_bytes).map_err(WindowError::Font)?;
 
@@ -100,6 +175,8 @@ pub fn run(
             window.update_with_buffer(&buffer, width, height)?;
         }
     }
+    let mut system_config = crate::load_system_config(root);
+    shell.apply_config_snapshot(system_config.snapshot());
     // Force an initial paint before the first input.
     shell.paint(&mut framebuffer.as_canvas(), &font);
     let mut mode = WindowMode::Shell;
@@ -135,12 +212,17 @@ pub fn run(
 
     println!(
         "KotoSim window: arrows move/cursor, Enter launch/newline, Backspace toggle details pane, \
-         F2 favorite, F3 sort, F4 category, letters type, F1 IME on/off, Tab convert, \
-         Shift sticky-shift, RShift commit, LCtrl cancel, F2 save (prompts for name) \
+         F1 settings (shell) / IME on/off (app), F2 favorite, F3 sort, F4 category, letters type, Tab convert, \
+         Shift sticky-shift, Space convert/cycle, Enter commit, Ctrl+G cancel, F2 save (prompts for name) \
          / F4 open file (memo), F5 new file (memo), F10 quit app, Esc quit"
     );
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    while window.is_open() {
+        if window.is_key_down(Key::Escape)
+            && !matches!(mode, WindowMode::Config(_) | WindowMode::ConfigWifi(_))
+        {
+            break;
+        }
         // KOTO-0191 watch loop: on the poll cadence, a change under the watched
         // tree rebuilds the app and relaunches it in this window. A failed
         // build keeps the running session (fix the source and save to retry);
@@ -169,28 +251,33 @@ pub fn run(
                 // Function-key shell commands (favorite / sort / category) persist
                 // to the save-data area so they survive across sessions.
                 let mut prefs_changed = false;
+                let open_config = window.is_key_pressed(Key::F1, KeyRepeat::No);
                 if window.is_key_pressed(Key::F2, KeyRepeat::No) {
-                    shell.toggle_selected_favorite();
+                    shell.activate_command(ShellCommandId::Favorite);
                     prefs_changed = true;
                 }
                 if window.is_key_pressed(Key::F3, KeyRepeat::No) {
-                    shell.cycle_sort();
+                    shell.activate_command(ShellCommandId::Sort);
                     prefs_changed = true;
                 }
                 if window.is_key_pressed(Key::F4, KeyRepeat::No) {
-                    shell.cycle_category();
+                    shell.activate_command(ShellCommandId::Category);
                     prefs_changed = true;
                 }
                 // F5 toggles the system/memory status overlay (KOTO-0182). The
                 // shell full-repaints every frame here, so no relayout bookkeeping.
                 if window.is_key_pressed(Key::F5, KeyRepeat::No) {
-                    shell.toggle_system_view();
+                    shell.activate_command(ShellCommandId::System);
                 }
                 if prefs_changed {
                     let _ = crate::save_shell_prefs(&shell, root);
                 }
 
-                let action = shell.update(&poll_shell_input(&window));
+                let action = if open_config {
+                    shell.activate_command(ShellCommandId::Settings)
+                } else {
+                    shell.update(&poll_shell_input(&window))
+                };
                 if let Some(sound) = shell.take_pending_sound() {
                     if let Ok(mut audio) = audio.lock() {
                         let id = match sound {
@@ -201,7 +288,24 @@ pub fn run(
                         audio.play_sfx(id);
                     }
                 }
-                if let ShellAction::Launch(package) = action {
+                if action == ShellAction::OpenConfig {
+                    if let Some(json) = fake_network_json.as_deref() {
+                        // Explicit development/test hook. The default path has
+                        // no fake and therefore advertises no Wi-Fi capability.
+                        // KOTO-0241 consumes these public observations without
+                        // giving KotoConfig access to host-network APIs.
+                        let trace = crate::fake_network::replay_trace(json)
+                            .expect("fake fixture was validated before window launch");
+                        println!(
+                            "KotoConfig fake NetworkService attached: {} observations",
+                            trace.len()
+                        );
+                    }
+                    let capabilities = config_capabilities(fake_network_json.is_some());
+                    let ui = KotoConfigUi::new_with_capabilities(&system_config, capabilities);
+                    paint_koto_config(&mut framebuffer, &font, &ui);
+                    mode = WindowMode::Config(ui);
+                } else if let ShellAction::Launch(package) = action {
                     println!(
                         "launch requested: {} ({})",
                         package.name(),
@@ -229,6 +333,121 @@ pub fn run(
                     paint_app_run(&mut framebuffer, &font, run);
                 }
             }
+            WindowMode::Config(ui) => {
+                let exit_shortcut = window.is_key_pressed(Key::F1, KeyRepeat::No)
+                    || window.is_key_pressed(Key::F10, KeyRepeat::No);
+                let mut events = Vec::new();
+                if window.is_key_pressed(Key::Tab, KeyRepeat::Yes) {
+                    let navigation = if window.is_key_down(Key::LeftShift)
+                        || window.is_key_down(Key::RightShift)
+                    {
+                        koto_ui::Navigation::Previous
+                    } else {
+                        koto_ui::Navigation::Next
+                    };
+                    events.push(koto_ui::UiEvent::pressed(koto_ui::UiAction::Navigate(
+                        navigation,
+                    )));
+                }
+                for (key, action) in [
+                    (
+                        Key::Up,
+                        koto_ui::UiAction::Navigate(koto_ui::Navigation::Up),
+                    ),
+                    (
+                        Key::Down,
+                        koto_ui::UiAction::Navigate(koto_ui::Navigation::Down),
+                    ),
+                    (
+                        Key::Left,
+                        koto_ui::UiAction::Navigate(koto_ui::Navigation::Left),
+                    ),
+                    (
+                        Key::Right,
+                        koto_ui::UiAction::Navigate(koto_ui::Navigation::Right),
+                    ),
+                    (Key::Enter, koto_ui::UiAction::Activate),
+                    (Key::Escape, koto_ui::UiAction::Cancel),
+                    (Key::Backspace, koto_ui::UiAction::Cancel),
+                    (Key::LeftCtrl, koto_ui::UiAction::Cancel),
+                ] {
+                    if window.is_key_pressed(key, KeyRepeat::Yes) {
+                        events.push(koto_ui::UiEvent::pressed(action));
+                    }
+                }
+                let mut repaint = false;
+                let mut exit = exit_shortcut;
+                let mut open_wifi = false;
+                for event in events {
+                    match ui.handle_event(event, &mut system_config) {
+                        KotoConfigAction::None => {}
+                        KotoConfigAction::LocaleChanged(_) => {
+                            let _ = crate::save_system_config(&system_config, root);
+                            shell.apply_config_snapshot(system_config.snapshot());
+                            repaint = true;
+                        }
+                        KotoConfigAction::UtcOffsetChanged(_) => {
+                            let _ = crate::save_system_config(&system_config, root);
+                            repaint = true;
+                        }
+                        KotoConfigAction::SntpServerChanged(_) => {
+                            let _ = crate::save_system_config(&system_config, root);
+                            repaint = true;
+                        }
+                        KotoConfigAction::OpenWifi => open_wifi = true,
+                        KotoConfigAction::Exit => exit = true,
+                    }
+                    repaint |= ui.damaged_rects().next().is_some();
+                }
+                if open_wifi {
+                    if let Some(json) = fake_network_json.as_deref() {
+                        let backend = FakeNetworkUiSession::new(json)
+                            .expect("fake fixture was validated before window launch");
+                        let mut wifi =
+                            KotoConfigWifiUi::new(system_config.locale(), backend.snapshot());
+                        let _ = wifi.update(backend.snapshot(), backend.results(), None);
+                        paint_koto_config_wifi(&mut framebuffer, &font, &wifi);
+                        wifi.clear_damage();
+                        mode = WindowMode::ConfigWifi(Box::new((wifi, backend)));
+                    }
+                } else if exit {
+                    mode = WindowMode::Shell;
+                    shell.paint(&mut framebuffer.as_canvas(), &font);
+                } else if repaint {
+                    paint_koto_config(&mut framebuffer, &font, ui);
+                    ui.clear_damage();
+                }
+            }
+            WindowMode::ConfigWifi(state) => {
+                let (ui, backend) = state.as_mut();
+                let exit_shortcut = window.is_key_pressed(Key::F1, KeyRepeat::No)
+                    || window.is_key_pressed(Key::F10, KeyRepeat::No);
+                let advanced = backend.service_frame();
+                let intent = ui.update(
+                    backend.snapshot(),
+                    backend.results(),
+                    poll_wifi_key(&window),
+                );
+                let submitted = backend.submit(intent, ui.credential());
+                if submitted {
+                    ui.submission_complete(intent);
+                }
+
+                if exit_shortcut {
+                    ui.reset();
+                    mode = WindowMode::Shell;
+                    shell.paint(&mut framebuffer.as_canvas(), &font);
+                } else if intent == WifiIntent::Exit {
+                    ui.reset();
+                    let capabilities = config_capabilities(fake_network_json.is_some());
+                    let config = KotoConfigUi::new_with_capabilities(&system_config, capabilities);
+                    paint_koto_config(&mut framebuffer, &font, &config);
+                    mode = WindowMode::Config(config);
+                } else if advanced || ui.damaged_rects().next().is_some() {
+                    paint_koto_config_wifi(&mut framebuffer, &font, ui);
+                    ui.clear_damage();
+                }
+            }
         }
 
         let buffer = framebuffer_to_argb(&framebuffer);
@@ -240,9 +459,62 @@ pub fn run(
 
 enum WindowMode {
     Shell,
+    Config(KotoConfigUi),
+    ConfigWifi(Box<(KotoConfigWifiUi, FakeNetworkUiSession)>),
     // Boxed: a live session embeds the VM heap and editor buffers, so the variant
     // is several KB larger than `Shell`.
     App(Box<AppRun>),
+}
+
+fn config_capabilities(fake_network: bool) -> ConfigCapability {
+    if fake_network {
+        ConfigCapability::LOCALE_CONFIG.union(ConfigCapability::WIFI_CONFIG)
+    } else {
+        ConfigCapability::LOCALE_CONFIG
+    }
+}
+
+fn paint_koto_config(framebuffer: &mut Framebuffer, font: &BitmapFont<'_>, ui: &KotoConfigUi) {
+    let mut canvas = framebuffer.as_canvas();
+    let mut painter = CanvasUiPainter::new(&mut canvas, font);
+    let _ = ui.paint(&mut painter, KOTOCONFIG_SURFACE);
+}
+
+fn paint_koto_config_wifi(
+    framebuffer: &mut Framebuffer,
+    font: &BitmapFont<'_>,
+    ui: &KotoConfigWifiUi,
+) {
+    let mut canvas = framebuffer.as_canvas();
+    let mut painter = CanvasUiPainter::new(&mut canvas, font);
+    let _ = ui.paint(&mut painter, KOTOCONFIG_WIFI_SURFACE);
+}
+
+fn poll_wifi_key(window: &Window) -> Option<WifiKey> {
+    for (key, wifi_key) in [
+        (Key::Up, WifiKey::Up),
+        (Key::Down, WifiKey::Down),
+        (Key::Left, WifiKey::Left),
+        (Key::Right, WifiKey::Right),
+        (Key::Enter, WifiKey::Enter),
+        (Key::Escape, WifiKey::Esc),
+        (Key::Backspace, WifiKey::Backspace),
+    ] {
+        if window.is_key_pressed(key, KeyRepeat::Yes) {
+            return Some(wifi_key);
+        }
+    }
+    if window.is_key_pressed(Key::Tab, KeyRepeat::Yes) {
+        return Some(
+            if window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift) {
+                WifiKey::Previous
+            } else {
+                WifiKey::Next
+            },
+        );
+    }
+    typed_char(window, window.is_key_down(Key::LeftShift))
+        .and_then(|ch| ch.is_ascii().then_some(WifiKey::Char(ch as u8)))
 }
 
 /// Watch poll cadence in window frames (~250 ms at the 60 fps target).
@@ -607,6 +879,7 @@ fn poll_app_input(window: &Window) -> VmInputSnapshot {
     let shift_held = window.is_key_down(Key::LeftShift);
     let typed = typed_char(window, shift_held);
     let text_codepoint = typed.map(|ch| ch as u32).unwrap_or(0);
+    let enter_pressed = window.is_key_pressed(Key::Enter, KeyRepeat::No);
 
     let mut intent_bits = 0;
     let mut set = |pressed: bool, flag: u32| {
@@ -614,10 +887,7 @@ fn poll_app_input(window: &Window) -> VmInputSnapshot {
             intent_bits |= flag;
         }
     };
-    set(
-        window.is_key_pressed(Key::Enter, KeyRepeat::No),
-        text_intent::NEWLINE,
-    );
+    set(enter_pressed, text_intent::NEWLINE);
     set(
         window.is_key_pressed(Key::Backspace, KeyRepeat::Yes),
         text_intent::BACKSPACE,
@@ -654,6 +924,10 @@ fn poll_app_input(window: &Window) -> VmInputSnapshot {
         window.is_key_pressed(Key::Tab, KeyRepeat::No),
         text_intent::CONVERT,
     );
+    set(
+        window.is_key_pressed(Key::Space, KeyRepeat::No),
+        text_intent::CONVERT,
+    );
     // Left Shift arms Sticky Shift (SKK), except when it is being used to type a
     // shifted symbol this frame — then it is a plain modifier, not a conversion.
     let typing_shifted_symbol = typed
@@ -663,13 +937,9 @@ fn poll_app_input(window: &Window) -> VmInputSnapshot {
         window.is_key_pressed(Key::LeftShift, KeyRepeat::No) && !typing_shifted_symbol,
         text_intent::SHIFT,
     );
+    let control_held = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
     set(
-        window.is_key_pressed(Key::RightShift, KeyRepeat::No)
-            || window.is_key_down(Key::RightShift),
-        text_intent::COMMIT,
-    );
-    set(
-        window.is_key_pressed(Key::LeftCtrl, KeyRepeat::No),
+        control_held && window.is_key_pressed(Key::G, KeyRepeat::No),
         text_intent::CANCEL,
     );
     set(
@@ -699,6 +969,9 @@ fn poll_app_input(window: &Window) -> VmInputSnapshot {
     VmInputSnapshot {
         text_codepoint,
         intent_bits,
+        // Match the device keyboard bridge: Enter is both a newline intent and
+        // game/UI button A. KotoUI consumes button A as Activate.
+        pressed_bits: u32::from(enter_pressed) << 4,
         ..VmInputSnapshot::empty()
     }
 }

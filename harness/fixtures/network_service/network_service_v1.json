@@ -1,0 +1,105 @@
+{
+  "schema": "koto.fake-network-service.v1",
+  "tick_unit_ms": 100,
+  "limits": {
+    "ssid_bytes": 32,
+    "scan_results": 16,
+    "credential_bytes": 63,
+    "status_records": 8,
+    "command_queue": 4,
+    "event_queue": 8
+  },
+  "networks": [
+    {
+      "result_id": 1,
+      "ssid_utf8": "KotoLab",
+      "bssid": "02:00:00:00:00:01",
+      "rssi_dbm": -42,
+      "security": "Wpa2PersonalAes"
+    },
+    {
+      "result_id": 2,
+      "ssid_hex": "ff4b6f746f",
+      "bssid": "02:00:00:00:00:02",
+      "rssi_dbm": -67,
+      "security": "Open"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "capability-absent",
+      "capability_inputs": [true, true, true, false],
+      "actions": [],
+      "snapshots": [
+        {"tick": 0, "generation": 1, "request_id": 0, "state": "RadioUnavailable", "error": "CredentialStoreUnavailable"}
+      ]
+    },
+    {
+      "name": "scan-connect-disconnect",
+      "capability_inputs": [true, true, true, true],
+      "actions": [
+        {"tick": 0, "op": "set_radio", "enabled": true, "request_id": 1},
+        {"tick": 2, "op": "scan", "request_id": 2},
+        {"tick": 5, "op": "connect", "request_id": 3, "result_id": 1, "credential_case": "valid"},
+        {"tick": 9, "op": "disconnect", "request_id": 4}
+      ],
+      "snapshots": [
+        {"tick": 0, "generation": 1, "request_id": 1, "state": "RadioEnabling", "error": null},
+        {"tick": 1, "generation": 1, "request_id": 1, "state": "Disabled", "radio": "Enabled", "error": null},
+        {"tick": 2, "generation": 1, "request_id": 2, "state": "Scanning", "error": null},
+        {"tick": 4, "generation": 1, "request_id": 2, "state": "Results", "result_ids": [1, 2], "error": null},
+        {"tick": 5, "generation": 1, "request_id": 3, "state": "Connecting", "retry": 0, "error": null},
+        {"tick": 8, "generation": 1, "request_id": 3, "state": "Connected", "result_id": 1, "error": null},
+        {"tick": 9, "generation": 1, "request_id": 4, "state": "Disconnecting", "error": null},
+        {"tick": 10, "generation": 1, "request_id": 4, "state": "Results", "error": null}
+      ]
+    },
+    {
+      "name": "authentication-failure",
+      "capability_inputs": [true, true, true, true],
+      "actions": [
+        {"tick": 0, "op": "connect", "request_id": 1, "result_id": 1, "credential_case": "invalid"}
+      ],
+      "snapshots": [
+        {"tick": 0, "generation": 1, "request_id": 1, "state": "Connecting", "retry": 0, "error": null},
+        {"tick": 2, "generation": 1, "request_id": 1, "state": "Failed", "retry": 0, "error": "AuthenticationFailed", "credential_staging_zeroized": true}
+      ]
+    },
+    {
+      "name": "cancel-scan",
+      "capability_inputs": [true, true, true, true],
+      "actions": [
+        {"tick": 0, "op": "scan", "request_id": 1},
+        {"tick": 1, "op": "cancel", "request_id": 1}
+      ],
+      "snapshots": [
+        {"tick": 0, "generation": 1, "request_id": 1, "state": "Scanning", "error": null},
+        {"tick": 1, "generation": 1, "request_id": 1, "state": "Failed", "error": "Cancelled"}
+      ]
+    },
+    {
+      "name": "radio-loss-discards-late-completion",
+      "capability_inputs": [true, true, true, true],
+      "actions": [
+        {"tick": 0, "op": "connect", "request_id": 1, "result_id": 1, "credential_case": "valid"},
+        {"tick": 1, "op": "lose_radio"},
+        {"tick": 3, "op": "driver_completion", "generation": 1, "request_id": 1}
+      ],
+      "snapshots": [
+        {"tick": 0, "generation": 1, "request_id": 1, "state": "Connecting", "error": null},
+        {"tick": 1, "generation": 2, "request_id": 0, "state": "RadioUnavailable", "error": "RadioUnavailable", "credential_staging_zeroized": true},
+        {"tick": 3, "generation": 2, "request_id": 0, "state": "RadioUnavailable", "error": "RadioUnavailable", "late_completion_discarded": true}
+      ]
+    },
+    {
+      "name": "forget-commit",
+      "capability_inputs": [true, true, true, true],
+      "actions": [
+        {"tick": 0, "op": "forget", "request_id": 1, "profile_id": 1}
+      ],
+      "snapshots": [
+        {"tick": 0, "generation": 1, "request_id": 1, "state": "Results", "error": null, "secret_commit_acknowledged": true, "credential_staging_zeroized": true}
+      ]
+    }
+  ]
+}

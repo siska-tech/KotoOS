@@ -1,0 +1,403 @@
+// App-authored KotoUI v1 component gallery. Component pixels and focus are
+// owned by the host; this app submits semantic descriptions and updates only.
+include <sdk/koto_ui.koto>;
+
+enum GalleryLocale {
+    En,
+    Ja,
+    QpsPloc,
+}
+
+enum GalleryWidget {
+    Panel = 1,
+    Status,
+    OpenDialog,
+    Checkbox,
+    List,
+    TextField,
+    DisabledButton,
+    Dialog,
+    CloseDialog,
+    DialogBody,
+}
+
+enum GalleryStatus {
+    None = -1,
+    DialogOpened = 0,
+    DialogClosed,
+    Checked,
+    Unchecked,
+    SelectionChanged,
+    TextChanged,
+    Submitted,
+    SelectionActivated,
+    CapacityRejected,
+}
+
+// Fatal exit codes, one per failure site. The code is the only diagnostic
+// that reaches the device UART or simulator output, so values are the
+// observable contract: never renumber, only append. Number spacing groups
+// the sites by transaction (-1x resource/rows, -2x capabilities, -3x mount,
+// -5x dialog, -6x status, -7x/-8x locale apply and event-loop diagnostics).
+enum GalleryError {
+    ResourceLoad = -10,
+    ResourceParse = -11,
+    RowsBegin = -12,
+    RowsFinish = -13,
+    Capabilities = -20,
+    MountFinish = -30,
+    MountSubmit = -31,
+    MountPresent = -32,
+    DialogBegin = -50,
+    DialogSubmit = -54,
+    DialogPresent = -55,
+    StatusBegin = -60,
+    StatusSubmit = -64,
+    StatusPresent = -65,
+    ApplyBegin = -70,
+    ApplySubmit = -83,
+    ApplyPresent = -84,
+    LocaleValidate = -85,
+    FocusPresent = -86,
+}
+
+// Storage sizes and indexed text shape fold from the real packaged assets and
+// the SDK's storage constructors (KOTO-0236/0237). All locales must expose the
+// same lines; range helpers derive the arenas copied into List rows and the
+// locale-update packet without combining impossible per-line locale maxima.
+const GALLERY_RESOURCE_LINES = asset_text_line_count(
+    "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const GALLERY_RESOURCE_RAW_BYTES =
+    asset_len("locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const GALLERY_RESOURCE_BYTES =
+    ui_text_resource_capacity(GALLERY_RESOURCE_LINES, GALLERY_RESOURCE_RAW_BYTES);
+const GALLERY_LIST_ROWS = 3;
+const GALLERY_LIST_LABEL_BYTES = asset_text_max_range_bytes(
+    9, GALLERY_LIST_ROWS,
+    "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const GALLERY_LIST_BYTES = ui_list_rows_capacity(GALLERY_LIST_ROWS, GALLERY_LIST_LABEL_BYTES);
+const GALLERY_APPLY_TEXT_BYTES = asset_text_max_range_bytes(
+    0, 9, "locales/en-US.txt", "locales/ja-JP.txt", "locales/qps-ploc.txt");
+const GALLERY_INITIAL_SELECTION = 0;
+
+static gallery_mount_builder: UiMountBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+static gallery_update_builder: UiUpdateBuilder = {
+    packet: 0, capacity: 0, record_capacity: 0, record_count: 0,
+    data_offset: 0, data_cursor: 0, status: 0, active: false,
+};
+
+static gallery_text: TextResource = {
+    storage: 0, capacity: 0, line_capacity: 0, line_count: 0,
+    payload_offset: 0, payload_len: 0, status: 0, complete: false,
+};
+
+static gallery_rows: UiListRowsBuilder = {
+    blob: 0, capacity: 0, row_capacity: 0, row_count: 0,
+    label_cursor: 0, status: 0, active: false, complete: false,
+};
+
+struct GalleryState {
+    selection: int,
+    status: int,
+    resource_kind: int,
+}
+
+static gallery: GalleryState = {
+    selection: GALLERY_INITIAL_SELECTION,
+    status: GalleryStatus::None,
+    resource_kind: GalleryLocale::En,
+};
+
+impl GalleryState {
+    fn reset_status(self) {
+        self.status = GalleryStatus::None;
+    }
+
+    fn select(self, index: int) {
+        self.selection = index;
+        self.status = GalleryStatus::SelectionChanged;
+    }
+}
+
+// Locale assets are UTF-8 text with matching non-empty LF/CRLF-separated lines:
+// 12 component strings, the initial field value, and 9 semantic status
+// strings. At load time they become a compact length table plus payload in
+// app-owned heap memory.
+
+fn gallery_fail(status: int) {
+    ui_reset();
+    exit(status);
+}
+
+fn gallery_load_resource(kind: int, raw: int, resource: int) {
+    let loaded = 0;
+    if kind == GalleryLocale::Ja {
+        loaded = asset_load("locales/ja-JP.txt", 17, raw, GALLERY_RESOURCE_RAW_BYTES);
+    } else if kind == GalleryLocale::QpsPloc {
+        loaded = asset_load("locales/qps-ploc.txt", 20, raw, GALLERY_RESOURCE_RAW_BYTES);
+    } else {
+        loaded = asset_load("locales/en-US.txt", 17, raw, GALLERY_RESOURCE_RAW_BYTES);
+    }
+    if loaded <= 0 { gallery_fail(GalleryError::ResourceLoad); }
+
+    if gallery_text.parse(raw, loaded, resource, GALLERY_RESOURCE_BYTES,
+        GALLERY_RESOURCE_LINES) != GALLERY_RESOURCE_LINES {
+        gallery_fail(GalleryError::ResourceParse);
+    }
+}
+
+fn gallery_build_rows(blob: int, capacity: int) {
+    if gallery_rows.begin(blob, capacity, GALLERY_LIST_ROWS) != 0 {
+        gallery_fail(GalleryError::RowsBegin);
+    }
+    gallery_rows.resource_row(true, gallery_text, 9, 0);
+    gallery_rows.resource_row(true, gallery_text, 10, 0);
+    gallery_rows.resource_row(true, gallery_text, 11, 0);
+    if gallery_rows.finish() < 0 { gallery_fail(GalleryError::RowsFinish); }
+}
+
+fn gallery_mount() {
+    // Ten records; the data arena is the sum of the fixed text/list slots
+    // declared below: 20+23+16+20+66+6+64+11+10+7+24 = 267 bytes. The selected
+    // resource and List rows were prepared before this frame.
+    buf packet[ui_mount_capacity(10, 267)];
+
+    let status = gallery_mount_builder.begin(packet, len(packet), 10,
+        GalleryWidget::Panel, GalleryWidget::OpenDialog);
+    if status != 0 { gallery_fail(status); }
+
+    gallery_mount_builder.panel(
+        GalleryWidget::Panel, UI_PARENT_ROOT, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        0, 0, 320, 320, gallery_text.line_ptr(0),
+        gallery_text.line_len(0), 20, 8, 20);
+    gallery_mount_builder.label(
+        GalleryWidget::Status, GalleryWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED | UI_FLAG_ELLIPSIS,
+        12, 28, 296, 20, gallery_text.line_ptr(1),
+        gallery_text.line_len(1), 23, UiAlignment::Start);
+    gallery_mount_builder.button(
+        GalleryWidget::OpenDialog, GalleryWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 52, 142, 28, gallery_text.line_ptr(2),
+        gallery_text.line_len(2), 16, false);
+    gallery_mount_builder.checkbox_with_mark_offset(
+        GalleryWidget::Checkbox, GalleryWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        166, 52, 142, 28, gallery_text.line_ptr(3),
+        gallery_text.line_len(3), 20, false, 4, 0);
+    gallery_mount_builder.list_builder(
+        GalleryWidget::List, GalleryWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 88, 142, 48, gallery_rows, GALLERY_LIST_BYTES, 0, 24, true);
+    gallery_mount_builder.text_field(
+        GalleryWidget::TextField, GalleryWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        166, 88, 142, 32, gallery_text.line_ptr(4),
+        gallery_text.line_len(4), 6,
+        gallery_text.line_ptr(12), gallery_text.line_len(12), 64, 4, true);
+    // Visible but disabled: keyboard focus must skip this control.
+    gallery_mount_builder.button(
+        GalleryWidget::DisabledButton, GalleryWidget::Panel, UI_FLAG_VISIBLE,
+        166, 132, 142, 28, gallery_text.line_ptr(5),
+        gallery_text.line_len(5), 11, false);
+    gallery_mount_builder.dialog(
+        GalleryWidget::Dialog, GalleryWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        30, 52, 260, 190, gallery_text.line_ptr(6),
+        gallery_text.line_len(6), 10, 8, 20,
+        GalleryWidget::CloseDialog, GalleryWidget::CloseDialog, false);
+    gallery_mount_builder.button(
+        GalleryWidget::CloseDialog, GalleryWidget::Dialog,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        110, 196, 100, 28, gallery_text.line_ptr(7),
+        gallery_text.line_len(7), 7, true);
+    gallery_mount_builder.label(
+        GalleryWidget::DialogBody, GalleryWidget::Dialog,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED | UI_FLAG_ELLIPSIS,
+        50, 92, 220, 24, gallery_text.line_ptr(8),
+        gallery_text.line_len(8), 24, UiAlignment::Center);
+
+    status = gallery_mount_builder.finish();
+    if status < 0 { gallery_fail(GalleryError::MountFinish); }
+    status = ui_mount(packet, status);
+    if status != 0 { gallery_fail(GalleryError::MountSubmit); }
+    status = ui_present();
+    if status != 0 { gallery_fail(GalleryError::MountPresent); }
+}
+
+fn gallery_set_dialog(open: int) {
+    // Two data-free records: the dialog open flag and the focus request.
+    buf update[ui_update_capacity(2, 0)];
+    let status = gallery_update_builder.begin(update, len(update), 2);
+    if status != 0 { gallery_fail(GalleryError::DialogBegin); }
+    gallery_update_builder.dialog_open(GalleryWidget::Dialog, open != 0);
+    if open == 0 {
+        gallery_update_builder.request_focus(GalleryWidget::OpenDialog);
+    } else {
+        gallery_update_builder.request_focus(GalleryWidget::CloseDialog);
+    }
+    status = gallery_update_builder.submit();
+    if status != 0 { gallery_fail(GalleryError::DialogSubmit); }
+    status = ui_present();
+    if status != 0 { gallery_fail(GalleryError::DialogPresent); }
+}
+
+fn gallery_set_status(line: int) {
+    // One text record; the longest localized status line is 19 UTF-8 bytes.
+    buf update[ui_update_capacity(1, 19)];
+    let status = gallery_update_builder.begin(update, len(update), 1);
+    if status != 0 { gallery_fail(GalleryError::StatusBegin); }
+    gallery_update_builder.text_resource(GalleryWidget::Status, gallery_text, line);
+    status = gallery_update_builder.submit();
+    if status != 0 { gallery_fail(GalleryError::StatusSubmit); }
+    status = ui_present();
+    if status != 0 { gallery_fail(GalleryError::StatusPresent); }
+}
+
+fn gallery_set_localized_status(index: int) {
+    gallery_set_status(13 + index);
+}
+
+fn gallery_select_resource(locale: int, locale_len: int) -> int {
+    // The host already validated the canonical tag. Match the language subtag;
+    // every other locale follows the documented embedded en-US fallback.
+    if ui_locale_match(locale, locale_len, "locales/ja-JP.txt" + 8, 2) != UiLocaleMatch::None {
+        return GalleryLocale::Ja;
+    }
+    if ui_locale_match(locale, locale_len,
+        "locales/qps-ploc.txt" + 8, 8) == UiLocaleMatch::Exact {
+        return GalleryLocale::QpsPloc;
+    }
+    return GalleryLocale::En;
+}
+
+fn gallery_apply_resource(selected: int) {
+    // Ten text/list records: lines 0..8 are component text and lines 9..11
+    // become the encoded three-row List in the same selected locale, so the
+    // data arena is the component-text maximum plus the encoded List rows
+    // blob, composed at compile time (KOTO-0238).
+    buf update[ui_update_capacity(10, GALLERY_APPLY_TEXT_BYTES + GALLERY_LIST_BYTES)];
+
+    let status = gallery_update_builder.begin(update, len(update), 10);
+    if status != 0 { gallery_fail(GalleryError::ApplyBegin); }
+    gallery_update_builder.text_resource(GalleryWidget::Panel, gallery_text, 0);
+    gallery_update_builder.text_resource(GalleryWidget::Status, gallery_text, 1);
+    gallery_update_builder.text_resource(GalleryWidget::OpenDialog, gallery_text, 2);
+    gallery_update_builder.text_resource(GalleryWidget::Checkbox, gallery_text, 3);
+    gallery_update_builder.text_resource(GalleryWidget::TextField, gallery_text, 4);
+    gallery_update_builder.text_resource(GalleryWidget::DisabledButton, gallery_text, 5);
+    gallery_update_builder.text_resource(GalleryWidget::Dialog, gallery_text, 6);
+    gallery_update_builder.text_resource(GalleryWidget::CloseDialog, gallery_text, 7);
+    gallery_update_builder.list_rows_builder(GalleryWidget::List, gallery_rows, selected);
+    gallery_update_builder.text_resource(GalleryWidget::DialogBody, gallery_text, 8);
+
+    status = gallery_update_builder.submit();
+    if status != 0 { gallery_fail(GalleryError::ApplySubmit); }
+    status = ui_present();
+    if status != 0 { gallery_fail(GalleryError::ApplyPresent); }
+}
+
+fn gallery_host_resource() -> int {
+    buf capabilities[64];
+    let capability_len = ui_capabilities(capabilities, len(capabilities));
+    if capability_len < 0 { exit(capability_len); }
+    if ui_capabilities_validate(capabilities, capability_len) != 0 {
+        exit(GalleryError::Capabilities);
+    }
+    return gallery_select_resource(
+        ui_capabilities_locale_ptr(capabilities), ui_capabilities_locale_len(capabilities));
+}
+
+fn main() {
+    // Declaration order fixes the heap layout: raw locale text, the parsed
+    // table, and the encoded List rows blob sit back-to-back, each capacity
+    // on its own declaration. Resolve the host locale before mount so startup
+    // needs one parse and one retained tree instead of mounting English and
+    // immediately relabeling it.
+    buf locale_raw[GALLERY_RESOURCE_RAW_BYTES];
+    buf locale_table[GALLERY_RESOURCE_BYTES];
+    buf rows_blob[GALLERY_LIST_BYTES];
+    gallery.resource_kind = gallery_host_resource();
+    gallery_load_resource(gallery.resource_kind, locale_raw, locale_table);
+    gallery_build_rows(rows_blob, len(rows_blob));
+    yield_frame();
+    gallery_mount();
+    yield_frame();
+
+    buf event[96];
+    // Business state that must survive deep inline SDK calls lives in one typed
+    // App-lifetime record rather than at the edge of the 45-slot local frame.
+    loop {
+        // F10 is an app-lifecycle command, not a retained KotoUI component
+        // event. Poll the normalized intent explicitly so device Shift+F5
+        // (bridge code 0x90) and KotoSim F10 both return to the shell.
+        let intent = text_intent();
+        if (intent & INTENT_EXIT) != 0 {
+            ui_reset();
+            exit(0);
+        }
+        let event_len = ui_poll_event(event, len(event));
+        if event_len < 0 { gallery_fail(event_len); }
+        while event_len > 0 {
+            if ui_event_validate(event, event_len) != 0 { gallery_fail(UI_SDK_BAD_ARGUMENT); }
+            let response = ui_event_response(event);
+            let widget = ui_event_widget_id(event);
+            gallery.reset_status();
+            if response == UiResponse::Activated && widget == GalleryWidget::OpenDialog {
+                gallery_set_dialog(1);
+                gallery.status = GalleryStatus::DialogOpened;
+            } else if response == UiResponse::Activated && widget == GalleryWidget::CloseDialog {
+                gallery_set_dialog(0);
+                gallery.status = GalleryStatus::DialogClosed;
+            } else if response == UiResponse::ValueChanged && widget == GalleryWidget::Checkbox {
+                if ui_event_value(event) == 0 {
+                    gallery.status = GalleryStatus::Unchecked;
+                } else {
+                    gallery.status = GalleryStatus::Checked;
+                }
+            } else if response == UiResponse::SelectionChanged && widget == GalleryWidget::List {
+                gallery.select(ui_event_index(event));
+            } else if response == UiResponse::SelectionActivated && widget == GalleryWidget::List {
+                gallery.status = GalleryStatus::SelectionActivated;
+            } else if response == UiResponse::TextChanged && widget == GalleryWidget::TextField {
+                gallery.status = GalleryStatus::TextChanged;
+            } else if response == UiResponse::Submitted && widget == GalleryWidget::TextField {
+                gallery.status = GalleryStatus::Submitted;
+            } else if response == UiResponse::CapacityRejected {
+                gallery.status = GalleryStatus::CapacityRejected;
+            } else if response == UiResponse::FocusChanged {
+                let focus_status = ui_present();
+                if focus_status != 0 { gallery_fail(GalleryError::FocusPresent); }
+            } else if response == UiResponse::LocaleChanged {
+                if ui_locale_changed_validate(event, event_len) != 0 {
+                    gallery_fail(GalleryError::LocaleValidate);
+                }
+                gallery.resource_kind = gallery_select_resource(
+                    ui_locale_changed_tag_ptr(event), ui_locale_changed_tag_len(event));
+                gallery_load_resource(gallery.resource_kind, locale_raw,
+                    locale_table);
+                gallery_build_rows(rows_blob, len(rows_blob));
+                // Keep worst-case qps-ploc parsing and the retained-tree
+                // update on separate deterministic frames.
+                yield_frame();
+                gallery_apply_resource(gallery.selection);
+            } else if response == UiResponse::Cancelled {
+                if widget == GalleryWidget::Dialog || widget == GalleryWidget::CloseDialog {
+                    gallery_set_dialog(0);
+                    gallery.status = GalleryStatus::DialogClosed;
+                }
+                else { ui_reset(); exit(0); }
+            }
+            if gallery.status != GalleryStatus::None {
+                gallery_set_localized_status(gallery.status);
+            }
+            event_len = ui_poll_event(event, len(event));
+            if event_len < 0 { gallery_fail(event_len); }
+        }
+        yield_frame();
+    }
+}

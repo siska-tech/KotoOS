@@ -1,0 +1,860 @@
+// Weather helpers (KOTO-0247), spliced into main.koto after the type and static
+// declarations. Every call is inlined at its site, so shared bodies stay tiny
+// and one-shot bodies (mount/compose/cache) live in their own helper.
+
+// ---- bounded byte / format utilities ----
+
+fn w_append(dst: int, cap: int, off: int, src: int, n: int) -> int {
+    if off < 0 || n < 0 || off + n > cap { return off; }
+    let i = 0;
+    while i < n {
+        heap_set_u8(dst + off + i, heap_get_u8(src + i));
+        i = i + 1;
+    }
+    return off + n;
+}
+
+// Two ASCII digits for 0..99.
+fn w_fmt_u2(dst: int, cap: int, off: int, v: int) -> int {
+    if off + 2 > cap { return off; }
+    heap_set_u8(dst + off, 48 + (v / 10) % 10);
+    heap_set_u8(dst + off + 1, 48 + v % 10);
+    return off + 2;
+}
+
+// Signed decimal text.
+fn w_fmt_int(dst: int, cap: int, off: int, v: int) -> int {
+    let n = v;
+    let neg = 0;
+    if n < 0 { neg = 1; n = 0 - n; }
+    let digits = 1;
+    let probe = n;
+    while probe >= 10 { probe = probe / 10; digits = digits + 1; }
+    if off + digits + neg > cap { return off; }
+    if neg == 1 { heap_set_u8(dst + off, 45); }
+    let i = off + neg + digits - 1;
+    while i >= off + neg {
+        heap_set_u8(dst + i, 48 + n % 10);
+        n = n / 10;
+        i = i - 1;
+    }
+    return off + neg + digits;
+}
+
+// Deci-degrees to "-12.3".
+fn w_fmt_dc(dst: int, cap: int, off: int, dc: int) -> int {
+    let n = dc;
+    if n < 0 {
+        if off < cap { heap_set_u8(dst + off, 45); off = off + 1; }
+        n = 0 - n;
+    }
+    off = w_fmt_int(dst, cap, off, n / 10);
+    if off + 2 > cap { return off; }
+    heap_set_u8(dst + off, 46);
+    heap_set_u8(dst + off + 1, 48 + n % 10);
+    return off + 2;
+}
+
+// A location key is a routing label: 1..W_CFG_LOC_BYTES bytes of [a-z0-9-_].
+fn w_valid_key(p: int, n: int) -> int {
+    if n < 1 || n > W_CFG_LOC_BYTES { return 0; }
+    let i = 0;
+    while i < n {
+        let c = heap_get_u8(p + i);
+        let ok = 0;
+        if c >= 97 && c <= 122 { ok = 1; }
+        if c >= 48 && c <= 57 { ok = 1; }
+        if c == 45 || c == 95 { ok = 1; }
+        if ok == 0 { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Fletcher-16 over n bytes using only bounded arithmetic (no wrap reliance), so
+// a torn sandbox write is detected. Returns sum1 + sum2*256.
+fn w_fletcher(p: int, n: int) -> int {
+    let s1 = 0;
+    let s2 = 0;
+    let i = 0;
+    while i < n {
+        s1 = (s1 + heap_get_u8(p + i)) % 255;
+        s2 = (s2 + s1) % 255;
+        i = i + 1;
+    }
+    return s1 + s2 * 256;
+}
+
+fn w_store_u32(p: int, v: int) {
+    heap_set_u16(p, v % 65536);
+    heap_set_u16(p + 2, (v / 65536) % 65536);
+}
+
+fn w_load_u32(p: int) -> int {
+    return heap_get_u16(p) + heap_get_u16(p + 2) * 65536;
+}
+
+fn w_str_eq(a: int, b: int, n: int) -> int {
+    let i = 0;
+    while i < n {
+        if heap_get_u8(a + i) != heap_get_u8(b + i) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Strict bounded integer token: optional '-', digits only, <=10 digits, aborts
+// before i32 overflow. Returns the value or W_PARSE_BAD.
+fn w_tok_int(p: int, n: int) -> int {
+    let i = 0;
+    let neg = 0;
+    if n > 0 && heap_get_u8(p) == 45 { neg = 1; i = 1; }
+    if i >= n || n - neg > 10 { return W_PARSE_BAD; }
+    let v = 0;
+    while i < n {
+        let c = heap_get_u8(p + i);
+        if c < 48 || c > 57 { return W_PARSE_BAD; }
+        if v > 214748363 { return W_PARSE_BAD; }
+        v = v * 10 + (c - 48);
+        if v < 0 { return W_PARSE_BAD; }
+        i = i + 1;
+    }
+    if neg == 1 { return 0 - v; }
+    return v;
+}
+
+fn w_fail_hard(code: int) {
+    ui_reset();
+    exit(code);
+}
+
+// ---- localized resource loading (File Note pattern) ----
+
+fn w_line_cap(line: int) -> int {
+    if line == W_LINE_TITLE { return W_TITLE_BYTES; }
+    if line == W_LINE_FIELD { return W_FIELD_BYTES; }
+    if line == W_LINE_REFRESH || line == W_LINE_CANCEL { return W_BTN_BYTES; }
+    if line == W_LINE_UNIT { return W_UNIT_BYTES; }
+    if line >= W_LINE_NODATA && line <= W_LINE_TIME_UNKNOWN { return W_MISC_BYTES; }
+    if line >= W_COND_FIRST && line < W_COND_FIRST + W_COND_COUNT { return W_COND_BYTES; }
+    return W_STATUS_BYTES;
+}
+
+fn w_load_resource(kind: int, app: WApp) {
+    let loaded = 0;
+    if kind == WLocale::Ja {
+        loaded = asset_load("locales/ja-JP.txt", 17, app.raw, len(app.raw));
+    } else if kind == WLocale::QpsPloc {
+        loaded = asset_load("locales/qps-ploc.txt", 20, app.raw, len(app.raw));
+    } else {
+        loaded = asset_load("locales/en-US.txt", 17, app.raw, len(app.raw));
+    }
+    if loaded <= 0 { w_fail_hard(WError::ResourceLoad); }
+    if weather_text.parse(app.raw, loaded, app.resource,
+        len(app.resource), W_RESOURCE_LINES) != W_RESOURCE_LINES {
+        w_fail_hard(WError::ResourceParse);
+    }
+    let line = 0;
+    while line < W_RESOURCE_LINES {
+        if weather_text.line_len(line) > w_line_cap(line) { w_fail_hard(WError::ResourceLineCap); }
+        line = line + 1;
+    }
+}
+
+fn w_select_resource(locale: int, locale_len: int) -> int {
+    if ui_locale_match(locale, locale_len, "locales/ja-JP.txt" + 8, 2) != UiLocaleMatch::None {
+        return WLocale::Ja;
+    }
+    if ui_locale_match(locale, locale_len,
+        "locales/qps-ploc.txt" + 8, 8) == UiLocaleMatch::Exact {
+        return WLocale::QpsPloc;
+    }
+    return WLocale::En;
+}
+
+fn w_host_resource() -> int {
+    buf capabilities[64];
+    let capability_len = ui_capabilities(capabilities, 64);
+    if capability_len < 0 { exit(capability_len); }
+    if ui_capabilities_validate(capabilities, capability_len) != 0 {
+        exit(WError::Capabilities);
+    }
+    return w_select_resource(
+        ui_capabilities_locale_ptr(capabilities), ui_capabilities_locale_len(capabilities));
+}
+
+fn w_locale_changed(app: WApp) {
+    if ui_locale_changed_validate(app.event,
+        ui_sdk_get_u32(app.event, 8)) != 0 { w_fail_hard(WError::LocaleValidate); }
+    w_load_resource(w_select_resource(
+        ui_locale_changed_tag_ptr(app.event),
+        ui_locale_changed_tag_len(app.event)), app);
+    app.dirty = 1;
+}
+
+// ---- non-secret settings (sandbox `config`): unit + location key ----
+
+fn w_load_settings(app: WApp) {
+    buf tmp[W_SETTINGS_BYTES + 4];
+    app.unit_f = 0;
+    app.cfg_loc_len = 0;
+    let handle = file_open("config", 6, FileMode::Read);
+    if handle < 0 { return; }
+    let n = file_read(handle, tmp, len(tmp));
+    file_close(handle);
+    if n != W_SETTINGS_BYTES { return; }
+    if heap_get_u8(tmp) != 75 || heap_get_u8(tmp + 1) != 87
+        || heap_get_u8(tmp + 2) != 70 || heap_get_u8(tmp + 3) != 49 { return; }
+    if w_fletcher(tmp, W_SETTINGS_BYTES - 2) != heap_get_u16(tmp + W_SETTINGS_BYTES - 2) {
+        return;
+    }
+    let unit = heap_get_u8(tmp + 4);
+    let loc_len = heap_get_u8(tmp + 5);
+    if unit > 1 { return; }
+    if loc_len > 0 && w_valid_key(tmp + 6, loc_len) == 0 { return; }
+    app.unit_f = unit;
+    app.cfg_loc_len = loc_len;
+    let i = 0;
+    while i < loc_len {
+        heap_set_u8(app.cfg_loc + i, heap_get_u8(tmp + 6 + i));
+        i = i + 1;
+    }
+}
+
+fn w_save_settings(app: WApp) {
+    buf tmp[W_SETTINGS_BYTES];
+    heap_set_u8(tmp, 75);      // K
+    heap_set_u8(tmp + 1, 87);  // W
+    heap_set_u8(tmp + 2, 70);  // F
+    heap_set_u8(tmp + 3, 49);  // 1
+    heap_set_u8(tmp + 4, app.unit_f);
+    heap_set_u8(tmp + 5, app.cfg_loc_len);
+    let i = 0;
+    while i < W_CFG_LOC_BYTES {
+        let b = 0;
+        if i < app.cfg_loc_len { b = heap_get_u8(app.cfg_loc + i); }
+        heap_set_u8(tmp + 6 + i, b);
+        i = i + 1;
+    }
+    heap_set_u16(tmp + W_SETTINGS_BYTES - 2, w_fletcher(tmp, W_SETTINGS_BYTES - 2));
+    let handle = file_open("config", 6, FileMode::Write);
+    if handle < 0 { app.status = WStatus::SaveFailed; return; }
+    let written = file_write(handle, tmp, W_SETTINGS_BYTES);
+    file_close(handle);
+    if written != W_SETTINGS_BYTES { app.status = WStatus::SaveFailed; }
+}
+
+// TextChanged/Submitted carry the whole field value; validate and persist the
+// non-secret location key. An invalid key leaves the previous one untouched.
+fn w_take_field(app: WApp) {
+    let n = ui_event_text_len(app.event);
+    if n > W_CFG_LOC_BYTES { app.status = WStatus::NoLocation; app.dirty = 1; return; }
+    let src = ui_event_text_ptr(app.event);
+    if n > 0 && w_valid_key(src, n) == 0 { app.status = WStatus::NoLocation; app.dirty = 1; return; }
+    let i = 0;
+    while i < n {
+        heap_set_u8(app.cfg_loc + i, heap_get_u8(src + i));
+        i = i + 1;
+    }
+    app.cfg_loc_len = n;
+    w_save_settings(app);
+}
+
+// ---- last-valid-snapshot cache (two sandbox slots, newest-valid wins) ----
+
+// Validate the slot image currently in app.file (n bytes read); returns its
+// generation, or 0 when absent/corrupt.
+fn w_cache_slot_gen(app: WApp, n: int) -> int {
+    if n != W_CACHE_BYTES { return 0; }
+    if heap_get_u8(app.file) != 75 || heap_get_u8(app.file + 1) != 87
+        || heap_get_u8(app.file + 2) != 67 || heap_get_u8(app.file + 3) != 49 { return 0; }
+    if w_fletcher(app.file, W_CACHE_BYTES - 2)
+        != heap_get_u16(app.file + W_CACHE_BYTES - 2) { return 0; }
+    let loc_len = heap_get_u8(app.file + 22);
+    if loc_len < 1 || loc_len > W_LOC_BYTES { return 0; }
+    return heap_get_u16(app.file + 4);
+}
+
+fn w_cache_read(app: WApp, which: int) -> int {
+    let handle = 0;
+    if which == 0 { handle = file_open("cache_a", 7, FileMode::Read); }
+    else { handle = file_open("cache_b", 7, FileMode::Read); }
+    if handle < 0 { return -1; }
+    let n = file_read(handle, app.file, len(app.file));
+    file_close(handle);
+    return n;
+}
+
+// Adopt the newest valid slot as the committed (stale) snapshot at boot.
+fn w_load_cache(app: WApp) {
+    app.gen_a = w_cache_slot_gen(app, w_cache_read(app, 0));
+    app.gen_b = w_cache_slot_gen(app, w_cache_read(app, 1));
+    // app.file currently holds slot B; re-read A when it is the newer one.
+    let use_a = 0;
+    if app.gen_a != 0 {
+        if app.gen_b == 0 { use_a = 1; }
+        else if ((app.gen_a - app.gen_b) + 65536) % 65536 < 32768 { use_a = 1; }
+    }
+    if use_a == 1 {
+        if w_cache_slot_gen(app, w_cache_read(app, 0)) == 0 { return; }
+    } else if app.gen_b == 0 {
+        return;
+    }
+    app.fetched = w_load_u32(app.file + 6);
+    app.obs = w_load_u32(app.file + 10);
+    app.temp = heap_get_i16(app.file + 14);
+    app.min = heap_get_i16(app.file + 16);
+    app.max = heap_get_i16(app.file + 18);
+    app.cond = heap_get_u8(app.file + 20);
+    let precip = heap_get_u8(app.file + 21);
+    if precip == 255 { precip = -1; }
+    app.precip = precip;
+    if app.cond > 8 { app.cond = 0; }
+    app.loc_len = heap_get_u8(app.file + 22);
+    let i = 0;
+    while i < app.loc_len {
+        heap_set_u8(app.loc + i, heap_get_u8(app.file + 23 + i));
+        i = i + 1;
+    }
+    app.have = 1;
+    app.fresh = 0;
+}
+
+// Write the committed snapshot into the older slot with the next nonzero
+// generation. A torn write can only corrupt the slot being replaced, so the
+// newest valid snapshot always survives.
+fn w_write_cache(app: WApp) {
+    let newest = app.gen_a;
+    if ((app.gen_b - newest) + 65536) % 65536 < 32768 { newest = app.gen_b; }
+    let gen = (newest + 1) % 65536;
+    if gen == 0 { gen = 1; }
+    heap_set_u8(app.file, 75);      // K
+    heap_set_u8(app.file + 1, 87);  // W
+    heap_set_u8(app.file + 2, 67);  // C
+    heap_set_u8(app.file + 3, 49);  // 1
+    heap_set_u16(app.file + 4, gen);
+    w_store_u32(app.file + 6, app.fetched);
+    w_store_u32(app.file + 10, app.obs);
+    heap_set_i16(app.file + 14, app.temp);
+    heap_set_i16(app.file + 16, app.min);
+    heap_set_i16(app.file + 18, app.max);
+    heap_set_u8(app.file + 20, app.cond);
+    let precip = app.precip;
+    if precip < 0 { precip = 255; }
+    heap_set_u8(app.file + 21, precip);
+    heap_set_u8(app.file + 22, app.loc_len);
+    let i = 0;
+    while i < W_LOC_BYTES {
+        let b = 0;
+        if i < app.loc_len { b = heap_get_u8(app.loc + i); }
+        heap_set_u8(app.file + 23 + i, b);
+        i = i + 1;
+    }
+    heap_set_u16(app.file + W_CACHE_BYTES - 2, w_fletcher(app.file, W_CACHE_BYTES - 2));
+    // Choose the slot NOT holding the currently-newest generation.
+    let write_a = 1;
+    if app.gen_a != 0 && (app.gen_b == 0
+        || ((app.gen_a - app.gen_b) + 65536) % 65536 < 32768) {
+        write_a = 0;
+    }
+    let handle = 0;
+    if write_a == 1 { handle = file_open("cache_a", 7, FileMode::Write); }
+    else { handle = file_open("cache_b", 7, FileMode::Write); }
+    if handle < 0 { app.status = WStatus::SaveFailed; return; }
+    let written = file_write(handle, app.file, W_CACHE_BYTES);
+    file_close(handle);
+    if written != W_CACHE_BYTES { app.status = WStatus::SaveFailed; return; }
+    if write_a == 1 { app.gen_a = gen; } else { app.gen_b = gen; }
+}
+
+// ---- fetch + bounded decode state machine ----
+
+fn w_reset_stage(app: WApp) {
+    app.consumed = 0;
+    app.target = W_T_NONE;
+    app.parse_bad = 0;
+    app.doc_done = 0;
+    app.chunk_len = 0;
+    app.chunk_pos = 0;
+    app.http_ok = 0;
+    app.s_loc_len = 0;
+    app.s_loc_flag = W_F_MISSING;
+    app.s_schema_flag = W_F_MISSING;
+    app.s_schema_ok = 0;
+    app.s_cond_flag = W_F_MISSING;
+    app.s_temp_flag = W_F_MISSING;
+    app.s_min_flag = W_F_MISSING;
+    app.s_max_flag = W_F_MISSING;
+    app.s_precip_flag = W_F_MISSING;
+    app.s_obs_flag = W_F_MISSING;
+    app.s_cond = 0;
+    app.s_temp = 0;
+    app.s_min = -10000;
+    app.s_max = -10000;
+    app.s_precip = -1;
+    app.s_obs = 0;
+}
+
+fn w_map_fetch_error(code: int) -> int {
+    if code == 5 { return WStatus::Timeout; }        // FetchError::Timeout
+    if code == 12 { return WStatus::Oversized; }     // ResponseTooLarge
+    if code == 2 || code == 7 || code == 9 || code == 13 {
+        return WStatus::Offline;                      // Unavailable/Dns/Connect/Disconnected
+    }
+    return WStatus::ProviderError;
+}
+
+// Terminal failure of the active request: keep the last valid snapshot, mark
+// it stale, and surface the reason. Invalid/partial data never replaces it.
+fn w_fetch_fail(app: WApp, status: int) {
+    app.status = status;
+    app.active = 0;
+    app.request = -1;
+    if app.have == 1 { app.fresh = 0; }
+    app.dirty = 1;
+}
+
+// Validate the staged document and commit it as the new snapshot.
+fn w_commit(app: WApp) {
+    let bad = 0;
+    if app.s_loc_flag != W_F_FOUND { bad = 1; }
+    if app.s_cond_flag != W_F_FOUND { bad = 1; }
+    if app.s_temp_flag != W_F_FOUND { bad = 1; }
+    if app.s_min_flag > W_F_FOUND || app.s_max_flag > W_F_FOUND { bad = 1; }
+    if app.s_precip_flag > W_F_FOUND || app.s_obs_flag > W_F_FOUND { bad = 1; }
+    if app.s_schema_flag > W_F_FOUND { bad = 1; }
+    if app.s_schema_flag == W_F_FOUND && app.s_schema_ok == 0 { bad = 1; }
+    if bad == 1 {
+        w_fetch_fail(app, WStatus::BadData);
+        return;
+    }
+    app.loc_len = app.s_loc_len;
+    let i = 0;
+    while i < app.loc_len {
+        heap_set_u8(app.loc + i, heap_get_u8(app.s_loc + i));
+        i = i + 1;
+    }
+    let cond = app.s_cond;
+    if cond < 0 || cond > 8 { cond = 0; }
+    app.cond = cond;
+    app.temp = app.s_temp;
+    app.min = app.s_min;
+    app.max = app.s_max;
+    app.precip = app.s_precip;
+    app.obs = app.s_obs;
+    let now = time_query(TIME_UTC_SECONDS);
+    if now < 0 { now = 0; }
+    app.fetched = now;
+    app.have = 1;
+    app.fresh = 1;
+    app.status = WStatus::Updated;
+    app.active = 0;
+    app.request = -1;
+    app.dirty = 1;
+    w_write_cache(app);
+}
+
+// Classify a depth-1 object key into a staged field target.
+fn w_take_key(app: WApp) {
+    let n = json_token(app.tok, len(app.tok));
+    app.target = W_T_NONE;
+    if n == 6 && w_str_eq(app.tok, "schema", 6) == 1 { app.target = W_T_SCHEMA; }
+    if n == 8 && w_str_eq(app.tok, "location", 8) == 1 { app.target = W_T_LOC; }
+    if n == 9 && w_str_eq(app.tok, "condition", 9) == 1 { app.target = W_T_COND; }
+    if n == 14 && w_str_eq(app.tok, "temperature_dc", 14) == 1 { app.target = W_T_TEMP; }
+    if n == 11 {
+        if w_str_eq(app.tok, "temp_min_dc", 11) == 1 { app.target = W_T_MIN; }
+        if w_str_eq(app.tok, "temp_max_dc", 11) == 1 { app.target = W_T_MAX; }
+        if w_str_eq(app.tok, "observed_at", 11) == 1 { app.target = W_T_OBS; }
+    }
+    if n == 17 && w_str_eq(app.tok, "precipitation_pct", 17) == 1 { app.target = W_T_PRECIP; }
+}
+
+// One staged value event answers the pending depth-1 key (if any).
+fn w_take_value(app: WApp, ev: int) {
+    let target = app.target;
+    app.target = W_T_NONE;
+    if target == W_T_NONE { return; }
+    if target == W_T_SCHEMA || target == W_T_LOC {
+        if ev != JSON_STR {
+            if target == W_T_SCHEMA { app.s_schema_flag = W_F_WRONG; }
+            else { app.s_loc_flag = W_F_WRONG; }
+            return;
+        }
+        let n = json_token(app.tok, len(app.tok));
+        if target == W_T_SCHEMA {
+            if app.s_schema_flag == W_F_FOUND { app.s_schema_flag = W_F_DUP; return; }
+            app.s_schema_flag = W_F_FOUND;
+            if n == 4 && w_str_eq(app.tok, "kwd1", 4) == 1 { app.s_schema_ok = 1; }
+            return;
+        }
+        if app.s_loc_flag == W_F_FOUND { app.s_loc_flag = W_F_DUP; return; }
+        if n < 1 || n > W_LOC_BYTES { app.s_loc_flag = W_F_BAD; return; }
+        app.s_loc_len = n;
+        let i = 0;
+        while i < n {
+            heap_set_u8(app.s_loc + i, heap_get_u8(app.tok + i));
+            i = i + 1;
+        }
+        app.s_loc_flag = W_F_FOUND;
+        return;
+    }
+    if ev != JSON_NUMBER {
+        if target == W_T_COND { app.s_cond_flag = W_F_WRONG; }
+        if target == W_T_TEMP { app.s_temp_flag = W_F_WRONG; }
+        if target == W_T_MIN { app.s_min_flag = W_F_WRONG; }
+        if target == W_T_MAX { app.s_max_flag = W_F_WRONG; }
+        if target == W_T_PRECIP { app.s_precip_flag = W_F_WRONG; }
+        if target == W_T_OBS { app.s_obs_flag = W_F_WRONG; }
+        return;
+    }
+    let n = json_token(app.tok, len(app.tok));
+    let v = w_tok_int(app.tok, n);
+    if target == W_T_COND {
+        if app.s_cond_flag == W_F_FOUND { app.s_cond_flag = W_F_DUP; return; }
+        if v == W_PARSE_BAD { app.s_cond_flag = W_F_BAD; return; }
+        app.s_cond = v;
+        app.s_cond_flag = W_F_FOUND;
+        return;
+    }
+    if target == W_T_TEMP || target == W_T_MIN || target == W_T_MAX {
+        let flag = W_F_FOUND;
+        if v == W_PARSE_BAD || v < -1000 || v > 700 { flag = W_F_BAD; }
+        if target == W_T_TEMP {
+            if app.s_temp_flag == W_F_FOUND { app.s_temp_flag = W_F_DUP; return; }
+            app.s_temp_flag = flag;
+            if flag == W_F_FOUND { app.s_temp = v; }
+            return;
+        }
+        if target == W_T_MIN {
+            if app.s_min_flag == W_F_FOUND { app.s_min_flag = W_F_DUP; return; }
+            app.s_min_flag = flag;
+            if flag == W_F_FOUND { app.s_min = v; }
+            return;
+        }
+        if app.s_max_flag == W_F_FOUND { app.s_max_flag = W_F_DUP; return; }
+        app.s_max_flag = flag;
+        if flag == W_F_FOUND { app.s_max = v; }
+        return;
+    }
+    if target == W_T_PRECIP {
+        if app.s_precip_flag == W_F_FOUND { app.s_precip_flag = W_F_DUP; return; }
+        if v == W_PARSE_BAD { app.s_precip_flag = W_F_BAD; return; }
+        if v < 0 { v = 0; }
+        if v > 100 { v = 100; }
+        app.s_precip = v;
+        app.s_precip_flag = W_F_FOUND;
+        return;
+    }
+    // W_T_OBS
+    if app.s_obs_flag == W_F_FOUND { app.s_obs_flag = W_F_DUP; return; }
+    if v == W_PARSE_BAD { app.s_obs_flag = W_F_BAD; return; }
+    if v < 946684800 { v = 0; }
+    app.s_obs = v;
+    app.s_obs_flag = W_F_FOUND;
+}
+
+// Per-frame fetch/parse step: one bounded chunk read and at most one 128-byte
+// chunk of decoding per frame, so the frame loop never blocks.
+fn w_poll(app: WApp) {
+    if app.active != 1 { return; }
+    let state = fetch_poll_state(app.request);
+    if state == FETCH_FAILED {
+        w_fetch_fail(app, w_map_fetch_error(fetch_poll_metadata(app.request)));
+        return;
+    }
+    if state == FETCH_HEADERS && app.http_ok == 0 {
+        let http = fetch_poll_metadata(app.request);
+        if http != 200 {
+            fetch_cancel(app.request);
+            w_fetch_fail(app, WStatus::ProviderError);
+            return;
+        }
+        app.http_ok = 1;
+    }
+    if (state == FETCH_HEADERS || state == FETCH_BODY) && app.http_ok == 1
+        && app.chunk_pos >= app.chunk_len {
+        let read = fetch_read(app.request, app.chunk, len(app.chunk));
+        if read > 0 {
+            app.chunk_len = read;
+            app.chunk_pos = 0;
+        }
+    }
+    while app.doc_done == 0 {
+        let ev = JSON_NEED_MORE;
+        if app.chunk_pos < app.chunk_len {
+            ev = json_next(app.chunk + app.chunk_pos, app.chunk_len - app.chunk_pos);
+            app.chunk_pos = app.chunk_pos + json_consumed();
+            app.consumed = app.consumed + json_consumed();
+            if app.consumed > W_BODY_CAP {
+                fetch_cancel(app.request);
+                w_fetch_fail(app, WStatus::Oversized);
+                return;
+            }
+        } else {
+            if state != FETCH_COMPLETE { return; }
+            ev = json_finish();
+        }
+        if ev == JSON_NEED_MORE { continue; }
+        if ev == JSON_ERROR {
+            fetch_cancel(app.request);
+            w_fetch_fail(app, WStatus::BadData);
+            return;
+        }
+        if ev == JSON_END_DOC {
+            app.doc_done = 1;
+            if state != FETCH_COMPLETE { fetch_cancel(app.request); }
+            w_commit(app);
+            return;
+        }
+        if ev == JSON_KEY {
+            if json_depth() == 1 { w_take_key(app); }
+        } else if ev >= JSON_BEGIN_OBJECT && ev <= JSON_NULL
+            && ev != JSON_END_OBJECT && ev != JSON_END_ARRAY {
+            w_take_value(app, ev);
+        }
+    }
+}
+
+fn w_cancel(app: WApp) {
+    fetch_cancel(app.request);
+    app.active = 0;
+    app.request = -1;
+    if app.have == 1 { app.fresh = 0; }
+    app.status = WStatus::Ready;
+    app.dirty = 1;
+}
+
+// Start a refresh when allowed: needs a configured location, respects the
+// bounded app-level refresh interval, and never runs two requests at once.
+fn w_attempt_start(app: WApp) {
+    if app.active == 1 { return; }
+    if app.cfg_loc_len == 0 {
+        app.status = WStatus::NoLocation;
+        app.dirty = 1;
+        return;
+    }
+    let now = time_query(TIME_MONOTONIC_MS);
+    if app.last_start >= 0 {
+        if ((now - app.last_start) & TIME_MONOTONIC_MASK) < W_COOLDOWN_MS {
+            app.status = WStatus::Cooldown;
+            app.dirty = 1;
+            return;
+        }
+    }
+    buf url[80];
+    let off = w_append(url, len(url), 0, "https://weather.example/kwd1/", 29);
+    off = w_append(url, len(url), off, app.cfg_loc, app.cfg_loc_len);
+    json_reset();
+    w_reset_stage(app);
+    let request = fetch_start(url, off);
+    if request < 0 {
+        w_fetch_fail(app, WStatus::Offline);
+        return;
+    }
+    app.request = request;
+    app.active = 1;
+    app.last_start = now;
+    app.status = WStatus::Loading;
+    app.dirty = 1;
+}
+
+// ---- presentation composition (bounded, integer-only) ----
+
+// Append "HH:MM" local time for a known Unix UTC second.
+fn w_compose_hhmm(dst: int, cap: int, off: int, utc: int) -> int {
+    let local = utc + time_query(TIME_OFFSET_MINUTES) * 60;
+    if local < 0 { local = 0; }
+    let secs = local % 86400;
+    off = w_fmt_u2(dst, cap, off, secs / 3600);
+    if off < cap { heap_set_u8(dst + off, 58); off = off + 1; }
+    return w_fmt_u2(dst, cap, off, (secs % 3600) / 60);
+}
+
+fn w_to_display(app: WApp, dc: int) -> int {
+    if app.unit_f == 1 { return (dc * 9) / 5 + 320; }
+    return dc;
+}
+
+// Rebuild every composed display string from the committed snapshot.
+fn w_compose(app: WApp) {
+    if app.have == 1 {
+        app.loc_text_len = w_append(app.loc_text, len(app.loc_text), 0, app.loc, app.loc_len);
+        app.cond_line = W_COND_FIRST + app.cond;
+    } else {
+        app.loc_text_len = w_append(app.loc_text, len(app.loc_text), 0,
+            weather_text.line_ptr(W_LINE_NODATA), weather_text.line_len(W_LINE_NODATA));
+        app.cond_line = W_COND_FIRST;
+    }
+
+    let unit_str = "°C";
+    if app.unit_f == 1 { unit_str = "°F"; }
+
+    let off = 0;
+    if app.have == 1 {
+        off = w_fmt_dc(app.temp_text, len(app.temp_text), 0, w_to_display(app, app.temp));
+        off = w_append(app.temp_text, len(app.temp_text), off, unit_str, 3);
+    } else {
+        off = w_append(app.temp_text, len(app.temp_text), 0, "--", 2);
+    }
+    app.temp_text_len = off;
+
+    off = 0;
+    if app.have == 1 && (app.min != -10000 || app.max != -10000) {
+        if app.min != -10000 {
+            off = w_fmt_dc(app.range_text, len(app.range_text), off, w_to_display(app, app.min));
+        } else {
+            off = w_append(app.range_text, len(app.range_text), off, "--", 2);
+        }
+        off = w_append(app.range_text, len(app.range_text), off, "/", 1);
+        if app.max != -10000 {
+            off = w_fmt_dc(app.range_text, len(app.range_text), off, w_to_display(app, app.max));
+        } else {
+            off = w_append(app.range_text, len(app.range_text), off, "--", 2);
+        }
+        off = w_append(app.range_text, len(app.range_text), off, unit_str, 3);
+    } else {
+        off = w_append(app.range_text, len(app.range_text), 0, "--", 2);
+    }
+    app.range_text_len = off;
+
+    off = 0;
+    if app.have == 1 && app.precip >= 0 {
+        off = w_fmt_int(app.precip_text, len(app.precip_text), 0, app.precip);
+        off = w_append(app.precip_text, len(app.precip_text), off, "%", 1);
+    } else {
+        off = w_append(app.precip_text, len(app.precip_text), 0, "--", 2);
+    }
+    app.precip_text_len = off;
+
+    // Updated line: [stale ][@HH:MM | time?] [+age | ?].
+    off = 0;
+    if app.have == 0 {
+        app.upd_text_len = 0;
+        return;
+    }
+    if app.fresh == 0 {
+        off = w_append(app.upd_text, len(app.upd_text), off,
+            weather_text.line_ptr(W_LINE_STALE), weather_text.line_len(W_LINE_STALE));
+        off = w_append(app.upd_text, len(app.upd_text), off, " ", 1);
+    }
+    if app.obs > 0 {
+        off = w_append(app.upd_text, len(app.upd_text), off, "@", 1);
+        off = w_compose_hhmm(app.upd_text, len(app.upd_text), off, app.obs);
+    } else {
+        off = w_append(app.upd_text, len(app.upd_text), off,
+            weather_text.line_ptr(W_LINE_TIME_UNKNOWN),
+            weather_text.line_len(W_LINE_TIME_UNKNOWN));
+    }
+    let now = time_query(TIME_UTC_SECONDS);
+    if now > 0 && app.fetched > 0 && now >= app.fetched {
+        let mins = (now - app.fetched) / 60;
+        if mins > 5999 { mins = 5999; }
+        off = w_append(app.upd_text, len(app.upd_text), off, " +", 2);
+        off = w_fmt_int(app.upd_text, len(app.upd_text), off, mins);
+        off = w_append(app.upd_text, len(app.upd_text), off, "m", 1);
+    } else {
+        off = w_append(app.upd_text, len(app.upd_text), off, " ?", 2);
+    }
+    app.upd_text_len = off;
+}
+
+// One atomic packet for everything dynamic (KOTO-0230 update builder).
+fn w_sync(app: WApp) {
+    buf update[ui_update_capacity(8, W_STATUS_BYTES + W_BTN_BYTES + W_COND_BYTES
+        + W_LOC_TEXT_BYTES + W_TEMP_TEXT_BYTES + W_RANGE_TEXT_BYTES
+        + W_PRECIP_TEXT_BYTES + W_UPD_TEXT_BYTES)];
+    if weather_update_builder.begin(update, len(update), 8) != 0 {
+        w_fail_hard(WError::SyncBegin);
+    }
+    weather_update_builder.text_resource(WWidget::Status, weather_text,
+        W_STATUS_FIRST + app.status);
+    let refresh_line = W_LINE_REFRESH;
+    if app.active == 1 { refresh_line = W_LINE_CANCEL; }
+    weather_update_builder.text_resource(WWidget::Refresh, weather_text, refresh_line);
+    weather_update_builder.text_resource(WWidget::Cond, weather_text, app.cond_line);
+    weather_update_builder.text(WWidget::Loc, app.loc_text, app.loc_text_len);
+    weather_update_builder.text(WWidget::Temp, app.temp_text, app.temp_text_len);
+    weather_update_builder.text(WWidget::Range, app.range_text, app.range_text_len);
+    weather_update_builder.text(WWidget::Precip, app.precip_text, app.precip_text_len);
+    weather_update_builder.text(WWidget::Updated, app.upd_text, app.upd_text_len);
+    if weather_update_builder.submit() != 0 { w_fail_hard(WError::SyncSubmit); }
+    if ui_present() != 0 { w_fail_hard(WError::SyncPresent); }
+}
+
+// Re-label the resource-only components after a locale change; the dynamic
+// strings follow through the next dirty sync.
+fn w_apply_locale(app: WApp) {
+    buf update[ui_update_capacity(3, W_TITLE_BYTES + W_FIELD_BYTES + W_UNIT_BYTES)];
+    if weather_update_builder.begin(update, len(update), 3) != 0 {
+        w_fail_hard(WError::ApplyBegin);
+    }
+    weather_update_builder.text_resource(WWidget::Panel, weather_text, W_LINE_TITLE);
+    weather_update_builder.text_resource(WWidget::Field, weather_text, W_LINE_FIELD);
+    weather_update_builder.text_resource(WWidget::Unit, weather_text, W_LINE_UNIT);
+    if weather_update_builder.submit() != 0 { w_fail_hard(WError::ApplySubmit); }
+    if ui_present() != 0 { w_fail_hard(WError::ApplyPresent); }
+    app.dirty = 1;
+}
+
+// Mount the retained tree once at boot.
+fn w_mount(app: WApp) {
+    if weather_mount_builder.begin(app.mount, len(app.mount),
+        W_MOUNT_RECORDS, WWidget::Panel, WWidget::Field) != 0 {
+        w_fail_hard(WError::MountBegin);
+    }
+    weather_mount_builder.panel(
+        WWidget::Panel, UI_PARENT_ROOT, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        0, 0, 320, 320, weather_text.line_ptr(W_LINE_TITLE),
+        weather_text.line_len(W_LINE_TITLE), W_TITLE_BYTES, 8, 20);
+    weather_mount_builder.text_field(
+        WWidget::Field, WWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 32, 296, 32, weather_text.line_ptr(W_LINE_FIELD),
+        weather_text.line_len(W_LINE_FIELD), W_FIELD_BYTES,
+        app.cfg_loc, app.cfg_loc_len, W_CFG_LOC_BYTES, UI_CURSOR_END, false);
+    weather_mount_builder.button(
+        WWidget::Refresh, WWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 72, 142, 28, weather_text.line_ptr(W_LINE_REFRESH),
+        weather_text.line_len(W_LINE_REFRESH), W_BTN_BYTES, false);
+    weather_mount_builder.button(
+        WWidget::Unit, WWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        166, 72, 142, 28, weather_text.line_ptr(W_LINE_UNIT),
+        weather_text.line_len(W_LINE_UNIT), W_UNIT_BYTES, false);
+    weather_mount_builder.label(
+        WWidget::Status, WWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED | UI_FLAG_ELLIPSIS,
+        12, 108, 296, 20, weather_text.line_ptr(W_STATUS_FIRST + app.status),
+        weather_text.line_len(W_STATUS_FIRST + app.status), W_STATUS_BYTES,
+        UiAlignment::Start);
+    weather_mount_builder.label(
+        WWidget::Loc, WWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED | UI_FLAG_ELLIPSIS,
+        12, 136, 296, 20, app.loc_text, app.loc_text_len, W_LOC_TEXT_BYTES,
+        UiAlignment::Start);
+    weather_mount_builder.label(
+        WWidget::Cond, WWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED | UI_FLAG_ELLIPSIS,
+        12, 160, 296, 20, weather_text.line_ptr(app.cond_line),
+        weather_text.line_len(app.cond_line), W_COND_BYTES, UiAlignment::Start);
+    weather_mount_builder.label(
+        WWidget::Temp, WWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 184, 296, 24, app.temp_text, app.temp_text_len, W_TEMP_TEXT_BYTES,
+        UiAlignment::Start);
+    weather_mount_builder.label(
+        WWidget::Range, WWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 212, 296, 20, app.range_text, app.range_text_len, W_RANGE_TEXT_BYTES,
+        UiAlignment::Start);
+    weather_mount_builder.label(
+        WWidget::Precip, WWidget::Panel, UI_FLAG_VISIBLE | UI_FLAG_ENABLED,
+        12, 236, 296, 20, app.precip_text, app.precip_text_len, W_PRECIP_TEXT_BYTES,
+        UiAlignment::Start);
+    weather_mount_builder.label(
+        WWidget::Updated, WWidget::Panel,
+        UI_FLAG_VISIBLE | UI_FLAG_ENABLED | UI_FLAG_ELLIPSIS,
+        12, 260, 296, 20, app.upd_text, app.upd_text_len, W_UPD_TEXT_BYTES,
+        UiAlignment::Start);
+    let packet_len = weather_mount_builder.finish();
+    if packet_len < 0 { w_fail_hard(WError::MountFinish); }
+    if ui_mount(app.mount, packet_len) != 0 { w_fail_hard(WError::MountSubmit); }
+    if ui_present() != 0 { w_fail_hard(WError::MountPresent); }
+}

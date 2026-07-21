@@ -149,7 +149,34 @@ impl<const N: usize> SkkIndex<N> {
         reader: &mut R,
         window: &mut [u8],
     ) -> Result<Self, SkkError> {
-        let mut entries = [IndexEntry::EMPTY; N];
+        let mut index = Self::empty();
+        Self::build_from_reader_into(reader, window, &mut index)?;
+        Ok(index)
+    }
+
+    /// Empty index: no buckets over a zero-length dictionary.
+    pub const fn empty() -> Self {
+        Self {
+            entries: [IndexEntry::EMPTY; N],
+            count: 0,
+            dict_len: 0,
+        }
+    }
+
+    /// [`Self::build_from_reader`] writing through `out` instead of returning
+    /// the index by value (KOTO-0252): on the device the ~2.3 KiB index would
+    /// otherwise land on the launch-path frame as a temporary before reaching
+    /// its resident cell. On `Err`, `out` holds an unspecified partial index
+    /// and must not be used.
+    pub fn build_from_reader_into<R: SkkRead>(
+        reader: &mut R,
+        window: &mut [u8],
+        out: &mut Self,
+    ) -> Result<(), SkkError> {
+        out.entries.fill(IndexEntry::EMPTY);
+        out.count = 0;
+        out.dict_len = 0;
+        let entries = &mut out.entries;
         let mut count = 0;
         let mut offset: u64 = 0;
 
@@ -168,7 +195,7 @@ impl<const N: usize> SkkIndex<N> {
                     Self::note_reading(
                         entry.reading,
                         offset as u32 + pos as u32,
-                        &mut entries,
+                        entries,
                         &mut count,
                     )?;
                 }
@@ -183,7 +210,7 @@ impl<const N: usize> SkkIndex<N> {
             if n < window.len() {
                 // `read_fully` came up short with no newline: final line at EOF.
                 if let Some(entry) = parse_entry(chunk) {
-                    Self::note_reading(entry.reading, offset as u32, &mut entries, &mut count)?;
+                    Self::note_reading(entry.reading, offset as u32, entries, &mut count)?;
                 }
                 offset += n as u64;
                 break;
@@ -192,7 +219,7 @@ impl<const N: usize> SkkIndex<N> {
             // (out of the packaging contract). Register its bucket from the
             // head, then stream forward to the next newline.
             if let Some(reading) = parse_reading_prefix(chunk) {
-                Self::note_reading(reading, offset as u32, &mut entries, &mut count)?;
+                Self::note_reading(reading, offset as u32, entries, &mut count)?;
             }
             offset += n as u64;
             loop {
@@ -216,11 +243,9 @@ impl<const N: usize> SkkIndex<N> {
         if offset > u32::MAX as u64 {
             return Err(SkkError::DictionaryTooLarge);
         }
-        Ok(Self {
-            entries,
-            count,
-            dict_len: offset as u32,
-        })
+        out.count = count;
+        out.dict_len = offset as u32;
+        Ok(())
     }
 
     /// Register `reading`'s leading character as a bucket if it starts one.

@@ -1,14 +1,20 @@
 use core::cmp::Ordering;
 
+use koto_ui::{
+    Button as UiButton, ControlStyle as UiControlStyle, Label as UiLabel, Panel as UiPanel,
+    ResponseKind, Theme as UiTheme, UiAction, UiContext, UiEvent, UiRect, WidgetId,
+};
+
 use crate::font::BitmapFont;
 use crate::hal::{InputState, PowerState};
 use crate::package::{PackageIconTheme, PackageInfo, PackageList, MAX_CATEGORY_LEN, MAX_PACKAGES};
 use crate::raster::{Canvas, Rgb565};
 use crate::render::{RenderCommand, RenderCommandList, RenderError, RenderSurface};
-use crate::KOTO_COPYRIGHT_NOTICE;
+use crate::ui_render::CanvasUiPainter;
+use crate::{ConfigSnapshot, Locale, KOTO_COPYRIGHT_NOTICE};
 
 /// Title shown in the shell header band.
-pub const SHELL_TITLE: &str = "ホーム";
+pub const SHELL_TITLE: &str = "Home";
 /// Width in pixels of each page-indicator triangle.
 pub const SHELL_PAGE_ARROW_WIDTH: i32 = 6;
 /// Left padding for header and row text, in pixels.
@@ -21,6 +27,151 @@ pub const SHELL_DETAIL_TEXT_CAPACITY: usize = 128;
 pub const SHELL_SELECTION_FEEDBACK_FRAMES: u8 = 6;
 pub const SHELL_PAGE_FEEDBACK_FRAMES: u8 = 8;
 pub const SHELL_PANE_TRANSITION_FRAMES: u8 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShellStrings {
+    title: &'static str,
+    open: &'static str,
+    settings: &'static str,
+    favorite: &'static str,
+    sort: &'static str,
+    category: &'static str,
+    details: &'static str,
+    system: &'static str,
+    sort_default: &'static str,
+    sort_name: &'static str,
+    sort_favorite: &'static str,
+    saved: &'static str,
+    unsaved: &'static str,
+    no_description: &'static str,
+    last_opened: &'static str,
+    size: &'static str,
+    favorite_yes: &'static str,
+    favorite_no: &'static str,
+    system_memory: &'static str,
+    sram_free_min: &'static str,
+    static_resident: &'static str,
+    stack_peak: &'static str,
+    core1_audio_free: &'static str,
+    app_heap: &'static str,
+    window: &'static str,
+    none: &'static str,
+    return_hint: &'static str,
+    sort_prefix: &'static str,
+    category_prefix: &'static str,
+    all: &'static str,
+    selected_prefix: &'static str,
+}
+
+const SHELL_EN_US: ShellStrings = ShellStrings {
+    title: SHELL_TITLE,
+    open: "Open",
+    settings: "Settings",
+    favorite: "Favorite",
+    sort: "Sort",
+    category: "Category",
+    details: "Details",
+    system: "System",
+    sort_default: "Default",
+    sort_name: "Name",
+    sort_favorite: "★ first",
+    saved: "Saved",
+    unsaved: "Unsaved",
+    no_description: "(No description)",
+    last_opened: "Last opened",
+    size: "Size",
+    favorite_yes: "★ Yes",
+    favorite_no: "☆ No",
+    system_memory: "System / Memory",
+    sram_free_min: "SRAM free min",
+    static_resident: "  Static resident",
+    stack_peak: "  Stack peak",
+    core1_audio_free: "Core1 audio free",
+    app_heap: "App heap",
+    window: "  window ",
+    none: "---- (none)",
+    return_hint: "F5 / Enter to return",
+    sort_prefix: "Sort:",
+    category_prefix: "  Category:",
+    all: "All",
+    selected_prefix: "Selected:",
+};
+
+const SHELL_JA_JP: ShellStrings = ShellStrings {
+    title: "ホーム",
+    open: "開く",
+    settings: "設定",
+    favorite: "お気に入り",
+    sort: "並替",
+    category: "カテゴリ",
+    details: "詳細",
+    system: "システム",
+    sort_default: "既定",
+    sort_name: "名前",
+    sort_favorite: "★優先",
+    saved: "保存済",
+    unsaved: "未保存",
+    no_description: "(説明なし)",
+    last_opened: "最後に開いた日時",
+    size: "サイズ",
+    favorite_yes: "★ はい",
+    favorite_no: "☆ いいえ",
+    system_memory: "システム / メモリ",
+    sram_free_min: "SRAM 空き最小",
+    static_resident: "  静的常駐",
+    stack_peak: "  スタック最大",
+    core1_audio_free: "Core1 音声空き",
+    app_heap: "アプリ heap",
+    window: "  窓",
+    none: "----（なし）",
+    return_hint: "F5 / Enter で戻る",
+    sort_prefix: "並び:",
+    category_prefix: "  分類:",
+    all: "全部",
+    selected_prefix: "選択中:",
+};
+
+const SHELL_QPS_PLOC: ShellStrings = ShellStrings {
+    title: "Home--",
+    open: "Open--",
+    settings: "Settings---",
+    favorite: "Favorite---",
+    sort: "Sort--",
+    category: "Category---",
+    details: "Details---",
+    system: "System---",
+    sort_default: "Default---",
+    sort_name: "Name--",
+    sort_favorite: "★ Favorite first------",
+    saved: "Saved--",
+    unsaved: "Unsaved---",
+    no_description: "(No description)------",
+    last_opened: "Last opened-----",
+    size: "Size--",
+    favorite_yes: "★ Yes--",
+    favorite_no: "☆ No-",
+    system_memory: "System / Memory------",
+    sram_free_min: "SRAM free min-----",
+    static_resident: "  Static resident------",
+    stack_peak: "  Stack peak----",
+    core1_audio_free: "Core1 audio free------",
+    app_heap: "App heap---",
+    window: "  window--- ",
+    none: "---- (none)----",
+    return_hint: "F5 / Enter to return--------",
+    sort_prefix: "Sort:--",
+    category_prefix: "  Category:----",
+    all: "All-",
+    selected_prefix: "Selected:----",
+};
+
+const fn shell_strings(locale: Locale) -> &'static ShellStrings {
+    match locale {
+        Locale::EnUs => &SHELL_EN_US,
+        Locale::JaJp => &SHELL_JA_JP,
+        Locale::QpsPloc => &SHELL_QPS_PLOC,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShellSound {
@@ -95,6 +246,14 @@ impl Default for ShellPalette {
 pub const SHELL_SURFACE: RenderSurface =
     RenderSurface::new(320, 320, crate::hal::PixelFormat::Rgb565);
 pub const SHELL_HEADER_HEIGHT: i32 = 20;
+/// Clock-only header damage, sized for `YYYY/MM/DD HH:MM` with the bundled
+/// half-width font and kept separate from the right system-status cluster.
+pub const SHELL_CLOCK_RECT: crate::hal::Rect = crate::hal::Rect {
+    x: 94,
+    y: 0,
+    w: 124,
+    h: SHELL_HEADER_HEIGHT,
+};
 /// Secondary status strip directly above the command bar (free memory, selection).
 pub const SHELL_STATUS_STRIP_HEIGHT: i32 = 14;
 /// Bottom command bar listing available shell actions.
@@ -150,6 +309,7 @@ pub struct ShellItem {
 pub enum ShellAction {
     None,
     Launch(PackageInfo),
+    OpenConfig,
 }
 
 /// One entry in the bottom command bar: a key chip, an action label, an optional
@@ -163,7 +323,34 @@ pub struct ShellCommand {
 }
 
 /// Number of entries in the shell command bar.
-pub const SHELL_COMMAND_COUNT: usize = 6;
+pub const SHELL_COMMAND_COUNT: usize = 7;
+
+/// Semantic command identities shared by keyboard adapters and the KotoUI
+/// command-bar controls. Physical key codes remain outside the Shell model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShellCommandId {
+    Open,
+    Settings,
+    Favorite,
+    Sort,
+    Category,
+    Details,
+    System,
+}
+
+impl ShellCommandId {
+    const fn index(self) -> usize {
+        match self {
+            Self::Open => 0,
+            Self::Settings => 1,
+            Self::Favorite => 2,
+            Self::Sort => 3,
+            Self::Category => 4,
+            Self::Details => 5,
+            Self::System => 6,
+        }
+    }
+}
 
 /// Launcher sort order, cycled by the sort command.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -178,11 +365,11 @@ pub enum SortMode {
 }
 
 impl SortMode {
-    pub fn label(self) -> &'static str {
+    fn label(self, strings: &ShellStrings) -> &'static str {
         match self {
-            SortMode::Default => "既定",
-            SortMode::Name => "名前",
-            SortMode::Favorite => "★優先",
+            SortMode::Default => strings.sort_default,
+            SortMode::Name => strings.sort_name,
+            SortMode::Favorite => strings.sort_favorite,
         }
     }
 
@@ -204,6 +391,40 @@ pub struct ShellClock {
     pub day: u8,
     pub hour: u8,
     pub minute: u8,
+}
+
+/// Coarse Wi-Fi signal shown by the Shell header antenna pictogram.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WifiSignal {
+    Unknown,
+    Weak,
+    Fair,
+    Good,
+    Excellent,
+}
+
+impl WifiSignal {
+    pub const fn from_rssi_dbm(rssi_dbm: i8) -> Self {
+        if rssi_dbm >= -55 {
+            Self::Excellent
+        } else if rssi_dbm >= -67 {
+            Self::Good
+        } else if rssi_dbm >= -75 {
+            Self::Fair
+        } else {
+            Self::Weak
+        }
+    }
+
+    const fn bars(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Weak => 1,
+            Self::Fair => 2,
+            Self::Good => 3,
+            Self::Excellent => 4,
+        }
+    }
 }
 
 /// Removable storage (SD card) availability for the header indicator.
@@ -292,6 +513,8 @@ pub struct ShellState {
     sort_mode: SortMode,
     category_filter: [u8; MAX_CATEGORY_LEN],
     category_filter_len: usize,
+    locale: Locale,
+    locale_generation: u32,
     power_state: PowerState,
     detail_pane: bool,
     /// When set, the launcher is replaced by the system/memory status overlay
@@ -299,6 +522,7 @@ pub struct ShellState {
     system_view: bool,
     memory: MemoryStatus,
     clock: Option<ShellClock>,
+    wifi_signal: Option<WifiSignal>,
     storage: StorageStatus,
     save_status: SaveStatus,
     selection_feedback_frames: u8,
@@ -335,11 +559,14 @@ impl ShellState {
             sort_mode: SortMode::Default,
             category_filter: [0; MAX_CATEGORY_LEN],
             category_filter_len: 0,
+            locale: Locale::EnUs,
+            locale_generation: 1,
             power_state: PowerState::unsupported(),
             detail_pane: true,
             system_view: false,
             memory: MemoryStatus::unknown(),
             clock: None,
+            wifi_signal: None,
             storage: StorageStatus::Unknown,
             save_status: SaveStatus::Unknown,
             selection_feedback_frames: 0,
@@ -349,6 +576,28 @@ impl ShellState {
             pane_transition_frames: 0,
             pending_sound: None,
         }
+    }
+
+    pub fn locale(&self) -> Locale {
+        self.locale
+    }
+
+    pub fn locale_generation(&self) -> u32 {
+        self.locale_generation
+    }
+
+    /// Apply the read-only shared configuration snapshot used by runtime apps.
+    /// Returns whether Shell text changed and needs repainting.
+    pub fn apply_config_snapshot(&mut self, snapshot: ConfigSnapshot) -> bool {
+        let changed =
+            self.locale != snapshot.locale || self.locale_generation != snapshot.locale_generation;
+        self.locale = snapshot.locale;
+        self.locale_generation = snapshot.locale_generation;
+        changed
+    }
+
+    fn strings(&self) -> &'static ShellStrings {
+        shell_strings(self.locale)
     }
 
     /// Refill the catalog in place and rebuild the view (KOTO-0172).
@@ -704,8 +953,37 @@ impl ShellState {
         self.clock = Some(clock);
     }
 
+    /// Updates the displayed minute and reports whether clock-only repaint is
+    /// required. Seconds are intentionally absent from [`ShellClock`].
+    pub fn set_clock_if_minute_changed(&mut self, clock: ShellClock) -> bool {
+        if self.clock == Some(clock) {
+            return false;
+        }
+        self.clock = Some(clock);
+        true
+    }
+
     pub fn clear_clock(&mut self) {
         self.clock = None;
+    }
+
+    pub fn wifi_signal(&self) -> Option<WifiSignal> {
+        self.wifi_signal
+    }
+
+    /// Updates connection visibility and RSSI-derived bars, returning whether
+    /// the right-side status region needs repainting.
+    pub fn set_wifi_connection(&mut self, connected: bool, rssi_dbm: Option<i8>) -> bool {
+        let signal = connected.then(|| {
+            rssi_dbm
+                .map(WifiSignal::from_rssi_dbm)
+                .unwrap_or(WifiSignal::Unknown)
+        });
+        if self.wifi_signal == signal {
+            return false;
+        }
+        self.wifi_signal = signal;
+        true
     }
 
     /// `YYYY/MM/DD HH:MM`, or a `----/--/-- --:--` placeholder when unset.
@@ -755,16 +1033,23 @@ impl ShellState {
     /// to a real input route.
     pub fn command_bar(&self) -> [ShellCommand; SHELL_COMMAND_COUNT] {
         let has_selection = self.selected_package().is_some();
+        let strings = self.strings();
         [
             ShellCommand {
                 key: "Enter",
-                label: "開く",
+                label: strings.open,
                 state: None,
                 enabled: has_selection,
             },
             ShellCommand {
+                key: "F1",
+                label: strings.settings,
+                state: None,
+                enabled: true,
+            },
+            ShellCommand {
                 key: "F2",
-                label: "お気に入り",
+                label: strings.favorite,
                 state: Some(if self.selected_is_favorite() {
                     "★"
                 } else {
@@ -774,36 +1059,102 @@ impl ShellState {
             },
             ShellCommand {
                 key: "F3",
-                label: "並替",
-                state: Some(self.sort_mode.label()),
+                label: strings.sort,
+                state: Some(self.sort_mode.label(strings)),
                 enabled: true,
             },
             ShellCommand {
                 key: "F4",
-                label: "カテゴリ",
+                label: strings.category,
                 state: None,
                 enabled: true,
             },
             ShellCommand {
                 key: "BS",
-                label: "詳細",
+                label: strings.details,
                 state: Some(if self.detail_pane { "ON" } else { "OFF" }),
                 enabled: true,
             },
             ShellCommand {
                 key: "F5",
-                label: "システム",
+                label: strings.system,
                 state: None,
                 enabled: true,
             },
         ]
     }
 
+    /// Route a device-independent event through the command's KotoUI button
+    /// and apply its semantic response to the existing Shell state machine.
+    /// Simulator and firmware key maps both call this entry point.
+    pub fn dispatch_command_event(
+        &mut self,
+        command: ShellCommandId,
+        event: UiEvent,
+    ) -> ShellAction {
+        let descriptor = self.command_bar()[command.index()];
+        let bounds = UiRect::new(0, 0, 1, 1);
+        let mut context = UiContext::<1>::new(bounds, UiTheme::DARK);
+        let mut button = UiButton::new(
+            WidgetId::new(0x2170 + command.index() as u16),
+            bounds,
+            descriptor.key,
+        )
+        .with_semantic_label(descriptor.label);
+        button.set_enabled(descriptor.enabled, &mut context);
+        button.set_focused(true, &mut context);
+        let Some(response) = button.handle_event(event, &mut context) else {
+            return ShellAction::None;
+        };
+        if response.kind != ResponseKind::Activated {
+            return ShellAction::None;
+        }
+
+        match command {
+            ShellCommandId::Open => {
+                let Some(package) = self.selected_package().copied() else {
+                    return ShellAction::None;
+                };
+                self.pending_sound = Some(ShellSound::Confirm);
+                ShellAction::Launch(package)
+            }
+            ShellCommandId::Settings => ShellAction::OpenConfig,
+            ShellCommandId::Favorite => {
+                self.toggle_selected_favorite();
+                ShellAction::None
+            }
+            ShellCommandId::Sort => {
+                self.cycle_sort();
+                ShellAction::None
+            }
+            ShellCommandId::Category => {
+                self.cycle_category();
+                ShellAction::None
+            }
+            ShellCommandId::Details => {
+                self.toggle_detail_pane();
+                self.page_feedback_frames = SHELL_PAGE_FEEDBACK_FRAMES;
+                self.pending_sound = Some(ShellSound::Cancel);
+                ShellAction::None
+            }
+            ShellCommandId::System => {
+                self.toggle_system_view();
+                ShellAction::None
+            }
+        }
+    }
+
+    /// Activate a Shell command from a physical shortcut after the host has
+    /// mapped its key code to a semantic command identity.
+    pub fn activate_command(&mut self, command: ShellCommandId) -> ShellAction {
+        self.dispatch_command_event(command, UiEvent::pressed(UiAction::Activate))
+    }
+
     /// Header save badge text, or `None` when the state is unknown.
     fn save_indicator_text(&self) -> Option<&'static str> {
         match self.save_status {
-            SaveStatus::Saved => Some("保存済"),
-            SaveStatus::Unsaved => Some("未保存"),
+            SaveStatus::Saved => Some(self.strings().saved),
+            SaveStatus::Unsaved => Some(self.strings().unsaved),
             SaveStatus::Unknown => None,
         }
     }
@@ -863,18 +1214,10 @@ impl ShellState {
             self.pending_sound = Some(ShellSound::Navigation);
         }
         if input.pressed.cancel {
-            // The details pane is toggleable in place of a separate screen; the
-            // grid relayouts, so the caller should repaint the full surface.
-            self.toggle_detail_pane();
-            self.page_feedback_frames = SHELL_PAGE_FEEDBACK_FRAMES;
-            self.pending_sound = Some(ShellSound::Cancel);
-            return ShellAction::None;
+            return self.activate_command(ShellCommandId::Details);
         }
         if input.pressed.confirm {
-            if let Some(package) = self.selected_package().copied() {
-                self.pending_sound = Some(ShellSound::Confirm);
-                return ShellAction::Launch(package);
-            }
+            return self.activate_command(ShellCommandId::Open);
         }
 
         ShellAction::None
@@ -1059,7 +1402,9 @@ impl ShellState {
         let icon_y = (SHELL_HEADER_HEIGHT - icon) / 2;
         draw_home_icon(canvas, SHELL_TEXT_PADDING, icon_y, icon, palette.header_fg);
         let title_x = SHELL_TEXT_PADDING + icon + 4;
-        canvas.draw_text(title_x, ty, font, SHELL_TITLE, palette.header_fg);
+        let title = clip_text_to_width(font, self.strings().title, 72);
+        canvas.draw_text(title_x, ty, font, title, palette.header_fg);
+        let title_right = title_x + text_width(font, title);
 
         // Right cluster, laid out from the right edge leftward.
         let mut right = i32::from(SHELL_SURFACE.width) - SHELL_TEXT_PADDING;
@@ -1088,18 +1433,18 @@ impl ShellState {
         right -= 8;
 
         right = self.paint_battery(canvas, font, palette, right, mid_y, ty);
+        right = self.paint_wifi_signal(canvas, palette, right, mid_y);
 
         // Centered clock, kept clear of the side clusters.
         let clock = self.clock_text();
         if let Some(text) = clock.as_str() {
             let cw = text_width(font, text);
-            let cx = (i32::from(SHELL_SURFACE.width) - cw) / 2;
             let clock_color = if self.clock.is_some() {
                 palette.header_fg
             } else {
                 palette.status_dim
             };
-            if cx + cw < right {
+            if let Some(cx) = shell_clock_x(cw, title_right, right) {
                 canvas.draw_text(cx, ty, font, text, clock_color);
             }
         }
@@ -1157,6 +1502,31 @@ impl ShellState {
             palette.status_dim,
         );
         right - 8
+    }
+
+    fn paint_wifi_signal(
+        &self,
+        canvas: &mut Canvas<'_>,
+        palette: &ShellPalette,
+        right: i32,
+        mid_y: i32,
+    ) -> i32 {
+        let Some(signal) = self.wifi_signal else {
+            return right;
+        };
+        let width = 15;
+        let height = 11;
+        let x = right - width;
+        let y = mid_y - height / 2;
+        draw_wifi_signal_icon(
+            canvas,
+            x,
+            y,
+            signal.bars(),
+            palette.header_fg,
+            palette.status_dim,
+        );
+        x - 6
     }
 
     /// Launcher icon grid (current page) for the current layout mode.
@@ -1409,7 +1779,17 @@ impl ShellState {
         palette: &ShellPalette,
         rect: crate::hal::Rect,
     ) {
-        canvas.fill_rect(rect, palette.pane_bg);
+        let panel_theme = shell_ui_theme(
+            palette.pane_bg,
+            palette.pane_fg,
+            palette.separator,
+            palette.status_dim,
+            0,
+        );
+        let panel = UiPanel::new(to_ui_rect(rect)).with_padding(0);
+        let mut painter = CanvasUiPainter::new(canvas, font);
+        let _ = panel.paint(&mut painter, to_ui_rect(rect), &panel_theme);
+        let canvas = painter.canvas_mut();
         canvas.fill_rect(
             crate::hal::Rect {
                 x: rect.x,
@@ -1432,11 +1812,40 @@ impl ShellState {
         // Title: favorite star + name.
         let mut name_x = x;
         if package.is_favorite() {
-            name_x = canvas.draw_text(x, y, font, "★", palette.pane_accent) + 2;
+            paint_shell_ui_label(
+                canvas,
+                font,
+                rect,
+                WidgetId::new(0x2160),
+                crate::hal::Rect {
+                    x,
+                    y,
+                    w: text_width(font, "★"),
+                    h: cell,
+                },
+                "★",
+                palette.pane_bg,
+                palette.pane_accent,
+            );
+            name_x = x + text_width(font, "★") + 2;
         }
         let name_w = content_w - (name_x - x);
         let name = clip_text_to_width(font, package.name(), name_w);
-        canvas.draw_text(name_x, y, font, name, palette.pane_accent);
+        paint_shell_ui_label(
+            canvas,
+            font,
+            rect,
+            WidgetId::new(0x2161),
+            crate::hal::Rect {
+                x: name_x,
+                y,
+                w: name_w,
+                h: cell,
+            },
+            name,
+            palette.pane_bg,
+            palette.pane_accent,
+        );
         y += cell + 3;
         canvas.fill_rect(
             crate::hal::Rect {
@@ -1450,7 +1859,8 @@ impl ShellState {
         y += 5;
 
         // Description, wrapped to the pane width.
-        let description = package.description().unwrap_or("(説明なし)");
+        let strings = self.strings();
+        let description = package.description().unwrap_or(strings.no_description);
         y = draw_wrapped_text(
             canvas,
             x,
@@ -1473,16 +1883,34 @@ impl ShellState {
             x,
             y,
             content_w,
-            "最後に開いた日時",
+            strings.last_opened,
             "----/--/-- --:--",
         );
-        y = paint_pane_slot(canvas, font, palette, x, y, content_w, "サイズ", "-- KB");
+        y = paint_pane_slot(
+            canvas,
+            font,
+            palette,
+            x,
+            y,
+            content_w,
+            strings.size,
+            "-- KB",
+        );
         let category = package.category().unwrap_or("--");
-        y = paint_pane_slot(canvas, font, palette, x, y, content_w, "カテゴリ", category);
+        y = paint_pane_slot(
+            canvas,
+            font,
+            palette,
+            x,
+            y,
+            content_w,
+            strings.category,
+            category,
+        );
         let favorite = if package.is_favorite() {
-            "★ はい"
+            strings.favorite_yes
         } else {
-            "☆ いいえ"
+            strings.favorite_no
         };
         let _ = paint_pane_slot(
             canvas,
@@ -1491,7 +1919,7 @@ impl ShellState {
             x,
             y,
             content_w,
-            "お気に入り",
+            strings.favorite,
             favorite,
         );
     }
@@ -1514,8 +1942,11 @@ impl ShellState {
         let label_x = body.x + SHELL_TEXT_PADDING + 4;
         let value_x = body.x + 132;
         let mut y = body.y + 8;
+        let strings = self.strings();
 
-        canvas.draw_text(label_x, y, font, "システム / メモリ", palette.pane_accent);
+        let heading =
+            clip_text_to_width(font, strings.system_memory, body.w - 2 * (label_x - body.x));
+        canvas.draw_text(label_x, y, font, heading, palette.pane_accent);
         y += line_h + 3;
 
         // SRAM headroom is the headline; colour it by the KOTO-0170 margin.
@@ -1537,7 +1968,7 @@ impl ShellState {
             label_x,
             value_x,
             y,
-            "SRAM 空き最小",
+            strings.sram_free_min,
             sram.as_str(),
             palette.pane_fg,
             free_color,
@@ -1550,7 +1981,7 @@ impl ShellState {
             label_x,
             value_x,
             y,
-            "  静的常駐",
+            strings.static_resident,
             mem_kib_text(m.sram_static_used).as_str(),
             palette.pane_fg,
             palette.pane_fg,
@@ -1563,7 +1994,7 @@ impl ShellState {
             label_x,
             value_x,
             y,
-            "  スタック最大",
+            strings.stack_peak,
             mem_kib_text(m.stack_peak_used).as_str(),
             palette.pane_fg,
             palette.pane_fg,
@@ -1576,7 +2007,7 @@ impl ShellState {
             label_x,
             value_x,
             y,
-            "Core1 音声空き",
+            strings.core1_audio_free,
             mem_kib_text(m.core1_stack_free_min).as_str(),
             palette.pane_fg,
             palette.pane_fg,
@@ -1595,7 +2026,7 @@ impl ShellState {
             label_x,
             value_x,
             y,
-            "アプリ heap",
+            strings.app_heap,
             heap.as_str(),
             palette.pane_fg,
             palette.pane_fg,
@@ -1605,10 +2036,10 @@ impl ShellState {
         let mut psram = ShellDetailText::empty();
         if m.psram_present {
             psram.push_mib(m.psram_total);
-            psram.push_str("  窓");
+            psram.push_str(strings.window);
             psram.push_u32(u32::from(m.code_window_slots));
         } else {
-            psram.push_str("----（なし）");
+            psram.push_str(strings.none);
         }
         let psram_color = if m.psram_present {
             palette.status_ok
@@ -1642,7 +2073,7 @@ impl ShellState {
             label_x,
             hint_y,
             font,
-            "F5 / Enter で戻る",
+            clip_text_to_width(font, strings.return_hint, body.w - 2 * (label_x - body.x)),
             palette.status_dim,
         );
     }
@@ -1660,23 +2091,25 @@ impl ShellState {
         let ty = rect.y + ((rect.h - cell) / 2).max(0);
 
         // Left: sort mode and category filter.
+        let strings = self.strings();
         let mut left = ShellDetailText::empty();
-        left.push_str("並び:");
-        left.push_str(self.sort_mode.label());
-        left.push_str("  分類:");
-        left.push_str(self.category_filter().unwrap_or("全部"));
+        left.push_str(strings.sort_prefix);
+        left.push_str(self.sort_mode.label(strings));
+        left.push_str(strings.category_prefix);
+        left.push_str(self.category_filter().unwrap_or(strings.all));
+        let left = clip_text_to_width(font, left.as_str(), rect.w / 2 - SHELL_TEXT_PADDING);
         canvas.draw_text(
             rect.x + SHELL_TEXT_PADDING,
             ty,
             font,
-            left.as_str(),
+            left,
             palette.status_strip_fg,
         );
 
         // Right: selection / page summary.
         let mut line = ShellDetailText::empty();
         if let Some(package) = self.selected_package() {
-            line.push_str("選択中:");
+            line.push_str(strings.selected_prefix);
             line.push_str(package.name());
             line.push_str(" (");
             line.push_u32((self.selected + 1) as u32);
@@ -1684,7 +2117,7 @@ impl ShellState {
             line.push_u32(self.order_len as u32);
             line.push_str(")");
         }
-        let text = line.as_str();
+        let text = clip_text_to_width(font, line.as_str(), rect.w / 2 - SHELL_TEXT_PADDING);
         if !text.is_empty() {
             let w = text_width(font, text);
             let x = i32::from(SHELL_SURFACE.width) - SHELL_TEXT_PADDING - w;
@@ -1713,7 +2146,7 @@ impl ShellState {
         let limit = rect.x + rect.w - SHELL_TEXT_PADDING;
         let mut x = rect.x + SHELL_TEXT_PADDING;
 
-        for cmd in self.command_bar() {
+        for (index, cmd) in self.command_bar().into_iter().enumerate() {
             let key_w = text_width(font, cmd.key) + 4;
             let mut label_w = text_width(font, cmd.label);
             if let Some(state) = cmd.state {
@@ -1724,31 +2157,86 @@ impl ShellState {
                 break;
             }
 
-            let (key_fg, label_fg) = if cmd.enabled {
-                (palette.command_bar_fg, palette.command_bar_fg)
+            let label_fg = if cmd.enabled {
+                palette.command_bar_fg
             } else {
-                (palette.status_dim, palette.status_dim)
+                palette.status_dim
             };
-            if cmd.enabled {
-                canvas.fill_rect(
+            let key_rect = crate::hal::Rect {
+                x,
+                y: rect.y + 2,
+                w: key_w,
+                h: rect.h - 4,
+            };
+            let button_theme = shell_ui_theme(
+                palette.command_key_bg,
+                palette.command_bar_fg,
+                palette.command_key_bg,
+                palette.status_dim,
+                0,
+            );
+            let mut button = UiButton::new(
+                WidgetId::new(0x2170 + index as u16),
+                to_ui_rect(key_rect),
+                cmd.key,
+            )
+            .with_semantic_label(cmd.label);
+            let mut context = UiContext::<1>::new(to_ui_rect(rect), button_theme);
+            button.set_enabled(cmd.enabled, &mut context);
+            let mut painter = CanvasUiPainter::new(canvas, font);
+            let _ = button.paint(&mut painter, to_ui_rect(rect), &button_theme);
+            let canvas = painter.canvas_mut();
+            x += key_w + 2;
+            paint_shell_ui_label(
+                canvas,
+                font,
+                rect,
+                WidgetId::new(0x2180 + index as u16),
+                crate::hal::Rect {
+                    x,
+                    y: ty,
+                    w: text_width(font, cmd.label),
+                    h: cell,
+                },
+                cmd.label,
+                palette.command_bar_bg,
+                label_fg,
+            );
+            x += text_width(font, cmd.label);
+            if let Some(state) = cmd.state {
+                x += 2;
+                let state_w = text_width(font, state);
+                paint_shell_ui_label(
+                    canvas,
+                    font,
+                    rect,
+                    WidgetId::new(0x2190 + index as u16),
                     crate::hal::Rect {
                         x,
-                        y: rect.y + 2,
-                        w: key_w,
-                        h: rect.h - 4,
+                        y: ty,
+                        w: state_w,
+                        h: cell,
                     },
-                    palette.command_key_bg,
+                    state,
+                    palette.command_bar_bg,
+                    palette.status_ok,
                 );
-            }
-            canvas.draw_text(x + 2, ty, font, cmd.key, key_fg);
-            x += key_w + 2;
-            x = canvas.draw_text(x, ty, font, cmd.label, label_fg);
-            if let Some(state) = cmd.state {
-                x = canvas.draw_text(x + 2, ty, font, state, palette.status_ok);
+                x += state_w;
             }
             x += 8;
         }
     }
+}
+
+fn shell_clock_x(clock_width: i32, title_right: i32, status_left: i32) -> Option<i32> {
+    const GAP: i32 = 1;
+    let minimum = title_right + GAP;
+    let maximum = status_left - GAP - clock_width;
+    if maximum < minimum {
+        return None;
+    }
+    let centered = (i32::from(SHELL_SURFACE.width) - clock_width) / 2;
+    Some(centered.clamp(minimum, maximum))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1968,6 +2456,7 @@ fn draw_mem_row(
     label_color: Rgb565,
     value_color: Rgb565,
 ) {
+    let label = clip_text_to_width(font, label, value_x - label_x - SHELL_TEXT_PADDING);
     canvas.draw_text(label_x, y, font, label, label_color);
     canvas.draw_text(value_x, y, font, value, value_color);
 }
@@ -2033,11 +2522,81 @@ fn paint_pane_slot(
     let mut y = y;
     draw_dashed_hline(canvas, x, y, w, palette.separator);
     y += 4;
-    canvas.draw_text(x, y, font, label, palette.status_dim);
+    let label = clip_text_to_width(font, label, w);
+    paint_shell_ui_label(
+        canvas,
+        font,
+        crate::hal::Rect { x, y, w, h: cell },
+        WidgetId::new(0x21a0),
+        crate::hal::Rect { x, y, w, h: cell },
+        label,
+        palette.pane_bg,
+        palette.status_dim,
+    );
     y += cell;
     let value = clip_text_to_width(font, value, w);
-    canvas.draw_text(x, y, font, value, palette.pane_fg);
+    paint_shell_ui_label(
+        canvas,
+        font,
+        crate::hal::Rect { x, y, w, h: cell },
+        WidgetId::new(0x21a1),
+        crate::hal::Rect { x, y, w, h: cell },
+        value,
+        palette.pane_bg,
+        palette.pane_fg,
+    );
     y + cell + 2
+}
+
+fn shell_ui_theme(
+    background: Rgb565,
+    foreground: Rgb565,
+    border: Rgb565,
+    disabled_foreground: Rgb565,
+    border_width: u8,
+) -> UiTheme {
+    let normal = UiControlStyle::new(
+        koto_ui::Rgb565(background.0),
+        koto_ui::Rgb565(foreground.0),
+        koto_ui::Rgb565(border.0),
+    );
+    UiTheme {
+        normal,
+        focused: normal,
+        pressed: normal,
+        disabled: UiControlStyle::new(
+            koto_ui::Rgb565(background.0),
+            koto_ui::Rgb565(disabled_foreground.0),
+            koto_ui::Rgb565(border.0),
+        ),
+        accent: koto_ui::Rgb565(foreground.0),
+        focus: koto_ui::Rgb565(border.0),
+        spacing: 0,
+        border_width,
+        focus_width: 0,
+        reserved: 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_shell_ui_label(
+    canvas: &mut Canvas<'_>,
+    font: &BitmapFont<'_>,
+    clip: crate::hal::Rect,
+    id: WidgetId,
+    bounds: crate::hal::Rect,
+    text: &str,
+    background: Rgb565,
+    foreground: Rgb565,
+) {
+    let theme = shell_ui_theme(background, foreground, foreground, foreground, 0);
+    let label = UiLabel::new(id, to_ui_rect(bounds), text);
+    let mut painter = CanvasUiPainter::new(canvas, font);
+    let _ = label.paint(&mut painter, to_ui_rect(clip), &theme);
+}
+
+const fn to_ui_rect(rect: crate::hal::Rect) -> UiRect {
+    UiRect::new(rect.x, rect.y, rect.w, rect.h)
 }
 
 /// Draw a dashed horizontal line (2px dashes every 4px).
@@ -2331,6 +2890,34 @@ fn draw_battery_icon(
                 empty,
             );
         }
+    }
+}
+
+/// Four ascending antenna bars. Connected-but-unknown RSSI keeps the complete
+/// pictogram dim; known strength lights one through four bars.
+fn draw_wifi_signal_icon(
+    canvas: &mut Canvas<'_>,
+    x: i32,
+    y: i32,
+    active_bars: u8,
+    active: Rgb565,
+    inactive: Rgb565,
+) {
+    for bar in 0..4i32 {
+        let height = 2 + bar * 3;
+        canvas.fill_rect(
+            crate::hal::Rect {
+                x: x + bar * 4,
+                y: y + 11 - height,
+                w: 3,
+                h: height,
+            },
+            if bar < i32::from(active_bars) {
+                active
+            } else {
+                inactive
+            },
+        );
     }
 }
 
@@ -2688,6 +3275,7 @@ fn draw_terminal_icon(canvas: &mut Canvas<'_>, r: crate::hal::Rect) {
 mod tests {
     use super::*;
     use crate::hal::Buttons;
+    use crate::ConfigService;
 
     fn sample_shell() -> ShellState {
         let mut packages = PackageList::new();
@@ -2774,8 +3362,45 @@ mod tests {
 
         match shell.update(&input) {
             ShellAction::Launch(package) => assert_eq!(package.name(), "One"),
-            ShellAction::None => panic!("expected launch action"),
+            ShellAction::None | ShellAction::OpenConfig => panic!("expected launch action"),
         }
+    }
+
+    #[test]
+    fn semantic_command_events_preserve_activation_and_enablement() {
+        let mut shell = sample_shell();
+
+        assert_eq!(
+            shell.dispatch_command_event(
+                ShellCommandId::Open,
+                UiEvent::repeated(UiAction::Activate),
+            ),
+            ShellAction::None
+        );
+        assert_eq!(shell.take_pending_sound(), None);
+        assert!(matches!(
+            shell.activate_command(ShellCommandId::Open),
+            ShellAction::Launch(package) if package.name() == "One"
+        ));
+        assert_eq!(shell.take_pending_sound(), Some(ShellSound::Confirm));
+        assert_eq!(
+            shell.activate_command(ShellCommandId::Settings),
+            ShellAction::OpenConfig
+        );
+
+        let mut empty = ShellState::empty();
+        assert_eq!(
+            empty.activate_command(ShellCommandId::Open),
+            ShellAction::None
+        );
+        assert_eq!(empty.take_pending_sound(), None);
+    }
+
+    #[test]
+    fn shell_state_and_render_command_budgets_are_recorded() {
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(core::mem::size_of::<ShellState>(), 29_672);
+        assert_eq!(SHELL_LIST_COMMANDS, 16);
     }
 
     #[test]
@@ -3427,6 +4052,60 @@ mod tests {
     }
 
     #[test]
+    fn clock_damage_is_needed_only_when_displayed_minute_changes() {
+        let mut shell = sample_shell();
+        let clock = ShellClock {
+            year: 2026,
+            month: 7,
+            day: 19,
+            hour: 12,
+            minute: 34,
+        };
+        assert!(shell.set_clock_if_minute_changed(clock));
+        assert!(!shell.set_clock_if_minute_changed(clock));
+        assert!(shell.set_clock_if_minute_changed(ShellClock {
+            minute: 35,
+            ..clock
+        }));
+        assert_eq!(SHELL_CLOCK_RECT.h, SHELL_HEADER_HEIGHT);
+        assert!(SHELL_CLOCK_RECT.w < i32::from(SHELL_SURFACE.width));
+    }
+
+    #[test]
+    fn wifi_antenna_tracks_connection_and_rssi_bands() {
+        let mut shell = sample_shell();
+        assert_eq!(shell.wifi_signal(), None);
+        assert!(!shell.set_wifi_connection(false, Some(-40)));
+        assert!(shell.set_wifi_connection(true, None));
+        assert_eq!(shell.wifi_signal(), Some(WifiSignal::Unknown));
+        assert!(shell.set_wifi_connection(true, Some(-80)));
+        assert_eq!(shell.wifi_signal(), Some(WifiSignal::Weak));
+        assert!(shell.set_wifi_connection(true, Some(-70)));
+        assert_eq!(shell.wifi_signal(), Some(WifiSignal::Fair));
+        assert!(shell.set_wifi_connection(true, Some(-60)));
+        assert_eq!(shell.wifi_signal(), Some(WifiSignal::Good));
+        assert!(shell.set_wifi_connection(true, Some(-50)));
+        assert_eq!(shell.wifi_signal(), Some(WifiSignal::Excellent));
+        assert!(!shell.set_wifi_connection(true, Some(-54)));
+        assert!(shell.set_wifi_connection(false, None));
+        assert_eq!(shell.wifi_signal(), None);
+    }
+
+    #[test]
+    fn wifi_status_width_shifts_clock_instead_of_suppressing_it() {
+        // The connected header's worst common right cluster begins at x=193
+        // (`Saved`, `SD`, unknown battery, and antenna). A 16-character clock
+        // at 6 px per glyph still fits by shifting from centered x=112 to x=96.
+        assert_eq!(shell_clock_x(96, 42, 193), Some(96));
+        assert_eq!(shell_clock_x(96, 42, 214), Some(112));
+        assert_eq!(shell_clock_x(96, 100, 193), None);
+        const {
+            assert!(SHELL_CLOCK_RECT.x <= 96);
+            assert!(SHELL_CLOCK_RECT.x + SHELL_CLOCK_RECT.w >= 208);
+        }
+    }
+
+    #[test]
     fn battery_indicators_cover_each_power_state() {
         let mut shell = sample_shell();
         // Unsupported (default).
@@ -3462,12 +4141,12 @@ mod tests {
         shell.set_storage_status(StorageStatus::Present);
         shell.set_save_status(SaveStatus::Saved);
         assert_eq!(shell.storage_indicator_text(), "SD");
-        assert_eq!(shell.save_indicator_text(), Some("保存済"));
+        assert_eq!(shell.save_indicator_text(), Some("Saved"));
 
         shell.set_storage_status(StorageStatus::Absent);
         shell.set_save_status(SaveStatus::Unsaved);
         assert_eq!(shell.storage_indicator_text(), "SD×");
-        assert_eq!(shell.save_indicator_text(), Some("未保存"));
+        assert_eq!(shell.save_indicator_text(), Some("Unsaved"));
     }
 
     #[test]
@@ -3476,27 +4155,32 @@ mod tests {
         let bar = shell.command_bar();
 
         // Launch is available when packages exist.
-        assert_eq!(bar[0].label, "開く");
+        assert_eq!(bar[0].label, "Open");
         assert!(bar[0].enabled);
 
-        // Favorite, sort, and category are now actionable.
-        assert_eq!(bar[1].label, "お気に入り");
+        // Settings is always reachable, including with an empty catalog.
+        assert_eq!(bar[1].key, "F1");
+        assert_eq!(bar[1].label, "Settings");
         assert!(bar[1].enabled);
-        assert_eq!(bar[2].label, "並替");
+
+        // Favorite, sort, and category are now actionable.
+        assert_eq!(bar[2].label, "Favorite");
         assert!(bar[2].enabled);
-        assert_eq!(bar[3].label, "カテゴリ");
+        assert_eq!(bar[3].label, "Sort");
         assert!(bar[3].enabled);
+        assert_eq!(bar[4].label, "Category");
+        assert!(bar[4].enabled);
 
         // The detail-pane toggle reports its current state.
-        assert_eq!(bar[4].label, "詳細");
-        assert_eq!(bar[4].state, Some("ON"));
+        assert_eq!(bar[5].label, "Details");
+        assert_eq!(bar[5].state, Some("ON"));
         shell.toggle_detail_pane();
-        assert_eq!(shell.command_bar()[4].state, Some("OFF"));
+        assert_eq!(shell.command_bar()[5].state, Some("OFF"));
 
         // The system status view is reachable from the launcher (KOTO-0182).
-        assert_eq!(bar[5].key, "F5");
-        assert_eq!(bar[5].label, "システム");
-        assert!(bar[5].enabled);
+        assert_eq!(bar[6].key, "F5");
+        assert_eq!(bar[6].label, "System");
+        assert!(bar[6].enabled);
     }
 
     #[test]
@@ -3573,8 +4257,69 @@ mod tests {
     #[test]
     fn command_bar_launch_disabled_without_packages() {
         let shell = ShellState::new(PackageList::new());
-        assert_eq!(shell.command_bar()[0].label, "開く");
+        assert_eq!(shell.command_bar()[0].label, "Open");
         assert!(!shell.command_bar()[0].enabled);
+    }
+
+    #[test]
+    fn shared_config_snapshot_relocalizes_shell_without_touching_preferences() {
+        let mut shell = sample_shell();
+        shell.set_sort_mode(SortMode::Favorite);
+        shell.toggle_selected_favorite();
+
+        assert_eq!(shell.locale(), Locale::EnUs);
+        assert_eq!(shell.locale_generation(), 1);
+        assert!(!shell.apply_config_snapshot(ConfigService::new().snapshot()));
+
+        let mut config = ConfigService::new();
+        config.set_locale(Locale::JaJp);
+        assert!(shell.apply_config_snapshot(config.snapshot()));
+        assert_eq!(shell.locale(), Locale::JaJp);
+        assert_eq!(shell.locale_generation(), 2);
+        assert_eq!(shell.command_bar()[0].label, "開く");
+        assert_eq!(shell.command_bar()[3].state, Some("★優先"));
+        assert!(shell.selected_is_favorite());
+    }
+
+    #[test]
+    fn pseudolocale_is_static_expanded_and_english_is_the_fallback() {
+        let english = shell_strings(Locale::EnUs);
+        let pseudo = shell_strings(Locale::QpsPloc);
+        assert_eq!(ShellState::empty().strings(), english);
+        let english_ascii = [
+            english.title,
+            english.open,
+            english.settings,
+            english.favorite,
+            english.sort,
+            english.category,
+            english.details,
+            english.system,
+            english.system_memory,
+            english.return_hint,
+            english.selected_prefix,
+        ]
+        .iter()
+        .map(|text| text.len())
+        .sum::<usize>();
+        let pseudo_ascii = [
+            pseudo.title,
+            pseudo.open,
+            pseudo.settings,
+            pseudo.favorite,
+            pseudo.sort,
+            pseudo.category,
+            pseudo.details,
+            pseudo.system,
+            pseudo.system_memory,
+            pseudo.return_hint,
+            pseudo.selected_prefix,
+        ]
+        .iter()
+        .map(|text| text.len())
+        .sum::<usize>();
+        assert!(pseudo_ascii * 100 >= english_ascii * 135);
+        assert!(pseudo_ascii * 100 <= english_ascii * 150);
     }
 
     fn categorized(app_id: &str, name: &str, category: &str) -> PackageInfo {

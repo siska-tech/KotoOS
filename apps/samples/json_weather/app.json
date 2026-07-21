@@ -1,0 +1,22 @@
+{
+  "app_id": "dev.koto.samples.json-weather",
+  "kind": "koto",
+  "package": "sample_json_weather",
+  "name": "SDK JSON Weather",
+  "description": "Streams fetched JSON through the bounded decoder.",
+  "category": "Samples",
+  "runtime": "kotoruntime-bytecode",
+  "source": "src/main.koto",
+  "memory": {
+    "sram_work_bytes": 16384,
+    "psram_cache_bytes": 32768
+  },
+  "permissions": {
+    "fs": "sandbox",
+    "network": {
+      "origins": [
+        "https://weather.example"
+      ]
+    }
+  }
+}

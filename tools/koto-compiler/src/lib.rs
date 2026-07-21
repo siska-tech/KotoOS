@@ -5,6 +5,7 @@
 //! kbc-asm -> KBC1`, with a final `verify_kbc` guarantee. It is a development
 //! tool only; nothing here runs on the device.
 
+mod assets;
 mod codegen;
 mod lexer;
 mod parser;
@@ -12,6 +13,7 @@ mod preprocess;
 
 use koto_core::{verify_kbc, RuntimeLimits};
 
+pub use assets::{AssetResolver, ManifestAssets};
 /// Preferred name for [`IncludeLoader`] in editor/tooling APIs.
 pub use preprocess::IncludeLoader as IncludeResolver;
 pub use preprocess::{FsLoader, IncludeLoader, OverlayLoader, SourceMap};
@@ -166,15 +168,22 @@ impl std::fmt::Display for Diagnostic {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SymbolKind {
     Constant,
+    Enum,
+    EnumMember,
     Data,
+    Struct,
+    Static,
+    Field,
     Function,
+    Method,
     Parameter,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SymbolType {
     Int,
     Bool,
+    Struct(String),
 }
 
 impl std::fmt::Display for SymbolType {
@@ -182,6 +191,7 @@ impl std::fmt::Display for SymbolType {
         f.write_str(match self {
             Self::Int => "int",
             Self::Bool => "bool",
+            Self::Struct(name) => name,
         })
     }
 }
@@ -197,9 +207,33 @@ pub enum SymbolDetail {
     Constant {
         value: i64,
     },
+    Enum {
+        members: usize,
+    },
+    EnumMember {
+        value: i64,
+    },
     Data {
         element_bits: u8,
         elements: usize,
+    },
+    Struct {
+        fields: usize,
+        bytes: usize,
+    },
+    Static {
+        ty: SymbolType,
+        bytes: usize,
+    },
+    Field {
+        ty: SymbolType,
+        offset: usize,
+    },
+    /// A fixed-capacity buffer field in a struct layout (KOTO-0235): hover
+    /// shows the region capacity and offset instead of a 32-bit scalar type.
+    BufferField {
+        capacity: usize,
+        offset: usize,
     },
     Function {
         parameters: Vec<SymbolParameter>,
@@ -277,11 +311,67 @@ pub fn compile_to_asm(file: &str, source: &str) -> Result<String, CompileError> 
 
 pub use codegen::CodegenOptions;
 
+/// Editor-facing metadata for host-call-backed KotoUI prelude functions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdkFunction {
+    pub name: &'static str,
+    pub parameters: &'static [&'static str],
+    pub returns: &'static str,
+}
+
+pub const UI_SDK_FUNCTIONS: &[SdkFunction] = &[
+    SdkFunction {
+        name: "ui_capabilities",
+        parameters: &["dst", "max_len"],
+        returns: "int",
+    },
+    SdkFunction {
+        name: "ui_mount",
+        parameters: &["src", "len"],
+        returns: "int",
+    },
+    SdkFunction {
+        name: "ui_update",
+        parameters: &["src", "len"],
+        returns: "int",
+    },
+    SdkFunction {
+        name: "ui_present",
+        parameters: &[],
+        returns: "int",
+    },
+    SdkFunction {
+        name: "ui_poll_event",
+        parameters: &["dst", "max_len"],
+        returns: "int",
+    },
+    SdkFunction {
+        name: "ui_reset",
+        parameters: &[],
+        returns: "int",
+    },
+];
+
 /// Compile an in-memory root source with injected include resolution and
-/// return every value needed by editor tooling in one pass.
+/// return every value needed by editor tooling in one pass. Compile-time asset
+/// helpers resolve against the nearest `app.json` above `request.file`
+/// (KOTO-0236/0237); see [`compile_source_with_assets`] to inject the asset
+/// namespace instead.
 pub fn compile_source(
     request: CompileRequest<'_>,
     resolver: &mut dyn IncludeResolver,
+) -> Compilation {
+    let mut assets = ManifestAssets::for_root(request.file);
+    compile_source_with_assets(request, resolver, &mut assets)
+}
+
+/// Like [`compile_source`], with compile-time asset resolution injected
+/// alongside include loading so tests and editors can fold asset sizes and
+/// text shape without an on-disk `app.json`.
+pub fn compile_source_with_assets(
+    request: CompileRequest<'_>,
+    resolver: &mut dyn IncludeResolver,
+    assets: &mut dyn AssetResolver,
 ) -> Compilation {
     let (expanded, map) = match preprocess::expand(request.file, request.source, resolver) {
         Ok(value) => value,
@@ -291,7 +381,7 @@ pub fn compile_source(
         Ok(tokens) => tokens,
         Err(diag) => return Compilation::failed(Diagnostic::from_mapped_diag(&map, diag)),
     };
-    let program = match parser::parse(&tokens) {
+    let program = match parser::parse(&tokens, assets) {
         Ok(program) => program,
         Err(diag) => return Compilation::failed(Diagnostic::from_mapped_diag(&map, diag)),
     };
@@ -348,8 +438,48 @@ pub fn compile_source(
     }
 }
 
+/// The declaration-ordered byte size of a struct layout: 4 bytes per scalar
+/// field plus each buffer field's declared capacity (KOTO-0235).
+fn struct_layout_bytes(def: &parser::StructDef) -> usize {
+    def.fields
+        .iter()
+        .map(|field| match &field.kind {
+            parser::StructFieldKind::Scalar(_) => 4,
+            parser::StructFieldKind::Buffer(capacity) => *capacity,
+        })
+        .sum()
+}
+
 fn collect_symbols(program: &parser::Program, map: &SourceMap) -> Vec<Symbol> {
     let mut symbols = Vec::new();
+    for (enum_name, members) in codegen::sdk_enums() {
+        let definition = SourceSpan {
+            file: "<KotoSDK>".to_string(),
+            start: SourcePosition { line: 1, column: 1 },
+            end: SourcePosition {
+                line: 1,
+                column: enum_name.len() + 1,
+            },
+        };
+        symbols.push(Symbol {
+            name: enum_name.to_string(),
+            kind: SymbolKind::Enum,
+            container: None,
+            definition: definition.clone(),
+            detail: SymbolDetail::Enum {
+                members: members.len(),
+            },
+        });
+        for (member, value) in members {
+            symbols.push(Symbol {
+                name: member.to_string(),
+                kind: SymbolKind::EnumMember,
+                container: Some(enum_name.to_string()),
+                definition: definition.clone(),
+                detail: SymbolDetail::EnumMember { value },
+            });
+        }
+    }
     for def in &program.consts {
         symbols.push(Symbol {
             name: def.name.clone(),
@@ -358,6 +488,33 @@ fn collect_symbols(program: &parser::Program, map: &SourceMap) -> Vec<Symbol> {
             definition: SourceSpan::mapped(map, def.name_line, def.name_col, def.name.len()),
             detail: SymbolDetail::Constant { value: def.value },
         });
+    }
+    for def in &program.enums {
+        symbols.push(Symbol {
+            name: def.name.clone(),
+            kind: SymbolKind::Enum,
+            container: None,
+            definition: SourceSpan::mapped(map, def.name_line, def.name_col, def.name.len()),
+            detail: SymbolDetail::Enum {
+                members: def.members.len(),
+            },
+        });
+        for member in &def.members {
+            symbols.push(Symbol {
+                name: member.name.clone(),
+                kind: SymbolKind::EnumMember,
+                container: Some(def.name.clone()),
+                definition: SourceSpan::mapped(
+                    map,
+                    member.name_line,
+                    member.name_col,
+                    member.name.len(),
+                ),
+                detail: SymbolDetail::EnumMember {
+                    value: member.value,
+                },
+            });
+        }
     }
     for def in &program.data {
         symbols.push(Symbol {
@@ -371,6 +528,68 @@ fn collect_symbols(program: &parser::Program, map: &SourceMap) -> Vec<Symbol> {
                     parser::DataWidth::U16 => 16,
                 },
                 elements: def.values.len(),
+            },
+        });
+    }
+    for def in &program.structs {
+        symbols.push(Symbol {
+            name: def.name.clone(),
+            kind: SymbolKind::Struct,
+            container: None,
+            definition: SourceSpan::mapped(map, def.name_line, def.name_col, def.name.len()),
+            detail: SymbolDetail::Struct {
+                fields: def.fields.len(),
+                bytes: struct_layout_bytes(def),
+            },
+        });
+        let mut offset = 0usize;
+        for field in &def.fields {
+            let (detail, bytes) = match &field.kind {
+                parser::StructFieldKind::Scalar(ty) => (
+                    SymbolDetail::Field {
+                        ty: symbol_type(ty.clone()),
+                        offset,
+                    },
+                    4,
+                ),
+                parser::StructFieldKind::Buffer(capacity) => (
+                    SymbolDetail::BufferField {
+                        capacity: *capacity,
+                        offset,
+                    },
+                    *capacity,
+                ),
+            };
+            symbols.push(Symbol {
+                name: field.name.clone(),
+                kind: SymbolKind::Field,
+                container: Some(def.name.clone()),
+                definition: SourceSpan::mapped(
+                    map,
+                    field.name_line,
+                    field.name_col,
+                    field.name.len(),
+                ),
+                detail,
+            });
+            offset += bytes;
+        }
+    }
+    for def in &program.statics {
+        let bytes = program
+            .structs
+            .iter()
+            .find(|item| item.name == def.ty)
+            .map(struct_layout_bytes)
+            .unwrap_or(0);
+        symbols.push(Symbol {
+            name: def.name.clone(),
+            kind: SymbolKind::Static,
+            container: None,
+            definition: SourceSpan::mapped(map, def.name_line, def.name_col, def.name.len()),
+            detail: SymbolDetail::Static {
+                ty: SymbolType::Struct(def.ty.clone()),
+                bytes,
             },
         });
     }
@@ -391,10 +610,10 @@ fn collect_symbols(program: &parser::Program, map: &SourceMap) -> Vec<Symbol> {
                     .iter()
                     .map(|param| SymbolParameter {
                         name: param.name.clone(),
-                        ty: symbol_type(param.ty),
+                        ty: symbol_type(param.ty.clone()),
                     })
                     .collect(),
-                return_type: function.ret.map(symbol_type),
+                return_type: function.ret.clone().map(symbol_type),
             },
         });
         for param in &function.params {
@@ -404,7 +623,45 @@ fn collect_symbols(program: &parser::Program, map: &SourceMap) -> Vec<Symbol> {
                 container: Some(function.name.clone()),
                 definition: SourceSpan::mapped(map, param.line, param.col, param.name.len()),
                 detail: SymbolDetail::Parameter {
-                    ty: symbol_type(param.ty),
+                    ty: symbol_type(param.ty.clone()),
+                },
+            });
+        }
+    }
+    for method in &program.methods {
+        let function = &method.function;
+        symbols.push(Symbol {
+            name: function.name.clone(),
+            kind: SymbolKind::Method,
+            container: Some(method.target.clone()),
+            definition: SourceSpan::mapped(
+                map,
+                function.name_line,
+                function.name_col,
+                function.name.len(),
+            ),
+            detail: SymbolDetail::Function {
+                parameters: function
+                    .params
+                    .iter()
+                    .skip(1)
+                    .map(|param| SymbolParameter {
+                        name: param.name.clone(),
+                        ty: symbol_type(param.ty.clone()),
+                    })
+                    .collect(),
+                return_type: function.ret.clone().map(symbol_type),
+            },
+        });
+        let container = format!("{}::{}", method.target, function.name);
+        for param in &function.params {
+            symbols.push(Symbol {
+                name: param.name.clone(),
+                kind: SymbolKind::Parameter,
+                container: Some(container.clone()),
+                definition: SourceSpan::mapped(map, param.line, param.col, param.name.len()),
+                detail: SymbolDetail::Parameter {
+                    ty: symbol_type(param.ty.clone()),
                 },
             });
         }
@@ -416,6 +673,7 @@ fn symbol_type(ty: parser::Type) -> SymbolType {
     match ty {
         parser::Type::Int => SymbolType::Int,
         parser::Type::Bool => SymbolType::Bool,
+        parser::Type::Struct(name) => SymbolType::Struct(name),
     }
 }
 
@@ -447,9 +705,23 @@ pub fn compile_to_asm_with_loader(
     options: CodegenOptions,
     loader: &mut dyn IncludeLoader,
 ) -> Result<String, CompileError> {
+    let mut assets = ManifestAssets::for_root(file);
+    compile_to_asm_with_resolvers(file, source, options, loader, &mut assets)
+}
+
+/// Like [`compile_to_asm_with_loader`], with compile-time asset resolution
+/// also injected (KOTO-0236/0237).
+pub fn compile_to_asm_with_resolvers(
+    file: &str,
+    source: &str,
+    options: CodegenOptions,
+    loader: &mut dyn IncludeLoader,
+    assets: &mut dyn AssetResolver,
+) -> Result<String, CompileError> {
     let (expanded, map) = preprocess::expand(file, source, loader)?;
     let tokens = lexer::lex(&expanded).map_err(|d| CompileError::from_diag_mapped(&map, d))?;
-    let program = parser::parse(&tokens).map_err(|d| CompileError::from_diag_mapped(&map, d))?;
+    let program =
+        parser::parse(&tokens, assets).map_err(|d| CompileError::from_diag_mapped(&map, d))?;
     codegen::compile_to_asm_with(file, &program, options)
         .map_err(|d| CompileError::from_diag_mapped(&map, d))
 }
@@ -473,7 +745,9 @@ pub fn slot_map_with_loader(
 ) -> Result<SlotMap, CompileError> {
     let (expanded, map) = preprocess::expand(file, source, loader)?;
     let tokens = lexer::lex(&expanded).map_err(|d| CompileError::from_diag_mapped(&map, d))?;
-    let program = parser::parse(&tokens).map_err(|d| CompileError::from_diag_mapped(&map, d))?;
+    let mut assets = ManifestAssets::for_root(file);
+    let program =
+        parser::parse(&tokens, &mut assets).map_err(|d| CompileError::from_diag_mapped(&map, d))?;
     let mut slots =
         codegen::slot_map(file, &program).map_err(|d| CompileError::from_diag_mapped(&map, d))?;
     for function in &mut slots.functions {
@@ -531,7 +805,21 @@ pub fn compile_with_loader(
     options: CodegenOptions,
     loader: &mut dyn IncludeLoader,
 ) -> Result<Vec<u8>, CompileError> {
-    let asm = compile_to_asm_with_loader(file, source, options, loader)?;
+    let mut assets = ManifestAssets::for_root(file);
+    compile_with_resolvers(file, source, options, loader, &mut assets)
+}
+
+/// Like [`compile_with_loader`], with compile-time asset resolution also
+/// injected (KOTO-0236/0237) so hermetic tests can name package assets without
+/// a manifest.
+pub fn compile_with_resolvers(
+    file: &str,
+    source: &str,
+    options: CodegenOptions,
+    loader: &mut dyn IncludeLoader,
+    assets: &mut dyn AssetResolver,
+) -> Result<Vec<u8>, CompileError> {
+    let asm = compile_to_asm_with_resolvers(file, source, options, loader, assets)?;
     let bytecode = kbc_asm::assemble(&asm).map_err(|error| {
         CompileError::internal(
             file,
